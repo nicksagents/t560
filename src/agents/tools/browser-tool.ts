@@ -204,6 +204,20 @@ function boundedPush<T>(rows: T[], value: T, maxEntries: number): T[] {
   return next.slice(next.length - maxEntries);
 }
 
+async function evalPageExpression<T>(page: any, expression: string): Promise<T> {
+  return (await page.evaluate(expression)) as T;
+}
+
+async function evalPageScript<T>(page: any, scriptBody: string, args?: unknown): Promise<T> {
+  const wrapped = `(() => {
+    const __t560Script = ${JSON.stringify(scriptBody)};
+    const __t560Args = ${JSON.stringify(args ?? null)};
+    const __t560Fn = new Function("args", __t560Script);
+    return __t560Fn(__t560Args);
+  })()`;
+  return await evalPageExpression<T>(page, wrapped);
+}
+
 function pushLiveConsole(tabId: string, entry: LiveConsoleEntry): void {
   const rows = liveConsoleByTabId.get(tabId) ?? [];
   liveConsoleByTabId.set(tabId, boundedPush(rows, entry, LIVE_CONSOLE_MAX_ENTRIES));
@@ -1110,59 +1124,56 @@ async function buildLiveActionRefs(page: any): Promise<Array<{
   fieldName?: string;
   method?: "get" | "post";
 }>> {
-  return (await page.evaluate(() => {
-    const cssPath = (node: Element): string => {
-      const element = node as HTMLElement;
+  const script = `
+    const cssEscape = (value) => {
+      const raw = String(value ?? "");
+      if (typeof CSS !== "undefined" && CSS && typeof CSS.escape === "function") {
+        return CSS.escape(raw);
+      }
+      return raw.replace(/[^a-zA-Z0-9_-]/g, "\\\\$&");
+    };
+    const cssPath = (node) => {
+      const element = node;
       const id = String(element.id ?? "").trim();
       if (id) {
-        return `#${id.replace(/([ !"#$%&'()*+,./:;<=>?@[\\\]^`{|}~])/g, "\\$1")}`;
+        return "#" + cssEscape(id);
       }
-      const parts: string[] = [];
-      let current: Element | null = element;
+      const parts = [];
+      let current = element;
       let depth = 0;
-      while (current && current.tagName.toLowerCase() !== "html" && depth < 8) {
+      while (current && current.tagName && current.tagName.toLowerCase() !== "html" && depth < 8) {
         const tag = current.tagName.toLowerCase();
         const parent = current.parentElement;
         if (!parent) {
           parts.unshift(tag);
           break;
         }
-        const siblings = Array.from(parent.children).filter((entry) => entry.tagName === current!.tagName);
+        const siblings = Array.from(parent.children).filter((entry) => entry.tagName === current.tagName);
         const index = siblings.indexOf(current) + 1;
-        parts.unshift(`${tag}:nth-of-type(${index})`);
+        parts.unshift(tag + ":nth-of-type(" + index + ")");
         current = parent;
         depth += 1;
       }
       return parts.join(" > ");
     };
 
-    const normalize = (value: string) => value.replace(/\s+/g, " ").trim();
-    const bySelector = new Set<string>();
+    const normalize = (value) => String(value ?? "").replace(/\\s+/g, " ").trim();
+    const bySelector = new Set();
     const forms = Array.from(document.querySelectorAll("form"));
-    const formMeta = new Map<Element, { formIndex: number; method: "get" | "post"; action: string }>();
+    const formMeta = new Map();
     for (const [idx, formEl] of forms.entries()) {
-      const methodRaw = String((formEl as HTMLFormElement).method || "get").toLowerCase();
+      const methodRaw = String(formEl.method || "get").toLowerCase();
       const method = methodRaw === "post" ? "post" : "get";
       let action = location.href;
       try {
-        action = new URL((formEl as HTMLFormElement).getAttribute("action") || location.href, location.href).toString();
+        action = new URL(formEl.getAttribute("action") || location.href, location.href).toString();
       } catch {
         action = location.href;
       }
       formMeta.set(formEl, { formIndex: idx + 1, method, action });
     }
 
-    const rows: Array<{
-      kind: "link" | "field" | "submit" | "button";
-      role: string;
-      name: string;
-      selector: string;
-      url?: string;
-      formIndex?: number;
-      fieldName?: string;
-      method?: "get" | "post";
-    }> = [];
-
+    const rows = [];
     const candidates = Array.from(
       document.querySelectorAll(
         'a[href],button,input,select,textarea,[role="button"],[role="link"],[role="textbox"],[role="combobox"],[contenteditable="true"]',
@@ -1170,7 +1181,7 @@ async function buildLiveActionRefs(page: any): Promise<Array<{
     );
 
     for (const element of candidates) {
-      const htmlEl = element as HTMLElement;
+      const htmlEl = element;
       const rect = htmlEl.getBoundingClientRect();
       const visible = rect.width > 0 && rect.height > 0;
       if (!visible) {
@@ -1183,27 +1194,24 @@ async function buildLiveActionRefs(page: any): Promise<Array<{
       }
       bySelector.add(selector);
 
-      const tag = element.tagName.toLowerCase();
-      const inputType = tag === "input" ? String((element as HTMLInputElement).type || "text").toLowerCase() : "";
+      const tag = String(element.tagName || "").toLowerCase();
+      const inputType = tag === "input" ? String(element.type || "text").toLowerCase() : "";
       const explicitRole = String(element.getAttribute("role") || "").toLowerCase();
       const inForm = element.closest("form");
       const meta = inForm ? formMeta.get(inForm) : null;
-
       const name = normalize(
-        String(
-          element.getAttribute("aria-label") ||
-            (tag === "input" ? (element as HTMLInputElement).value : "") ||
-            (tag === "textarea" ? (element as HTMLTextAreaElement).value : "") ||
-            htmlEl.innerText ||
-            element.textContent ||
-            element.getAttribute("placeholder") ||
-            element.getAttribute("name") ||
-            element.getAttribute("id") ||
-            "",
-        ),
+        element.getAttribute("aria-label") ||
+          (tag === "input" ? element.value : "") ||
+          (tag === "textarea" ? element.value : "") ||
+          htmlEl.innerText ||
+          element.textContent ||
+          element.getAttribute("placeholder") ||
+          element.getAttribute("name") ||
+          element.getAttribute("id") ||
+          "",
       );
 
-      let kind: "link" | "field" | "submit" | "button" | null = null;
+      let kind = null;
       let role = explicitRole || "";
       if (tag === "a" || explicitRole === "link") {
         kind = "link";
@@ -1226,13 +1234,8 @@ async function buildLiveActionRefs(page: any): Promise<Array<{
           role = role || "textbox";
         }
       } else if (tag === "button" || explicitRole === "button") {
-        const nativeType =
-          tag === "button" ? String((element as HTMLButtonElement).type || "submit").toLowerCase() : "button";
-        if (nativeType === "submit" && inForm) {
-          kind = "submit";
-        } else {
-          kind = "button";
-        }
+        const nativeType = tag === "button" ? String(element.type || "submit").toLowerCase() : "button";
+        kind = nativeType === "submit" && inForm ? "submit" : "button";
         role = role || "button";
       } else if (element.getAttribute("contenteditable") === "true") {
         kind = "field";
@@ -1243,28 +1246,16 @@ async function buildLiveActionRefs(page: any): Promise<Array<{
         continue;
       }
 
-      const row: {
-        kind: "link" | "field" | "submit" | "button";
-        role: string;
-        name: string;
-        selector: string;
-        url?: string;
-        formIndex?: number;
-        fieldName?: string;
-        method?: "get" | "post";
-      } = {
+      const row = {
         kind,
         role,
         name: name || selector,
         selector,
       };
-
       if (kind === "link") {
         try {
-          row.url = new URL((element as HTMLAnchorElement).href || "", location.href).toString();
-        } catch {
-          // ignore bad href
-        }
+          row.url = new URL(element.href || "", location.href).toString();
+        } catch {}
       }
       if ((kind === "field" || kind === "submit") && meta) {
         row.formIndex = meta.formIndex;
@@ -1281,7 +1272,8 @@ async function buildLiveActionRefs(page: any): Promise<Array<{
     }
 
     return rows;
-  })) as Array<{
+  `;
+  return await evalPageScript<Array<{
     kind: "link" | "field" | "submit" | "button";
     role: string;
     name: string;
@@ -1290,7 +1282,7 @@ async function buildLiveActionRefs(page: any): Promise<Array<{
     formIndex?: number;
     fieldName?: string;
     method?: "get" | "post";
-  }>;
+  }>>(page, script);
 }
 
 function resolveSnapshotRef(tab: BrowserTab, refRaw: unknown): BrowserElementRef | null {
@@ -1464,22 +1456,23 @@ async function liveFillFormField(tab: BrowserTab, form: BrowserForm, field: Brow
     // Fall through to DOM eval fallback.
   }
   try {
-    await page.evaluate(
-      (args: { formIndex: number; fieldName: string; value: string }) => {
+    await evalPageScript(
+      page,
+      `
         const forms = Array.from(document.querySelectorAll("form"));
-        const formEl = forms[args.formIndex - 1] as any;
+        const formEl = forms[args.formIndex - 1];
         if (!formEl) {
           return;
         }
-        const escapedFieldName = String(args.fieldName).replace(/["\\]/g, "\\$&");
-        const target = formEl.querySelector(`[name="${escapedFieldName}"]`) as any;
+        const escapedFieldName = String(args.fieldName).replace(/["\\\\]/g, "\\\\$&");
+        const target = formEl.querySelector('[name="' + escapedFieldName + '"]');
         if (!target) {
           return;
         }
-        target.value = args.value;
+        target.value = String(args.value ?? "");
         target.dispatchEvent(new Event("input", { bubbles: true }));
         target.dispatchEvent(new Event("change", { bubbles: true }));
-      },
+      `,
       {
         formIndex: form.index,
         fieldName: field.name,
@@ -1497,34 +1490,31 @@ async function liveSubmitForm(tab: BrowserTab, form: BrowserForm, timeoutMs: num
     throw new Error(`live browser page missing for tab ${tab.id}.`);
   }
   const values = tab.formValues[form.index] ?? {};
-  await page.evaluate(
-    (args: {
-      formIndex: number;
-      values: Record<string, string>;
-    }) => {
+  await evalPageScript(
+    page,
+    `
       const forms = Array.from(document.querySelectorAll("form"));
-      const formEl = forms[args.formIndex - 1] as any;
+      const formEl = forms[args.formIndex - 1];
       if (!formEl) {
         return;
       }
-
-      for (const [name, value] of Object.entries(args.values)) {
-        const escapedName = String(name).replace(/["\\]/g, "\\$&");
-        const target = formEl.querySelector(`[name="${escapedName}"]`) as any;
+      const entries = Object.entries(args.values || {});
+      for (const [name, value] of entries) {
+        const escapedName = String(name).replace(/["\\\\]/g, "\\\\$&");
+        const target = formEl.querySelector('[name="' + escapedName + '"]');
         if (!target) {
           continue;
         }
-        target.value = value;
+        target.value = String(value ?? "");
         target.dispatchEvent(new Event("input", { bubbles: true }));
         target.dispatchEvent(new Event("change", { bubbles: true }));
       }
-
       if (typeof formEl.requestSubmit === "function") {
         formEl.requestSubmit();
       } else {
         formEl.submit();
       }
-    },
+    `,
     {
       formIndex: form.index,
       values,
@@ -2310,9 +2300,12 @@ export function createBrowserTool(): AnyAgentTool {
               rawState === "attached" || rawState === "hidden" || rawState === "detached" ? rawState : "visible";
             await page.locator(waitForSelector).first().waitFor({ state: state as any, timeout: timeoutMs });
           } else if (waitForText) {
+            const wanted = waitForText.toLowerCase();
             await page.waitForFunction(
-              (wanted: string) => document.body?.innerText?.toLowerCase().includes(wanted.toLowerCase()),
-              waitForText,
+              `(() => {
+                const bodyText = String(document.body?.innerText ?? "").toLowerCase();
+                return bodyText.includes(${JSON.stringify(wanted)});
+              })()`,
               { timeout: timeoutMs },
             );
           } else if (urlContains) {
@@ -2355,10 +2348,10 @@ export function createBrowserTool(): AnyAgentTool {
         const toTop = params.toTop === true;
         const toBottom = params.toBottom === true;
         const selector = getExplicitSelector(params, "selector");
-        await page.evaluate(
-          (args: { selector: string; deltaX: number; deltaY: number; toTop: boolean; toBottom: boolean }) => {
-            const target = args.selector ? (document.querySelector(args.selector) as HTMLElement | null) : null;
-            const node: any = target || window;
+        await evalPageScript(
+          page,
+          `
+            const target = args.selector ? document.querySelector(args.selector) : null;
             if (args.toTop) {
               if (target) {
                 target.scrollTop = 0;
@@ -2380,7 +2373,7 @@ export function createBrowserTool(): AnyAgentTool {
             } else {
               window.scrollBy({ left: args.deltaX, top: args.deltaY });
             }
-          },
+          `,
           {
             selector,
             deltaX,
@@ -2630,12 +2623,16 @@ export function createBrowserTool(): AnyAgentTool {
           throw new Error("expression is required for evaluate.");
         }
         const page = requireLivePage(tab);
-        const result = await page.evaluate((source: string) => {
-          // eslint-disable-next-line no-new-func
-          const fn = new Function(`return (${source});`);
-          const value = fn();
-          return typeof value === "function" ? value() : value;
-        }, expression);
+        const result = await evalPageScript(
+          page,
+          `
+            const source = String(args.source ?? "").trim();
+            const fn = new Function("return (" + source + ");");
+            const value = fn();
+            return typeof value === "function" ? value() : value;
+          `,
+          { source: expression },
+        );
         const snapshotAfter = params.snapshotAfter === true;
         const snapshot = snapshotAfter ? await captureLiveTabSnapshot(tab, params) : null;
         return {

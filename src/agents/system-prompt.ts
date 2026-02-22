@@ -96,6 +96,7 @@ export function buildAgentSystemPrompt(params: {
       lines.push(
         "## Web Grounding",
         "For time-sensitive facts or external references, use web tools first, then cite results from tool output.",
+        "For single-step factual lookups (news/checks/quick verification), prefer `web_search` + `web_fetch` and avoid `browser` unless interaction is required.",
         'For multi-step website navigation, prefer `browser` (search/open/snapshot/click/forms/fill/submit/back/forward) over ad-hoc URL guessing.',
         "When a site is JS-heavy (React/Vue/SPA), use `browser` with `engine=live`.",
         "For complex pages, call `browser` snapshot first and use returned element refs (`e1`, `e2`, ...) with `click`/`fill`/`submit`/`hover`/`press`/`select`/`drag`/`act`.",
