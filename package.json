@@ -1,0 +1,32 @@
+{
+  "name": "t560",
+  "version": "0.1.0",
+  "description": "Mini upgradable T560 agent scaffold",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@clack/prompts": "^0.8.2",
+    "@mariozechner/pi-ai": "^0.53.0",
+    "picocolors": "^1.1.1",
+    "playwright": "^1.58.2",
+    "ws": "^8.18.0"
+  },
+  "bin": {
+    "t560": "dist/bin/t560.js"
+  },
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build:ui": "cd ui && npm install && npx vite build",
+    "build:server": "tsc -p tsconfig.json",
+    "build": "npm run build:ui && npm run build:server",
+    "dev": "tsx src/bin/t560.ts",
+    "dev:ui": "cd ui && npx vite",
+    "start": "node dist/bin/t560.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.5",
+    "@types/ws": "^8.5.14",
+    "tsx": "^4.20.4",
+    "typescript": "^5.8.2"
+  }
+}

@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# t560 launcher script.
+# - Runs from any directory (installed via scripts/install_cli.sh).
+# - Uses Node (no Python/venv required).
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "t560 error: node is required but was not found on PATH." >&2
+  echo "Install Node.js (recommended: v22+), then re-run." >&2
+  exit 1
+fi
+
+# Accept both t560 and openclaw env naming.
+export T560_STATE_DIR="${T560_STATE_DIR:-$HOME/.t560}"
+if [[ -n "${T560_STATE_DIR:-}" && -z "${OPENCLAW_STATE_DIR:-}" ]]; then
+  export OPENCLAW_STATE_DIR="$T560_STATE_DIR"
+fi
+if [[ -n "${T560_CONFIG_PATH:-}" && -z "${OPENCLAW_CONFIG_PATH:-}" ]]; then
+  export OPENCLAW_CONFIG_PATH="$T560_CONFIG_PATH"
+fi
+
+if [[ ! -d "$ROOT_DIR/node_modules" ]]; then
+  echo "t560 error: dependencies not installed." >&2
+  echo "Run: bash \"$ROOT_DIR/install.sh\"" >&2
+  exit 1
+fi
+
+TSX_LOADER="$ROOT_DIR/node_modules/tsx/dist/loader.mjs"
+if [[ ! -f "$TSX_LOADER" ]]; then
+  echo "t560 error: tsx loader not found at: $TSX_LOADER" >&2
+  echo "Run: bash \"$ROOT_DIR/install.sh\"" >&2
+  exit 1
+fi
+
+# Normalize cwd to a known-good directory so Node tooling does not fail
+# when invoked from a stale/deleted shell working directory.
+cd "$ROOT_DIR"
+
+exec node --import "$TSX_LOADER" "$ROOT_DIR/src/bin/t560.ts" "$@"

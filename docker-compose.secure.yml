@@ -1,0 +1,38 @@
+services:
+  t560-gateway:
+    image: ${T560_IMAGE:-t560:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      HOME: /home/node
+      T560_STATE_DIR: /home/node/.t560
+      T560_GATEWAY_BIND: ${T560_GATEWAY_BIND:-lan}
+      T560_GATEWAY_PORT: 18789
+    volumes:
+      - t560_state:/home/node/.t560
+    ports:
+      - "${T560_GATEWAY_PORT:-18789}:18789"
+    restart: unless-stopped
+    init: true
+
+  t560-cli:
+    image: ${T560_IMAGE:-t560:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      HOME: /home/node
+      T560_STATE_DIR: /home/node/.t560
+      T560_GATEWAY_BIND: ${T560_GATEWAY_BIND:-lan}
+      T560_GATEWAY_PORT: 18789
+    volumes:
+      - t560_state:/home/node/.t560
+    stdin_open: true
+    tty: true
+    init: true
+    entrypoint: ["node","src/cli.js"]
+
+volumes:
+  t560_state:
+

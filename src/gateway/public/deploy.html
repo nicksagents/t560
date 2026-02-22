@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Deploy t560</title>
+    <style>
+      :root {
+        --bg: #0b0c10;
+        --panel: rgba(255, 255, 255, 0.06);
+        --panel2: rgba(255, 255, 255, 0.09);
+        --text: #f4f6ff;
+        --muted: rgba(244, 246, 255, 0.68);
+        --accent: #ffca3a;
+        --danger: #ff595e;
+        --ok: #8ac926;
+        --border: rgba(244, 246, 255, 0.12);
+        --shadow: 0 20px 50px rgba(0, 0, 0, 0.55);
+        --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+      }
+      body {
+        margin: 0;
+        color: var(--text);
+        font-family: var(--sans);
+        background: radial-gradient(800px 400px at 20% 10%, rgba(255, 202, 58, 0.12), transparent 60%),
+          radial-gradient(900px 500px at 85% 25%, rgba(138, 201, 38, 0.12), transparent 55%),
+          radial-gradient(700px 450px at 60% 90%, rgba(255, 89, 94, 0.12), transparent 55%), var(--bg);
+      }
+      .wrap {
+        max-width: 980px;
+        margin: 0 auto;
+        padding: 28px 18px 60px;
+      }
+      header {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        align-items: baseline;
+        margin-bottom: 18px;
+      }
+      h1 {
+        font-weight: 850;
+        letter-spacing: -0.03em;
+        margin: 0;
+        font-size: 28px;
+      }
+      .tagline {
+        color: var(--muted);
+        font-size: 13px;
+        font-family: var(--mono);
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 14px;
+      }
+      .panel {
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        background: var(--panel);
+        box-shadow: var(--shadow);
+        overflow: hidden;
+      }
+      .panel .hd {
+        padding: 12px 14px;
+        border-bottom: 1px solid var(--border);
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.06), transparent);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+      }
+      .panel .hd .title {
+        font-weight: 700;
+        font-size: 14px;
+        letter-spacing: 0.02em;
+        text-transform: uppercase;
+        color: rgba(244, 246, 255, 0.9);
+      }
+      .panel .bd {
+        padding: 14px;
+      }
+      .note {
+        white-space: pre-wrap;
+        font-family: var(--mono);
+        font-size: 12.5px;
+        line-height: 1.45;
+        color: rgba(244, 246, 255, 0.86);
+        background: rgba(0, 0, 0, 0.35);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 12px;
+        padding: 12px;
+      }
+      .row {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+      button {
+        appearance: none;
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        background: rgba(255, 255, 255, 0.06);
+        color: var(--text);
+        padding: 10px 12px;
+        border-radius: 12px;
+        cursor: pointer;
+        font-weight: 650;
+      }
+      button.primary {
+        border-color: rgba(255, 202, 58, 0.45);
+        background: rgba(255, 202, 58, 0.12);
+      }
+      button.danger {
+        border-color: rgba(255, 89, 94, 0.55);
+        background: rgba(255, 89, 94, 0.12);
+      }
+      input,
+      select,
+      textarea {
+        width: 100%;
+        box-sizing: border-box;
+        background: rgba(0, 0, 0, 0.3);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        color: var(--text);
+        border-radius: 12px;
+        padding: 10px 12px;
+        font-family: var(--mono);
+      }
+      textarea {
+        min-height: 110px;
+      }
+      .hint {
+        color: var(--muted);
+        font-family: var(--mono);
+        font-size: 12px;
+        margin-top: 8px;
+      }
+      .error {
+        color: var(--danger);
+        font-family: var(--mono);
+        font-size: 12px;
+        margin-top: 10px;
+      }
+      .stepMsg {
+        font-family: var(--mono);
+        color: rgba(244, 246, 255, 0.92);
+        font-size: 13px;
+        margin: 0 0 10px;
+      }
+      @media (min-width: 900px) {
+        .grid {
+          grid-template-columns: 0.9fr 1.1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <h1>Deploy t560</h1>
+        <div class="tagline">wizard over http</div>
+      </header>
+
+      <div class="grid">
+        <div class="panel">
+          <div class="hd">
+            <div class="title">Wizard</div>
+            <div class="row">
+              <button id="start" class="primary">Start</button>
+              <button id="cancel" class="danger" disabled>Cancel</button>
+            </div>
+          </div>
+          <div class="bd">
+            <div id="wizardBody"></div>
+            <div id="wizardError" class="error" style="display: none"></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="hd">
+            <div class="title">Notes</div>
+            <div class="row">
+              <button id="clear">Clear</button>
+            </div>
+          </div>
+          <div class="bd">
+            <div id="notes" class="note">(none yet)</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      let wizardId = "";
+
+      const elStart = document.getElementById("start");
+      const elCancel = document.getElementById("cancel");
+      const elClear = document.getElementById("clear");
+      const elNotes = document.getElementById("notes");
+      const elBody = document.getElementById("wizardBody");
+      const elError = document.getElementById("wizardError");
+
+      function showError(msg) {
+        const t = String(msg || "").trim();
+        if (!t) {
+          elError.style.display = "none";
+          elError.textContent = "";
+          return;
+        }
+        elError.style.display = "block";
+        elError.textContent = t;
+      }
+
+      function appendNotes(items) {
+        const lines = [];
+        for (const it of items || []) {
+          if (!it) continue;
+          if (it.type === "note") {
+            const title = it.title ? `[${it.title}]` : "[note]";
+            lines.push(`${title}\n${it.message}\n`);
+          } else if (it.type === "intro") {
+            lines.push(`[intro] ${it.title}\n`);
+          } else if (it.type === "outro") {
+            lines.push(`[outro] ${it.message}\n`);
+          }
+        }
+        const existing = elNotes.textContent === "(none yet)" ? "" : elNotes.textContent;
+        const next = (existing + (existing ? "\n" : "") + lines.join("\n")).trim();
+        elNotes.textContent = next || "(none yet)";
+      }
+
+      function renderStep(step) {
+        if (!step) {
+          elBody.innerHTML = `<div class="hint">No active step. If you're done, open <a href="/" style="color: var(--accent)">WebChat</a>.</div>`;
+          return;
+        }
+
+        const msg = step.message || "";
+        const err = step.error || "";
+
+        let html = `<p class="stepMsg">${escapeHtml(msg)}</p>`;
+        if (err) html += `<div class="error">${escapeHtml(err)}</div>`;
+
+        if (step.type === "confirm") {
+          html += `
+            <div class="row">
+              <button class="primary" data-answer="true">Yes</button>
+              <button data-answer="false">No</button>
+            </div>
+          `;
+        } else if (step.type === "select") {
+          html += `<select id="answerSelect"></select><div class="row" style="margin-top: 10px"><button class="primary" id="submit">Continue</button></div>`;
+        } else if (step.type === "text") {
+          html += `<input id="answerText" placeholder="${escapeHtml(step.placeholder || "")}" value="${escapeHtml(step.initialValue || "")}"/><div class="row" style="margin-top: 10px"><button class="primary" id="submit">Continue</button></div>`;
+        } else {
+          html += `<div class="hint">Unsupported step type: ${escapeHtml(step.type || "unknown")}</div>`;
+        }
+
