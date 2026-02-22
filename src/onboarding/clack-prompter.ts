@@ -13,6 +13,7 @@ import {
 type SelectOption<T> = {
   label: string;
   value: T;
+  hint?: string;
 };
 
 export class OnboardingCancelledError extends Error {
@@ -22,12 +23,12 @@ export class OnboardingCancelledError extends Error {
   }
 }
 
-function assertNotCancelled<T>(value: T): T {
+function assertNotCancelled<T>(value: T | symbol): T {
   if (isCancel(value)) {
     cancel("Setup cancelled.");
     throw new OnboardingCancelledError();
   }
-  return value;
+  return value as T;
 }
 
 export function createClackOnboardingPrompter() {
@@ -64,10 +65,7 @@ export function createClackOnboardingPrompter() {
     async choose<T>(message: string, options: Array<SelectOption<T>>): Promise<T> {
       const value = await select<T>({
         message,
-        options: options.map((option) => ({
-          value: option.value,
-          label: option.label,
-        })),
+        options: options as any,
       });
       return assertNotCancelled(value);
     },

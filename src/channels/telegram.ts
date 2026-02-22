@@ -9,6 +9,7 @@ import {
 import { formatTelegramResponse } from "../format/message-formatter.js";
 import type { GatewayInboundMessage } from "../gateway/types.js";
 import { isHeartbeatCheckMessage } from "../gateway/heartbeat.js";
+import type { AgentEvent } from "../agents/agent-events.js";
 import { isPairingApproved, requestPairingCode } from "./pairing.js";
 
 export type TelegramBridge = {
@@ -19,6 +20,10 @@ export type TelegramBridge = {
 
 export type TelegramBridgeOptions = {
   handleMessage: (input: GatewayInboundMessage) => Promise<ChatResponse>;
+  subscribeEvents?: (params: {
+    sessionId?: string;
+    onEvent: (event: AgentEvent) => void;
+  }) => () => void;
 };
 
 type TelegramUpdate = {

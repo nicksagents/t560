@@ -92,7 +92,7 @@ function normalizeToolParametersForTool(
       ...tool,
       parameters: (isGeminiProvider && !isAnthropicProvider
         ? cleanSchemaForGemini(schema)
-        : schema) as TSchema,
+        : schema) as unknown as TSchema,
     };
   }
 
@@ -107,7 +107,7 @@ function normalizeToolParametersForTool(
       ...tool,
       parameters: (isGeminiProvider && !isAnthropicProvider
         ? cleanSchemaForGemini(schemaWithType)
-        : schemaWithType) as TSchema,
+        : schemaWithType) as unknown as TSchema,
     };
   }
 
@@ -178,7 +178,7 @@ function normalizeToolParametersForTool(
     ...tool,
     parameters: (isGeminiProvider && !isAnthropicProvider
       ? cleanSchemaForGemini(flattenedSchema)
-      : flattenedSchema) as TSchema,
+      : flattenedSchema) as unknown as TSchema,
   };
 }
 
@@ -204,7 +204,7 @@ export function cleanToolSchemaForGemini(tools: Tool<TSchema>[]): Tool<TSchema>[
     }
     return {
       ...tool,
-      parameters: cleanSchemaForGemini(schema) as TSchema,
+      parameters: cleanSchemaForGemini(schema) as unknown as TSchema,
     };
   });
 }

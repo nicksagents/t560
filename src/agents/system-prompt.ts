@@ -9,12 +9,15 @@ export function buildAgentSystemPrompt(params: {
   toolHint?: string;
 }): string {
   const lines: string[] = [];
+  const now = new Date();
+  const currentDateIso = now.toISOString().slice(0, 10);
   const toolNames = (params.toolNames ?? []).map((tool) => tool.trim()).filter(Boolean);
   const normalizedTools = toolNames.map((tool) => tool.toLowerCase());
   const availableTools = new Set(normalizedTools);
   const readToolName = availableTools.has("read") ? "read" : "exec";
 
   lines.push("You are a personal assistant running inside T560.", "");
+  lines.push(`Current date (UTC): ${currentDateIso}.`, "");
   lines.push("Treat injected project files as authoritative context when present.", "");
 
   const injectedFiles = params.injectedContextFiles ?? [];
@@ -39,8 +42,9 @@ export function buildAgentSystemPrompt(params: {
       find: "Search for files by path substring.",
       exists: "Check whether a file or directory exists.",
       browser:
-        "Stateful browser navigation with tabs/history/snapshot/search/click/forms/fill/submit/hover/press/select/drag/evaluate/upload/dialog/console/pdf/scroll/resize/back/forward; use engine=live for SPA/reactive sites.",
-      web_search: "Search DuckDuckGo and optionally fetch top results for grounded excerpts.",
+        "Stateful browser navigation with tabs/history/snapshot/search/click/forms/fill/submit/login/mfa/hover/press/select/drag/evaluate/upload/dialog/console/pdf/scroll/resize/back/forward; use engine=live for SPA/reactive sites.",
+      web_search:
+        "Search the web for up-to-date info (Brave when configured, DuckDuckGo fallback) and optionally fetch top results for grounded excerpts.",
       web_fetch: "Fetch a URL and return a readable text snapshot.",
     };
     const toolOrder = [
@@ -92,17 +96,46 @@ export function buildAgentSystemPrompt(params: {
       ""
     );
 
-    if (availableTools.has("web_search") || availableTools.has("web_fetch")) {
+    const hasWebSearch = availableTools.has("web_search");
+    const hasWebFetch = availableTools.has("web_fetch");
+    const hasBrowser = availableTools.has("browser");
+    if (hasWebSearch || hasWebFetch || hasBrowser) {
       lines.push(
         "## Web Grounding",
-        "For time-sensitive facts or external references, use web tools first, then cite results from tool output.",
-        "For single-step factual lookups (news/checks/quick verification), prefer `web_search` + `web_fetch` and avoid `browser` unless interaction is required.",
-        'For multi-step website navigation, prefer `browser` (search/open/snapshot/click/forms/fill/submit/back/forward) over ad-hoc URL guessing.',
-        "When a site is JS-heavy (React/Vue/SPA), use `browser` with `engine=live`.",
-        "For complex pages, call `browser` snapshot first and use returned element refs (`e1`, `e2`, ...) with `click`/`fill`/`submit`/`hover`/`press`/`select`/`drag`/`act`.",
-        "Use `console` to inspect browser logs, `dialog` to arm confirm/prompt handling, `upload` for file inputs, `scroll`/`resize` for viewport control, and `pdf` to export current page.",
-        ""
+        "For time-sensitive facts or external references, use available web tools first, then cite results from tool output.",
+        "For requests containing words like current/latest/today/right now/live, verify source dates and do not rely on stale-year pages when newer year pages are available.",
       );
+      if (hasWebSearch && hasWebFetch) {
+        lines.push(
+          "For single-step factual lookups (news/checks/quick verification), prefer `web_search` then `web_fetch` for the most relevant URLs."
+        );
+      } else if (hasWebSearch) {
+        lines.push(
+          "For single-step factual lookups (news/checks/quick verification), use `web_search` first; use `browser` only when interaction is required."
+        );
+      } else if (hasWebFetch && hasBrowser) {
+        lines.push(
+          "If `web_search` is unavailable, use `browser` action=`search`/`open` to find URLs, then use `web_fetch` for clean text grounding."
+        );
+      } else if (hasWebFetch) {
+        lines.push("Use `web_fetch` for user-provided URLs and ground answers from fetched text.");
+      }
+      if (hasBrowser) {
+        lines.push(
+          'For multi-step website navigation, prefer `browser` (search/open/snapshot/click/forms/fill/submit/back/forward) over ad-hoc URL guessing.',
+          "Important: `browser` action=`open` uses an internal tool tab and may not open a visible desktop browser window.",
+          "If the user asks to open a browser/window for them on their machine, use `browser` action=`launch` with the target URL.",
+          "When a site is JS-heavy (React/Vue/SPA), use `browser` with `engine=live`.",
+          "For complex pages, call `browser` snapshot first and use returned element refs (`e1`, `e2`, ...) with `click`/`fill`/`submit`/`hover`/`press`/`select`/`drag`/`act`.",
+          "For login pages with stored credentials, use `browser` action=`login` with `service=<site>` (examples: email, x.com, havenvaults2-0) to avoid requesting or exposing secrets.",
+          "If `browser` login returns `requiresMfa: true`, ask the user for the one-time code in one short line, then immediately call `browser` action=`mfa` with `code` once they provide it.",
+          "When the user sends a likely one-time code (4-10 digits), do not ask them to repeat it; use it directly via `browser` action=`mfa`.",
+          "If credentials are missing, tell the user to run `/setup <service-or-site>` in chat rather than asking them to paste passwords directly.",
+          "Use `console` to inspect browser logs, `dialog` to arm confirm/prompt handling, `upload` for file inputs, `scroll`/`resize` for viewport control, and `pdf` to export current page.",
+          'Before purchase/checkout actions (for example "buy now", "place order", payment submit), ask for explicit user confirmation phrase: "confirm purchase".',
+        );
+      }
+      lines.push("");
     }
   }
 

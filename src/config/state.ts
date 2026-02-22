@@ -55,6 +55,30 @@ export type ToolPolicyConfig = {
 
 export type ToolProfileId = "minimal" | "coding" | "messaging" | "full";
 
+export type WebSearchProvider = "brave" | "duckduckgo";
+
+export type WebSearchToolConfig = {
+  enabled?: boolean;
+  provider?: WebSearchProvider;
+  apiKey?: string;
+  timeoutMs?: number;
+  maxResults?: number;
+  region?: string;
+  fetchTop?: number;
+  fetchMaxBytes?: number;
+};
+
+export type WebFetchToolConfig = {
+  enabled?: boolean;
+  timeoutMs?: number;
+  maxBytes?: number;
+};
+
+export type WebToolsConfig = {
+  search?: WebSearchToolConfig;
+  fetch?: WebFetchToolConfig;
+};
+
 export type ToolsConfig = {
   dangerouslyUnrestricted?: boolean;
   profile?: ToolProfileId;
@@ -70,6 +94,7 @@ export type ToolsConfig = {
     timeoutSec?: number;
     allowBackground?: boolean;
   };
+  web?: WebToolsConfig;
   selfProtection?: {
     enabled?: boolean;
     installRoot?: string;
@@ -355,6 +380,65 @@ function normalizeTools(raw: unknown): ToolsConfig | undefined {
       ? (profileRaw as ToolProfileId)
       : undefined;
 
+  const webRaw = obj.web;
+  const webObj = webRaw && typeof webRaw === "object" ? (webRaw as Record<string, unknown>) : null;
+  const searchRaw =
+    webObj?.search && typeof webObj.search === "object"
+      ? (webObj.search as Record<string, unknown>)
+      : null;
+  const fetchRaw =
+    webObj?.fetch && typeof webObj.fetch === "object"
+      ? (webObj.fetch as Record<string, unknown>)
+      : null;
+  const providerRaw = String(searchRaw?.provider ?? "").trim().toLowerCase();
+  const searchProvider =
+    providerRaw === "duckduckgo" || providerRaw === "brave"
+      ? (providerRaw as WebSearchProvider)
+      : undefined;
+
+  const web: WebToolsConfig | undefined = webObj
+    ? {
+        search: searchRaw
+          ? {
+              enabled: typeof searchRaw.enabled === "boolean" ? searchRaw.enabled : undefined,
+              provider: searchProvider,
+              apiKey: typeof searchRaw.apiKey === "string" ? (searchRaw.apiKey.trim() || undefined) : undefined,
+              timeoutMs:
+                typeof searchRaw.timeoutMs === "number" && Number.isFinite(searchRaw.timeoutMs)
+                  ? Math.max(1000, Math.floor(searchRaw.timeoutMs))
+                  : undefined,
+              maxResults:
+                typeof searchRaw.maxResults === "number" && Number.isFinite(searchRaw.maxResults)
+                  ? Math.max(1, Math.floor(searchRaw.maxResults))
+                  : undefined,
+              region:
+                typeof searchRaw.region === "string" ? (searchRaw.region.trim() || undefined) : undefined,
+              fetchTop:
+                typeof searchRaw.fetchTop === "number" && Number.isFinite(searchRaw.fetchTop)
+                  ? Math.max(0, Math.floor(searchRaw.fetchTop))
+                  : undefined,
+              fetchMaxBytes:
+                typeof searchRaw.fetchMaxBytes === "number" && Number.isFinite(searchRaw.fetchMaxBytes)
+                  ? Math.max(10_000, Math.floor(searchRaw.fetchMaxBytes))
+                  : undefined,
+            }
+          : undefined,
+        fetch: fetchRaw
+          ? {
+              enabled: typeof fetchRaw.enabled === "boolean" ? fetchRaw.enabled : undefined,
+              timeoutMs:
+                typeof fetchRaw.timeoutMs === "number" && Number.isFinite(fetchRaw.timeoutMs)
+                  ? Math.max(1000, Math.floor(fetchRaw.timeoutMs))
+                  : undefined,
+              maxBytes:
+                typeof fetchRaw.maxBytes === "number" && Number.isFinite(fetchRaw.maxBytes)
+                  ? Math.max(10_000, Math.floor(fetchRaw.maxBytes))
+                  : undefined,
+            }
+          : undefined,
+      }
+    : undefined;
+
   return {
     dangerouslyUnrestricted:
       typeof obj.dangerouslyUnrestricted === "boolean"
@@ -388,6 +472,7 @@ function normalizeTools(raw: unknown): ToolsConfig | undefined {
                 : undefined,
           }
         : undefined,
+    web,
     selfProtection:
       obj.selfProtection && typeof obj.selfProtection === "object"
         ? {

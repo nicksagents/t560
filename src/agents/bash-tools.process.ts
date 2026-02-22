@@ -1,5 +1,6 @@
 import { Type } from "@mariozechner/pi-ai";
 import type { AnyAgentTool } from "./pi-tools.types.js";
+import type { ProcessSession } from "./bash-process-registry.js";
 import {
   deleteSession,
   drainSession,
@@ -32,6 +33,16 @@ function renderSessionSummary(params: {
   const runtimeMs = (params.endedAt ?? Date.now()) - params.startedAt;
   const seconds = Math.max(0, Math.round(runtimeMs / 1000));
   return `${params.id} ${params.status} ${seconds}s :: ${params.command}`;
+}
+
+function resolveProcessStatus(session: ProcessSession): "running" | "completed" | "failed" {
+  if (!session.exited) {
+    return "running";
+  }
+  if ((session.exitCode ?? 0) === 0 && !session.exitSignal) {
+    return "completed";
+  }
+  return "failed";
 }
 
 export function createProcessTool(defaults?: ProcessToolDefaults): AnyAgentTool {
@@ -72,7 +83,6 @@ export function createProcessTool(defaults?: ProcessToolDefaults): AnyAgentTool 
           .map((session) => ({
             sessionId: session.id,
             status: session.status,
-            pid: session.pid,
             command: session.command,
             cwd: session.cwd,
             startedAt: session.startedAt,
@@ -122,9 +132,7 @@ export function createProcessTool(defaults?: ProcessToolDefaults): AnyAgentTool 
               details: { status: "failed" }
             };
           }
-          const stdout = scopedFinished.stdout.join("");
-          const stderr = scopedFinished.stderr.join("");
-          const text = [stdout, stderr].filter(Boolean).join("") || "(no output)";
+          const text = scopedFinished.aggregated || "(no output)";
           return {
             content: [{ type: "text", text }],
             details: {
@@ -153,11 +161,7 @@ export function createProcessTool(defaults?: ProcessToolDefaults): AnyAgentTool 
         return {
           content: [{ type: "text", text }],
           details: {
-            status: scopedRunning.exited
-              ? scopedRunning.status === "completed"
-                ? "completed"
-                : "failed"
-              : "running",
+            status: resolveProcessStatus(scopedRunning),
             sessionId,
             running: !scopedRunning.exited,
             exitCode: scopedRunning.exitCode,
@@ -174,9 +178,7 @@ export function createProcessTool(defaults?: ProcessToolDefaults): AnyAgentTool 
             details: { status: "failed" }
           };
         }
-        const stdout = target.stdout.join("");
-        const stderr = target.stderr.join("");
-        const all = [stdout, stderr].filter(Boolean).join("");
+        const all = target.aggregated;
         const lines = all.split(/\r?\n/);
         const offset = Math.max(0, Number(params.offset ?? 0));
         const limitRaw = Number(params.limit ?? 200);
@@ -209,7 +211,7 @@ export function createProcessTool(defaults?: ProcessToolDefaults): AnyAgentTool 
             details: { status: "failed" }
           };
         }
-        const stdin = scopedRunning.child.stdin;
+        const stdin = scopedRunning.stdin;
         if (!stdin || stdin.destroyed) {
           return {
             content: [{ type: "text", text: `Session ${sessionId} stdin is not writable.` }],
@@ -235,7 +237,7 @@ export function createProcessTool(defaults?: ProcessToolDefaults): AnyAgentTool 
       }
 
       if (action === "kill") {
-        if (scopedRunning) {
+        if (scopedRunning?.child) {
           scopedRunning.child.kill("SIGTERM");
           return {
             content: [{ type: "text", text: `Sent SIGTERM to ${sessionId}.` }],

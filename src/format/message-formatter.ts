@@ -244,6 +244,35 @@ function formatToolResultSummary(result?: unknown, error?: string): string[] {
 }
 
 export function formatTerminalToolEvent(event: AgentEvent): string | null {
+  if (event.stream === "assistant") {
+    const text = typeof event.data.text === "string" ? event.data.text.trim() : "";
+    if (!text) {
+      return null;
+    }
+    const prefix = event.data.phase === "pretool" ? "🧠" : "↳";
+    if (isRich()) {
+      return `${theme.info(prefix)} ${theme.dim(text)}`;
+    }
+    return `${prefix} ${text}`;
+  }
+
+  if (event.stream === "status") {
+    if (event.data.phase === "route") {
+      const slot = typeof event.data.slot === "string" ? event.data.slot : "default";
+      const provider = typeof event.data.provider === "string" ? event.data.provider : "unknown";
+      const model = typeof event.data.model === "string" ? event.data.model : "unknown";
+      const text = `route: ${slot} -> ${provider}/${model}`;
+      return isRich() ? theme.dim(text) : text;
+    }
+    if (event.data.phase === "provider") {
+      const provider = typeof event.data.provider === "string" ? event.data.provider : "unknown";
+      const model = typeof event.data.model === "string" ? event.data.model : "unknown";
+      const text = `provider: ${provider}/${model}`;
+      return isRich() ? theme.dim(text) : text;
+    }
+    return null;
+  }
+
   if (event.stream !== "tool") {
     return null;
   }

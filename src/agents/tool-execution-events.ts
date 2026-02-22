@@ -1,7 +1,7 @@
 import { emitAgentEvent } from "./agent-events.js";
 import { progressMessageForToolStart } from "./tool-progress.js";
 
-const EMIT_SYNTHETIC_PROGRESS = process.env.T560_SYNTH_PROGRESS === "1";
+const EMIT_SYNTHETIC_PROGRESS = process.env.T560_SYNTH_PROGRESS !== "0";
 
 export function handleToolExecutionStart(params: {
   sessionId: string;

@@ -2,6 +2,7 @@ import { exec as execCallback } from "node:child_process";
 import { Type } from "@mariozechner/pi-ai";
 import type { AnyAgentTool } from "./pi-tools.types.js";
 import { assertExecCommandAllowed, type SelfProtectionPolicy } from "./self-protection.js";
+import { commandTouchesSensitivePath } from "../security/credentials-vault.js";
 
 export type ExecToolDefaults = {
   cwd?: string;
@@ -57,6 +58,9 @@ export function createExecTool(defaults?: ExecToolDefaults): AnyAgentTool {
           policy: selfProtection
         });
       }
+      if (commandTouchesSensitivePath(command)) {
+        throw new Error("Command blocked: direct access to .env or vault credential paths is not allowed.");
+      }
 
       if (background && !allowBackground) {
         throw new Error("Background execution is disabled.");
@@ -70,10 +74,15 @@ export function createExecTool(defaults?: ExecToolDefaults): AnyAgentTool {
             cwd,
             timeout: timeout * 1000,
             maxBuffer: 2 * 1024 * 1024,
-            shell: true,
+            shell: process.env.SHELL ?? "/bin/sh",
+            encoding: "utf8",
             env: process.env,
           },
-          (error, stdout, stderr) => {
+          (
+            error: Error | null,
+            stdout: string,
+            stderr: string,
+          ) => {
             const out = String(stdout ?? "");
             const err = String(stderr ?? "");
 

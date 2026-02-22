@@ -2,6 +2,8 @@ import { Type } from "@mariozechner/pi-ai";
 import type { AnyAgentTool } from "../pi-tools.types.js";
 import { duckDuckGoSearch } from "../../web/duckduckgo_search.js";
 import { chooseReadableText, decodeHtmlEntities } from "../../web/fetch.js";
+import { extractEcommerceCandidates, pickCheapestCandidate } from "../ecommerce.js";
+import { getCredential, normalizeSetupService } from "../../security/credentials-vault.js";
 import { mkdtemp, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -15,6 +17,7 @@ const DEFAULT_SEARCH_COUNT = 8;
 const DEFAULT_SCREENSHOT_WIDTH = 1440;
 const DEFAULT_SCREENSHOT_HEIGHT = 900;
 const DEFAULT_WAIT_MS = 1200;
+const DEFAULT_ACTION_MAX_RETRIES = 1;
 const LIVE_ENGINE_VIEWPORT_WIDTH = 1440;
 const LIVE_ENGINE_VIEWPORT_HEIGHT = 900;
 const LIVE_ENGINE_USER_AGENT =
@@ -50,6 +53,10 @@ type LiveDialogEvent = {
   message: string;
   defaultValue: string;
   handled: string;
+};
+
+type ExternalLaunchResult = {
+  command: string[];
 };
 
 type BrowserLink = {
@@ -334,6 +341,55 @@ async function closeLiveTab(tabId: string): Promise<void> {
   }
 }
 
+async function launchExternalBrowser(url: string, timeoutMs: number): Promise<ExternalLaunchResult> {
+  const platform = process.platform;
+  let command = "";
+  let args: string[] = [];
+  if (platform === "darwin") {
+    command = "open";
+    args = [url];
+  } else if (platform === "win32") {
+    command = "cmd";
+    args = ["/c", "start", "", url];
+  } else {
+    command = "xdg-open";
+    args = [url];
+  }
+
+  let stderrText = "";
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(command, args, {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`external browser launch timed out after ${timeoutMs}ms.`));
+    }, timeoutMs);
+
+    child.stderr?.on("data", (chunk) => {
+      stderrText += String(chunk ?? "");
+    });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      const details = stderrText.trim();
+      const suffix = details ? ` ${details.split("\n").slice(-2).join(" ").trim()}` : "";
+      reject(new Error(`external browser launch failed (exit ${code ?? "unknown"}).${suffix}`));
+    });
+  });
+
+  return {
+    command: [command, ...args],
+  };
+}
+
 async function resetLiveRuntime(): Promise<void> {
   const pageIds = Array.from(livePagesByTabId.keys());
   for (const tabId of pageIds) {
@@ -373,6 +429,204 @@ function normalizeEngineParam(value: unknown): "auto" | BrowserEngineMode {
     return raw;
   }
   throw new Error("engine must be one of: auto|fetch|live");
+}
+
+function shouldAllowEngineFallback(params: Record<string, unknown>): boolean {
+  return params.allowEngineFallback !== false;
+}
+
+function formatToolError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
+}
+
+function normalizeBrowserActionParams(input: Record<string, unknown>): Record<string, unknown> {
+  const params = { ...input };
+
+  const targetId = String(params.targetId ?? "").trim();
+  if (targetId && params.tabId === undefined) {
+    params.tabId = targetId;
+  }
+
+  const targetUrl = String(params.targetUrl ?? "").trim();
+  if (targetUrl && params.url === undefined) {
+    params.url = targetUrl;
+  }
+
+  const elementSelector = String(params.element ?? "").trim();
+  if (elementSelector && params.selector === undefined) {
+    params.selector = elementSelector;
+  }
+
+  const inputRef = String(params.inputRef ?? "").trim();
+  if (inputRef && params.ref === undefined) {
+    params.ref = inputRef;
+  }
+
+  const request = params.request;
+  if (request && typeof request === "object" && !Array.isArray(request)) {
+    const req = request as Record<string, unknown>;
+    if (params.target === undefined && req.target !== undefined) {
+      params.target = req.target;
+    }
+    if (params.node === undefined && req.node !== undefined) {
+      params.node = req.node;
+    }
+    if (params.profile === undefined && req.profile !== undefined) {
+      params.profile = req.profile;
+    }
+    if (params.kind === undefined && req.kind !== undefined) {
+      params.kind = req.kind;
+    }
+    if (params.tabId === undefined && req.targetId !== undefined) {
+      params.tabId = req.targetId;
+    }
+    if (params.url === undefined && req.targetUrl !== undefined) {
+      params.url = req.targetUrl;
+    }
+    if (params.ref === undefined && req.ref !== undefined) {
+      params.ref = req.ref;
+    }
+    if (params.ref === undefined && req.inputRef !== undefined) {
+      params.ref = req.inputRef;
+    }
+    if (params.selector === undefined && req.selector !== undefined) {
+      params.selector = req.selector;
+    }
+    if (params.selector === undefined && req.element !== undefined) {
+      params.selector = req.element;
+    }
+    if (params.button === undefined && req.button !== undefined) {
+      params.button = req.button;
+    }
+    if (params.doubleClick === undefined && req.doubleClick !== undefined) {
+      params.doubleClick = req.doubleClick;
+    }
+    if (params.modifiers === undefined && req.modifiers !== undefined) {
+      params.modifiers = req.modifiers;
+    }
+    if (params.value === undefined && req.text !== undefined) {
+      params.value = req.text;
+    }
+    if (params.submit === undefined && req.submit !== undefined) {
+      params.submit = req.submit;
+    }
+    if (params.slowly === undefined && req.slowly !== undefined) {
+      params.slowly = req.slowly;
+    }
+    if (params.key === undefined && req.key !== undefined) {
+      params.key = req.key;
+    }
+    if (params.startRef === undefined && req.startRef !== undefined) {
+      params.startRef = req.startRef;
+    }
+    if (params.endRef === undefined && req.endRef !== undefined) {
+      params.endRef = req.endRef;
+    }
+    if (params.values === undefined && req.values !== undefined) {
+      params.values = req.values;
+    }
+    if (params.fields === undefined && req.fields !== undefined) {
+      params.fields = req.fields;
+    }
+    if (params.formIndex === undefined && req.formIndex !== undefined) {
+      params.formIndex = req.formIndex;
+    }
+    if (params.fieldName === undefined && req.fieldName !== undefined) {
+      params.fieldName = req.fieldName;
+    }
+    if (params.value === undefined && req.value !== undefined) {
+      params.value = req.value;
+    }
+    if (params.path === undefined && req.path !== undefined) {
+      params.path = req.path;
+    }
+    if (params.paths === undefined && req.paths !== undefined) {
+      params.paths = req.paths;
+    }
+    if (params.linkIndex === undefined && req.linkIndex !== undefined) {
+      params.linkIndex = req.linkIndex;
+    }
+    if (params.width === undefined && req.width !== undefined) {
+      params.width = req.width;
+    }
+    if (params.height === undefined && req.height !== undefined) {
+      params.height = req.height;
+    }
+    if (params.timeMs === undefined && req.timeMs !== undefined) {
+      params.timeMs = req.timeMs;
+    }
+    if (params.allowEngineFallback === undefined && req.allowEngineFallback !== undefined) {
+      params.allowEngineFallback = req.allowEngineFallback;
+    }
+    if (params.maxRetries === undefined && req.maxRetries !== undefined) {
+      params.maxRetries = req.maxRetries;
+    }
+    if (params.expression === undefined && req.fn !== undefined) {
+      params.expression = req.fn;
+    }
+    if (params.accept === undefined && req.accept !== undefined) {
+      params.accept = req.accept;
+    }
+    if (params.once === undefined && req.once !== undefined) {
+      params.once = req.once;
+    }
+    if (params.promptText === undefined && req.promptText !== undefined) {
+      params.promptText = req.promptText;
+    }
+    if (params.format === undefined && req.format !== undefined) {
+      params.format = req.format;
+    }
+    if (params.printBackground === undefined && req.printBackground !== undefined) {
+      params.printBackground = req.printBackground;
+    }
+    if (params.deltaX === undefined && req.deltaX !== undefined) {
+      params.deltaX = req.deltaX;
+    }
+    if (params.deltaY === undefined && req.deltaY !== undefined) {
+      params.deltaY = req.deltaY;
+    }
+    if (params.toTop === undefined && req.toTop !== undefined) {
+      params.toTop = req.toTop;
+    }
+    if (params.toBottom === undefined && req.toBottom !== undefined) {
+      params.toBottom = req.toBottom;
+    }
+    if (params.waitForSelector === undefined && req.waitForSelector !== undefined) {
+      params.waitForSelector = req.waitForSelector;
+    }
+    if (params.urlContains === undefined && req.urlContains !== undefined) {
+      params.urlContains = req.urlContains;
+    }
+    if (params.state === undefined && req.state !== undefined) {
+      params.state = req.state;
+    }
+    if (params.clear === undefined && req.clear !== undefined) {
+      params.clear = req.clear;
+    }
+    if (params.level === undefined && req.level !== undefined) {
+      params.level = req.level;
+    }
+    if (params.limit === undefined && req.limit !== undefined) {
+      params.limit = req.limit;
+    }
+    if (
+      params.waitForText === undefined &&
+      req.text !== undefined &&
+      String(req.kind ?? "")
+        .trim()
+        .toLowerCase() === "wait"
+    ) {
+      params.waitForText = req.text;
+    }
+    if (params.textGone === undefined && req.textGone !== undefined) {
+      params.textGone = req.textGone;
+    }
+  }
+
+  return params;
 }
 
 function normalizeHttpUrl(value: unknown, baseUrl?: string): string {
@@ -767,6 +1021,7 @@ async function captureFirefoxScreenshot(params: {
   width: number;
   height: number;
   url: string;
+  type: "png";
 }> {
   const filePath = path.join(
     os.tmpdir(),
@@ -830,6 +1085,7 @@ async function captureFirefoxScreenshot(params: {
     width: params.width,
     height: params.height,
     url: params.url,
+    type: "png",
   };
 }
 
@@ -993,6 +1249,32 @@ async function captureTabSnapshot(
   tab.lastSnapshot = snapshot;
   tab.updatedAt = Date.now();
   return snapshot;
+}
+
+async function captureTabSnapshotWithRetries(
+  tab: BrowserTab,
+  params: Record<string, unknown>,
+  request?: { method?: "GET" | "POST"; url?: string; body?: string },
+): Promise<{ snapshot: BrowserSnapshot; attempts: number }> {
+  const retries = clampInt(params.maxRetries, 0, 4, DEFAULT_ACTION_MAX_RETRIES);
+  let attempts = 0;
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    attempts = attempt + 1;
+    try {
+      const snapshot = await captureTabSnapshot(tab, params, request);
+      return {
+        snapshot,
+        attempts,
+      };
+    } catch (error) {
+      lastError = error;
+      if (attempt >= retries) {
+        break;
+      }
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("snapshot capture failed.");
 }
 
 function resolveForm(tab: BrowserTab, formIndexRaw: unknown, refRaw?: unknown): BrowserForm {
@@ -1407,6 +1689,7 @@ async function captureLiveScreenshot(tab: BrowserTab, params: Record<string, unk
   width: number;
   height: number;
   url: string;
+  type: "png" | "jpeg";
 }> {
   const page = getLivePage(tab.id);
   if (!page) {
@@ -1415,17 +1698,20 @@ async function captureLiveScreenshot(tab: BrowserTab, params: Record<string, unk
   const width = clampInt(params.width, 320, 4096, DEFAULT_SCREENSHOT_WIDTH);
   const height = clampInt(params.height, 240, 4096, DEFAULT_SCREENSHOT_HEIGHT);
   const timeoutMs = clampInt(params.timeoutMs, 1000, 120000, DEFAULT_TIMEOUT_MS);
+  const requestedType = String(params.type ?? "").trim().toLowerCase();
+  const shotType: "png" | "jpeg" = requestedType === "jpeg" || requestedType === "jpg" ? "jpeg" : "png";
+  const ext = shotType === "jpeg" ? "jpg" : "png";
   const filePath = path.join(
     os.tmpdir(),
-    `t560-browser-live-shot-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.png`,
+    `t560-browser-live-shot-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`,
   );
 
   await page.setViewportSize({ width, height });
   await page.screenshot({
     path: filePath,
-    type: "png",
+    type: shotType,
     timeout: timeoutMs,
-    fullPage: false,
+    fullPage: params.fullPage === true,
   });
   const info = await stat(filePath);
   return {
@@ -1434,6 +1720,7 @@ async function captureLiveScreenshot(tab: BrowserTab, params: Record<string, unk
     width,
     height,
     url: normalizeHttpUrl(page.url() || tab.url),
+    type: shotType,
   };
 }
 
@@ -1762,31 +2049,452 @@ async function registerPopupTabFromLivePage(
   return { tab: popupTab, snapshot: null };
 }
 
-export function createBrowserTool(): AnyAgentTool {
+function resolveSetupServiceFromBrowserInput(serviceRaw: unknown, currentUrl: string): string | null {
+  const explicit = normalizeSetupService(String(serviceRaw ?? ""));
+  if (explicit) {
+    return explicit;
+  }
+  const url = String(currentUrl ?? "").trim().toLowerCase();
+  if (!url) {
+    return null;
+  }
+  if (/\b(x\.com|twitter\.com)\b/.test(url)) {
+    return "x.com";
+  }
+  if (/\b(mail\.google\.com|gmail\.com|outlook\.live\.com|outlook\.office\.com|mail\.yahoo\.com)\b/.test(url)) {
+    return "email";
+  }
+  try {
+    const parsed = new URL(url);
+    return normalizeSetupService(parsed.hostname) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function deriveServiceCandidates(params: {
+  explicitServiceRaw: unknown;
+  currentUrl: string;
+}): string[] {
+  const candidates: string[] = [];
+  const push = (value: string | null) => {
+    const normalized = normalizeSetupService(String(value ?? ""));
+    if (!normalized) {
+      return;
+    }
+    if (!candidates.includes(normalized)) {
+      candidates.push(normalized);
+    }
+  };
+
+  const explicit = normalizeSetupService(String(params.explicitServiceRaw ?? ""));
+  if (explicit) {
+    push(explicit);
+  }
+
+  const liveService = resolveSetupServiceFromBrowserInput("", params.currentUrl);
+  if (liveService) {
+    // Host-specific service is more precise than short alias.
+    candidates.unshift(liveService);
+    if (liveService.includes(".")) {
+      push(liveService.split(".")[0] ?? "");
+    }
+  }
+
+  if (explicit && explicit.includes(".")) {
+    push(explicit.split(".")[0] ?? "");
+  }
+
+  return Array.from(new Set(candidates.filter(Boolean)));
+}
+
+function maskCredentialIdentifier(identifier: string): string {
+  const value = String(identifier ?? "").trim();
+  if (!value) {
+    return "(empty)";
+  }
+  const atIndex = value.indexOf("@");
+  if (atIndex > 1) {
+    return `${value.slice(0, 1)}***${value.slice(atIndex)}`;
+  }
+  if (value.length <= 4) {
+    return `${value[0] ?? "*"}***`;
+  }
+  return `${value.slice(0, 2)}***${value.slice(-1)}`;
+}
+
+async function selectFirstUsableLocator(page: any, selectors: string[], timeoutMs: number): Promise<{
+  selector: string;
+  locator: any;
+} | null> {
+  for (const selector of selectors) {
+    const normalized = String(selector ?? "").trim();
+    if (!normalized) {
+      continue;
+    }
+    try {
+      const locator = page.locator(normalized).first();
+      const count = Number(await locator.count());
+      if (!Number.isFinite(count) || count < 1) {
+        continue;
+      }
+      try {
+        await locator.waitFor({ state: "visible", timeout: Math.min(timeoutMs, 1500) });
+      } catch {
+        // Continue even if visibility wait fails; fill/click can still succeed.
+      }
+      return { selector: normalized, locator };
+    } catch {
+      // Keep trying next selector.
+    }
+  }
+  return null;
+}
+
+async function performLiveCredentialLogin(params: {
+  tab: BrowserTab;
+  service: string;
+  identifier: string;
+  secret: string;
+  authMode: "password" | "passwordless_mfa_code";
+  timeoutMs: number;
+}): Promise<{
+  service: string;
+  identifierMasked: string;
+  identifierSelector: string;
+  passwordSelector: string | null;
+  submitted: boolean;
+  requiresMfa: boolean;
+  authMode: "password" | "passwordless_mfa_code";
+}> {
+  const page = requireLivePage(params.tab);
+  const timeoutMs = Math.max(1000, params.timeoutMs);
+
+  const identifierSelectors =
+    params.service === "x.com"
+      ? [
+          'input[name="text"]',
+          'input[autocomplete="username"]',
+          'input[name="session[username_or_email]"]',
+          'input[type="email"]',
+          'input[type="text"]',
+        ]
+      : [
+          'input[type="email"]',
+          'input[name="identifier"]',
+          'input[name="username"]',
+          'input[autocomplete="username"]',
+          'input[type="text"]',
+        ];
+  const passwordSelectors =
+    params.service === "x.com"
+      ? ['input[name="password"]', 'input[type="password"]']
+      : ['input[type="password"]', 'input[name="password"]'];
+  const mfaInputSelectors = [
+    'input[autocomplete="one-time-code"]',
+    'input[name*="otp" i]',
+    'input[id*="otp" i]',
+    'input[name*="mfa" i]',
+    'input[id*="mfa" i]',
+    'input[name*="twofactor" i]',
+    'input[id*="twofactor" i]',
+    'input[name*="verification" i]',
+    'input[id*="verification" i]',
+    'input[name*="code" i]',
+    'input[id*="code" i]',
+  ];
+  const mfaHintRegex = /\b(verification code|one[-\s]?time code|otp|2fa|mfa|authenticator app|passcode)\b/i;
+
+  const identifierTarget = await selectFirstUsableLocator(page, identifierSelectors, timeoutMs);
+  if (!identifierTarget) {
+    throw new Error(`No login identifier input was found for service=${params.service}.`);
+  }
+  await identifierTarget.locator.fill(params.identifier, { timeout: timeoutMs });
+
+  let passwordTarget: { selector: string; locator: any } | null = null;
+  if (params.authMode === "password") {
+    passwordTarget = await selectFirstUsableLocator(page, passwordSelectors, timeoutMs);
+    if (!passwordTarget && params.service === "x.com") {
+      try {
+        await page.getByRole("button", { name: /next/i }).first().click({ timeout: Math.min(timeoutMs, 5000) });
+      } catch {
+        // no-op
+      }
+      passwordTarget = await selectFirstUsableLocator(page, passwordSelectors, timeoutMs);
+    }
+    if (!passwordTarget) {
+      throw new Error(`No password input was found for service=${params.service}.`);
+    }
+    await passwordTarget.locator.fill(params.secret, { timeout: timeoutMs });
+  } else {
+    // Passwordless flow: continue from identifier screen to the MFA challenge screen.
+    const passwordlessContinueSelectors = [
+      'button[type="submit"]',
+      'input[type="submit"]',
+      'button:has-text("Next")',
+      'button:has-text("Continue")',
+      'button:has-text("Sign in")',
+      'button:has-text("Log in")',
+      'button:has-text("Get one-time code")',
+      'button:has-text("Get one time code")',
+      'button:has-text("Send code")',
+      'button:has-text("Verify")',
+    ];
+    const continueTarget = await selectFirstUsableLocator(
+      page,
+      passwordlessContinueSelectors,
+      Math.min(timeoutMs, 3500),
+    );
+    if (continueTarget) {
+      try {
+        await continueTarget.locator.click({ timeout: Math.min(timeoutMs, 4000) });
+      } catch {
+        // continue with fallback below
+      }
+    }
+    try {
+      await page.getByRole("button", { name: /next|continue|sign in|log in/i }).first().click({
+        timeout: Math.min(timeoutMs, 5000),
+      });
+    } catch {
+      try {
+        await identifierTarget.locator.press("Enter", { timeout: Math.min(timeoutMs, 4000) });
+      } catch {
+        // no-op
+      }
+    }
+  }
+
+  let submitted = false;
+  const submitSelectors =
+    params.service === "x.com"
+      ? [
+          'button[data-testid="LoginForm_Login_Button"]',
+          'div[role="button"][data-testid="LoginForm_Login_Button"]',
+          'button[type="submit"]',
+        ]
+      : ['button[type="submit"]', 'input[type="submit"]'];
+  if (params.authMode === "password") {
+    const submitTarget = await selectFirstUsableLocator(page, submitSelectors, timeoutMs);
+    if (submitTarget) {
+      try {
+        await submitTarget.locator.click({ timeout: timeoutMs });
+        submitted = true;
+      } catch {
+        submitted = false;
+      }
+    }
+
+    if (!submitted && passwordTarget) {
+      try {
+        await passwordTarget.locator.press("Enter", { timeout: Math.min(timeoutMs, 5000) });
+        submitted = true;
+      } catch {
+        submitted = false;
+      }
+    }
+  } else {
+    submitted = true;
+  }
+
+  try {
+    await page.waitForLoadState("domcontentloaded", { timeout: Math.min(timeoutMs, 7000) });
+  } catch {
+    // SPA auth flows frequently avoid a full load event.
+  }
+
+  let requiresMfa = false;
+  const mfaInput = await selectFirstUsableLocator(page, mfaInputSelectors, Math.min(timeoutMs, 2500));
+  if (mfaInput) {
+    requiresMfa = true;
+  } else {
+    try {
+      const hasMfaPrompt = await evalPageScript<boolean>(
+        page,
+        `
+          const bodyText = String(
+            (typeof document !== "undefined" && document && document.body && document.body.innerText) || ""
+          );
+          const re = new RegExp(String(args?.regexSource ?? ""), "i");
+          return re.test(bodyText);
+        `,
+        { regexSource: mfaHintRegex.source },
+      );
+      requiresMfa = Boolean(hasMfaPrompt);
+    } catch {
+      requiresMfa = false;
+    }
+  }
+
+  params.tab.updatedAt = Date.now();
   return {
+    service: params.service,
+    identifierMasked: maskCredentialIdentifier(params.identifier),
+    identifierSelector: identifierTarget.selector,
+    passwordSelector: passwordTarget?.selector ?? null,
+    submitted,
+    requiresMfa,
+    authMode: params.authMode,
+  };
+}
+
+async function submitMfaCode(params: {
+  tab: BrowserTab;
+  code: string;
+  timeoutMs: number;
+}): Promise<{
+  submitted: boolean;
+  selector: string;
+  multiField: boolean;
+}> {
+  const page = requireLivePage(params.tab);
+  const timeoutMs = Math.max(1000, params.timeoutMs);
+  const code = String(params.code ?? "").trim();
+  if (!code) {
+    throw new Error("MFA code is required.");
+  }
+
+  const singleDigitSelectors = [
+    'input[maxlength="1"][inputmode="numeric"]',
+    'input[maxlength="1"][autocomplete="one-time-code"]',
+    'input[maxlength="1"][name*="code" i]',
+    'input[maxlength="1"][id*="code" i]',
+  ];
+  for (const selector of singleDigitSelectors) {
+    const locator = page.locator(selector);
+    const count = Number(await locator.count().catch(() => 0));
+    if (!Number.isFinite(count) || count < 4) {
+      continue;
+    }
+    const maxDigits = Math.min(count, code.length);
+    let wrote = 0;
+    for (let i = 0; i < maxDigits; i += 1) {
+      const ch = code[i] ?? "";
+      if (!ch) {
+        continue;
+      }
+      try {
+        const field = locator.nth(i);
+        await field.fill(ch, { timeout: Math.min(timeoutMs, 2500) });
+        wrote += 1;
+      } catch {
+        // ignore sparse/hidden field failures
+      }
+    }
+    if (wrote > 0) {
+      try {
+        await locator.nth(Math.max(0, wrote - 1)).press("Enter", { timeout: Math.min(timeoutMs, 2500) });
+      } catch {
+        // no-op
+      }
+      return {
+        submitted: true,
+        selector,
+        multiField: true,
+      };
+    }
+  }
+
+  const mfaInputSelectors = [
+    'input[autocomplete="one-time-code"]',
+    'input[name*="otp" i]',
+    'input[id*="otp" i]',
+    'input[name*="mfa" i]',
+    'input[id*="mfa" i]',
+    'input[name*="verification" i]',
+    'input[id*="verification" i]',
+    'input[name*="code" i]',
+    'input[id*="code" i]',
+    'input[inputmode="numeric"]',
+  ];
+  const target = await selectFirstUsableLocator(page, mfaInputSelectors, timeoutMs);
+  if (!target) {
+    throw new Error("Could not find an MFA code input on the current page.");
+  }
+
+  await target.locator.fill(code, { timeout: timeoutMs });
+  let submitted = false;
+  const submitTarget = await selectFirstUsableLocator(
+    page,
+    ['button[type="submit"]', 'input[type="submit"]', 'button:has-text("Verify")', 'button:has-text("Continue")'],
+    Math.min(timeoutMs, 3000),
+  );
+  if (submitTarget) {
+    try {
+      await submitTarget.locator.click({ timeout: Math.min(timeoutMs, 3000) });
+      submitted = true;
+    } catch {
+      submitted = false;
+    }
+  }
+  if (!submitted) {
+    try {
+      await target.locator.press("Enter", { timeout: Math.min(timeoutMs, 3000) });
+      submitted = true;
+    } catch {
+      submitted = false;
+    }
+  }
+  return {
+    submitted,
+    selector: target.selector,
+    multiField: false,
+  };
+}
+
+export function createBrowserTool(_opts?: {
+  sandboxBridgeUrl?: string;
+  allowHostControl?: boolean;
+  allowLiveEngine?: boolean;
+  externalLauncher?: (url: string, timeoutMs: number) => Promise<ExternalLaunchResult>;
+}): AnyAgentTool {
+  const sandboxBridgeUrl = String(_opts?.sandboxBridgeUrl ?? "").trim();
+  const allowHostControl = _opts?.allowHostControl !== false;
+  const allowLiveEngine = _opts?.allowLiveEngine !== false;
+  const externalLauncher = _opts?.externalLauncher ?? launchExternalBrowser;
+  const defaultTarget: "host" | "sandbox" = sandboxBridgeUrl ? "sandbox" : "host";
+  const tool: AnyAgentTool = {
     name: "browser",
     description:
-      "Stateful web browser tool with tabs/history/snapshot/search/click/forms/fill/submit/hover/press/select/drag/evaluate/upload/dialog/console/pdf/scroll/resize/wait/back/forward; supports engine=live (Playwright) or engine=fetch fallback. Snapshot returns refs (e1,e2,...) for follow-up actions.",
+      "Stateful web browser tool with t560-compatible actions/aliases (status/diagnostics/start/stop/profiles/tabs/open/focus/close/snapshot/screenshot/navigate/console/pdf/upload/dialog/login/mfa/act/products/launch). `open` manages internal tool tabs; `launch` opens the OS-visible default browser. Supports engine=live (Playwright) with resilient fetch fallback. Snapshot returns refs (e1,e2,...) for follow-up actions.",
     parameters: Type.Object({
       action: Type.String({
         description:
-          "status|tabs|open|navigate|focus|close|snapshot|search|forms|click|type|fill|submit|hover|press|select|drag|evaluate|upload|dialog|console|pdf|scroll|resize|wait|act|back|forward|reload|screenshot|reset",
+          "status|diagnostics|start|stop|profiles|tabs|open|navigate|focus|close|snapshot|search|forms|products|launch|login|mfa|click|type|fill|submit|hover|press|select|drag|evaluate|upload|dialog|console|pdf|scroll|resize|wait|act|back|forward|reload|screenshot|reset",
       }),
+      target: Type.Optional(Type.String({ description: "Compatibility target hint (host|sandbox|node)." })),
+      node: Type.Optional(Type.String({ description: "Compatibility node id/name hint." })),
+      profile: Type.Optional(Type.String({ description: "Compatibility profile hint." })),
       engine: Type.Optional(
         Type.String({
           description: "Browser engine: auto|fetch|live (auto prefers live when available).",
         }),
       ),
       tabId: Type.Optional(Type.String({ description: "Target tab id (for tab-specific actions)." })),
+      targetId: Type.Optional(Type.String({ description: "t560 compatibility alias for tabId." })),
       url: Type.Optional(Type.String({ description: "HTTP/HTTPS URL." })),
+      targetUrl: Type.Optional(Type.String({ description: "t560 compatibility alias for url." })),
       query: Type.Optional(Type.String({ description: "Search query (for action=search)." })),
+      service: Type.Optional(Type.String({ description: "Credential service id for action=login (email|x.com)." })),
       region: Type.Optional(Type.String({ description: "DuckDuckGo region code (for action=search)." })),
       count: Type.Optional(Type.Number({ minimum: 1, maximum: 20 })),
       openFirstResult: Type.Optional(Type.Boolean({ description: "When true, open first search result in a tab." })),
+      mode: Type.Optional(Type.String({ description: "Compatibility snapshot mode hint." })),
+      snapshotFormat: Type.Optional(Type.String({ description: "Compatibility snapshot format hint (aria|ai)." })),
+      refs: Type.Optional(Type.String({ description: "Compatibility refs hint (role|aria)." })),
+      interactive: Type.Optional(Type.Boolean({ description: "Compatibility interaction hint." })),
+      compact: Type.Optional(Type.Boolean({ description: "Compatibility compact snapshot hint." })),
+      depth: Type.Optional(Type.Number({ minimum: 0, maximum: 8 })),
       ref: Type.Optional(Type.String({ description: "Snapshot reference id (e.g., e7) for click/fill/submit/hover/select/press actions." })),
+      inputRef: Type.Optional(Type.String({ description: "t560 compatibility alias for ref (upload/click/fill)." })),
       selector: Type.Optional(
         Type.String({ description: "CSS selector for live actions (click/hover/press/select/drag/upload/scroll)." }),
       ),
+      element: Type.Optional(Type.String({ description: "t560 compatibility alias for selector." })),
+      frame: Type.Optional(Type.String({ description: "Compatibility frame selector hint." })),
+      labels: Type.Optional(Type.Boolean({ description: "Compatibility label hint." })),
+      fullPage: Type.Optional(Type.Boolean({ description: "Capture full-page screenshot when true." })),
+      type: Type.Optional(Type.String({ description: "Image output type for screenshot (png|jpeg)." })),
       button: Type.Optional(Type.String({ description: "Mouse button for click: left|right|middle." })),
       doubleClick: Type.Optional(Type.Boolean({ description: "When true, perform a double-click." })),
       clickCount: Type.Optional(Type.Number({ minimum: 1, maximum: 5 })),
@@ -1799,10 +2507,19 @@ export function createBrowserTool(): AnyAgentTool {
       formIndex: Type.Optional(Type.Number({ minimum: 1 })),
       fieldName: Type.Optional(Type.String({ description: "Form field name (for type/fill actions)." })),
       value: Type.Optional(Type.String({ description: "Field value (for type/fill actions)." })),
+      code: Type.Optional(Type.String({ description: "One-time MFA/OTP code for action=mfa." })),
       values: Type.Optional(Type.Array(Type.String({ description: "Values for select action." }))),
+      fields: Type.Optional(
+        Type.Array(Type.Object({}, { additionalProperties: true }), {
+          description: "Compatibility fill fields payload.",
+        }),
+      ),
+      slowly: Type.Optional(Type.Boolean({ description: "When true (type), type characters with delay." })),
+      submit: Type.Optional(Type.Boolean({ description: "When true (type), press Enter after typing." })),
       key: Type.Optional(Type.String({ description: "Keyboard key for press action, e.g. Enter." })),
       limit: Type.Optional(Type.Number({ minimum: 1, maximum: 500 })),
       clear: Type.Optional(Type.Boolean({ description: "Clear buffered state after reading (console/dialog)." })),
+      level: Type.Optional(Type.String({ description: "Console log level filter." })),
       accept: Type.Optional(Type.Boolean({ description: "For dialog action: true=accept, false=dismiss." })),
       once: Type.Optional(Type.Boolean({ description: "For dialog action: apply to next dialog only (default true)." })),
       promptText: Type.Optional(Type.String({ description: "Prompt text when accepting a prompt dialog." })),
@@ -1821,31 +2538,58 @@ export function createBrowserTool(): AnyAgentTool {
       toBottom: Type.Optional(Type.Boolean({ description: "Scroll to bottom for action=scroll." })),
       waitForSelector: Type.Optional(Type.String({ description: "For action=wait: CSS selector to wait for." })),
       waitForText: Type.Optional(Type.String({ description: "For action=wait: text to appear in page content." })),
+      textGone: Type.Optional(Type.String({ description: "For action=wait: text that should disappear." })),
       urlContains: Type.Optional(Type.String({ description: "For action=wait: URL substring to wait for." })),
       state: Type.Optional(Type.String({ description: "For waitForSelector: attached|visible|hidden|detached." })),
       kind: Type.Optional(
         Type.String({
           description:
-            "Sub-action for act: click|type|fill|submit|navigate|wait|hover|press|select|drag|evaluate|upload|dialog|console|pdf|scroll|resize|close",
+            "Sub-action for act: click|type|fill|submit|navigate|wait|hover|press|select|drag|evaluate|upload|dialog|console|pdf|scroll|resize|login|mfa|close",
         }),
       ),
       timeMs: Type.Optional(Type.Number({ minimum: 0, maximum: 120000 })),
       snapshotAfter: Type.Optional(Type.Boolean({ description: "Capture a snapshot after navigation actions." })),
       timeoutMs: Type.Optional(Type.Number({ minimum: 1000, maximum: 120000 })),
+      allowEngineFallback: Type.Optional(
+        Type.Boolean({ description: "Allow automatic fallback from engine=live to fetch when live execution fails." }),
+      ),
+      maxRetries: Type.Optional(Type.Number({ minimum: 0, maximum: 4 })),
       maxBytes: Type.Optional(Type.Number({ minimum: 10000, maximum: 500000 })),
       maxChars: Type.Optional(Type.Number({ minimum: 500, maximum: 80000 })),
       maxLinks: Type.Optional(Type.Number({ minimum: 1, maximum: 200 })),
       width: Type.Optional(Type.Number({ minimum: 320, maximum: 4096 })),
       height: Type.Optional(Type.Number({ minimum: 240, maximum: 4096 })),
+      request: Type.Optional(Type.Object({}, { additionalProperties: true })),
     }),
-    execute: async (_toolCallId, params) => {
+    execute: async (_toolCallId, rawParams) => {
+      const params = normalizeBrowserActionParams(rawParams);
       const action = String(params.action ?? "").trim().toLowerCase();
       if (!action) {
         throw new Error("action is required.");
       }
+      const targetRaw = String(params.target ?? "").trim().toLowerCase();
+      const target = (targetRaw || defaultTarget) as "host" | "sandbox" | "node";
+      if (targetRaw && targetRaw !== "host" && targetRaw !== "sandbox" && targetRaw !== "node") {
+        throw new Error('target must be one of: host|sandbox|node');
+      }
+      if (target === "sandbox" && !sandboxBridgeUrl) {
+        throw new Error(
+          'Sandbox browser is unavailable. Enable agents.defaults.sandbox.browser.enabled or use target="host" if allowed.',
+        );
+      }
+      if (target === "host" && !allowHostControl) {
+        throw new Error("Host browser control is disabled by sandbox policy.");
+      }
+      if (target === "node" || String(params.node ?? "").trim().length > 0) {
+        throw new Error(
+          "target=node is not supported in this t560 browser build (browser proxy is unavailable).",
+        );
+      }
+      const profile = String(params.profile ?? "").trim() || "default";
       const requestedEngine = normalizeEngineParam(params.engine);
-      const liveAvailable = await hasLiveEngine();
-      const resolveEngine = (tab?: BrowserTab | null): BrowserEngineMode => {
+      const liveAvailable = allowLiveEngine ? await hasLiveEngine() : false;
+      const resolveEngine = (tab?: BrowserTab | null, actionParams?: Record<string, unknown>): BrowserEngineMode => {
+        const fallbackAllowed = shouldAllowEngineFallback(actionParams ?? params);
         if (tab && getLivePage(tab.id)) {
           return "live";
         }
@@ -1853,6 +2597,12 @@ export function createBrowserTool(): AnyAgentTool {
           return "fetch";
         }
         if (requestedEngine === "live") {
+          if (!liveAvailable) {
+            if (!fallbackAllowed) {
+              throw new Error("engine=live requested but unavailable, and allowEngineFallback=false.");
+            }
+            return "fetch";
+          }
           return "live";
         }
         if (tab) {
@@ -1861,22 +2611,42 @@ export function createBrowserTool(): AnyAgentTool {
         return liveAvailable ? "live" : "fetch";
       };
 
-      if (action === "status") {
+      if (action === "status" || action === "diagnostics") {
+        let statusEngine: string;
+        try {
+          statusEngine = resolveEngine(null, { ...params, allowEngineFallback: true }) === "live" ? "playwright" : "fetch-html";
+        } catch {
+          statusEngine = "fetch-html";
+        }
         return {
           ok: true,
-          engine: resolveEngine(null) === "live" ? "playwright" : "fetch-html",
+          engine: statusEngine,
           requestedEngine,
           liveAvailable,
+          allowLiveEngine,
           liveRunning: Boolean(liveBrowser),
           liveTabCount: livePagesByTabId.size,
           sharedState: true,
+          profile,
+          target,
+          targetDefault: defaultTarget,
+          sandboxBridgeConfigured: Boolean(sandboxBridgeUrl),
+          hostControlAllowed: allowHostControl,
+          nodeProxyAvailable: false,
           capabilities: [
+            "start",
+            "stop",
+            "profiles",
             "tabs",
             "snapshot",
             "refs",
             "search",
             "click",
             "forms",
+            "products",
+            "launch",
+            "login",
+            "mfa",
             "fill",
             "submit",
             "hover",
@@ -1892,10 +2662,82 @@ export function createBrowserTool(): AnyAgentTool {
             "resize",
             "wait",
             "screenshot",
+            "diagnostics",
           ],
           activeTabId: browserState.activeTabId,
           tabCount: browserState.tabs.length,
           createdAt: browserState.createdAt,
+        };
+      }
+
+      if (action === "launch") {
+        const url = normalizeHttpUrl(params.url ?? "https://www.google.com/");
+        const timeoutMs = clampInt(params.timeoutMs, 1000, 120000, DEFAULT_TIMEOUT_MS);
+        const launched = await externalLauncher(url, timeoutMs);
+        return {
+          ok: true,
+          action: "launch",
+          launched: true,
+          url,
+          command: launched.command,
+          platform: process.platform,
+          visibleToUser: true,
+        };
+      }
+
+      if (action === "start") {
+        let startedEngine: BrowserEngineMode = resolveEngine(null);
+        let warning: string | null = null;
+        if (startedEngine === "live" && liveAvailable) {
+          try {
+            await ensureLiveRuntime();
+            startedEngine = "live";
+          } catch (error) {
+            startedEngine = "fetch";
+            warning = error instanceof Error ? error.message : String(error);
+          }
+        } else {
+          startedEngine = "fetch";
+        }
+        return {
+          ok: true,
+          started: true,
+          profile,
+          target,
+          liveAvailable,
+          liveRunning: Boolean(liveBrowser),
+          engine: startedEngine,
+          warning,
+          activeTabId: browserState.activeTabId,
+          tabCount: browserState.tabs.length,
+        };
+      }
+
+      if (action === "stop") {
+        await resetLiveRuntime();
+        return {
+          ok: true,
+          stopped: true,
+          profile,
+          target,
+          liveAvailable,
+          liveRunning: false,
+          activeTabId: browserState.activeTabId,
+          tabCount: browserState.tabs.length,
+        };
+      }
+
+      if (action === "profiles") {
+        return {
+          ok: true,
+          profile,
+          profiles: [
+            {
+              id: "default",
+              label: "Default",
+              engine: liveAvailable ? "auto(fetch|live)" : "fetch",
+            },
+          ],
         };
       }
 
@@ -1919,32 +2761,61 @@ export function createBrowserTool(): AnyAgentTool {
         const url = normalizeHttpUrl(params.url ?? "https://duckduckgo.com/");
         const tab = createTab(url);
         const snapshotAfter = params.snapshotAfter !== false;
-        const engine = resolveEngine(tab);
+        const engine = resolveEngine(tab, params);
+        let usedEngine: BrowserEngineMode = engine;
+        let fallbackFrom: BrowserEngineMode | undefined =
+          requestedEngine === "live" && engine === "fetch" ? "live" : undefined;
+        let fallbackReason: string | undefined =
+          requestedEngine === "live" && engine === "fetch" && !liveAvailable
+            ? "live engine unavailable; using fetch fallback."
+            : undefined;
+        let retryCount = 1;
         let snapshot: BrowserSnapshot | null = null;
         if (engine === "live") {
-          const timeoutMs = clampInt(params.timeoutMs, 1000, 120000, DEFAULT_TIMEOUT_MS);
-          const { context } = await ensureLiveRuntime();
-          const page = await context.newPage();
-          attachLivePage(tab.id, page);
-          const response = await page.goto(url, {
-            waitUntil: "domcontentloaded",
-            timeout: timeoutMs,
-          });
-          setLiveMeta(tab.id, response);
-          if (snapshotAfter) {
-            snapshot = await captureLiveTabSnapshot(tab, params);
-          } else {
-            tab.url = normalizeHttpUrl(page.url() || url);
-            tab.history[tab.historyIndex] = tab.url;
-            tab.title = String(await page.title()) || summarizeTitleFromUrl(tab.url);
-            tab.updatedAt = Date.now();
+          try {
+            const timeoutMs = clampInt(params.timeoutMs, 1000, 120000, DEFAULT_TIMEOUT_MS);
+            const { context } = await ensureLiveRuntime();
+            const page = await context.newPage();
+            attachLivePage(tab.id, page);
+            const response = await page.goto(url, {
+              waitUntil: "domcontentloaded",
+              timeout: timeoutMs,
+            });
+            setLiveMeta(tab.id, response);
+            if (snapshotAfter) {
+              snapshot = await captureLiveTabSnapshot(tab, params);
+            } else {
+              tab.url = normalizeHttpUrl(page.url() || url);
+              tab.history[tab.historyIndex] = tab.url;
+              tab.title = String(await page.title()) || summarizeTitleFromUrl(tab.url);
+              tab.updatedAt = Date.now();
+            }
+          } catch (error) {
+            if (!shouldAllowEngineFallback(params)) {
+              throw error;
+            }
+            await closeLiveTab(tab.id);
+            usedEngine = "fetch";
+            fallbackFrom = "live";
+            fallbackReason = formatToolError(error);
+            const recovered = await captureTabSnapshotWithRetries(tab, params);
+            retryCount = recovered.attempts;
+            snapshot = snapshotAfter ? recovered.snapshot : null;
           }
         } else {
-          snapshot = snapshotAfter ? await captureTabSnapshot(tab, params) : null;
+          if (snapshotAfter) {
+            const captured = await captureTabSnapshotWithRetries(tab, params);
+            retryCount = captured.attempts;
+            snapshot = captured.snapshot;
+          }
         }
         return {
           ok: true,
-          engine,
+          engine: usedEngine,
+          requestedEngine,
+          fallbackFrom,
+          fallbackReason,
+          retryCount,
           activeTabId: browserState.activeTabId,
           tab: serializeTab(tab),
           snapshot,
@@ -1987,23 +2858,46 @@ export function createBrowserTool(): AnyAgentTool {
         let openedTab: Record<string, unknown> | null = null;
         let snapshot: BrowserSnapshot | null = null;
         let openedEngine: BrowserEngineMode | null = null;
+        let openedFallbackFrom: BrowserEngineMode | undefined;
+        let openedFallbackReason: string | undefined;
+        let openedRetryCount = 1;
         if (openFirst && results.length > 0) {
           const tab = createTab(results[0].url);
-          const engine = resolveEngine(tab);
+          const engine = resolveEngine(tab, params);
           openedEngine = engine;
+          openedFallbackFrom = requestedEngine === "live" && engine === "fetch" ? "live" : undefined;
+          openedFallbackReason =
+            requestedEngine === "live" && engine === "fetch" && !liveAvailable
+              ? "live engine unavailable; using fetch fallback."
+              : undefined;
           if (engine === "live") {
-            const timeoutMs = clampInt(params.timeoutMs, 1000, 120000, DEFAULT_TIMEOUT_MS);
-            const { context } = await ensureLiveRuntime();
-            const page = await context.newPage();
-            attachLivePage(tab.id, page);
-            const response = await page.goto(results[0].url, {
-              waitUntil: "domcontentloaded",
-              timeout: timeoutMs,
-            });
-            setLiveMeta(tab.id, response);
-            snapshot = await captureLiveTabSnapshot(tab, params);
+            try {
+              const timeoutMs = clampInt(params.timeoutMs, 1000, 120000, DEFAULT_TIMEOUT_MS);
+              const { context } = await ensureLiveRuntime();
+              const page = await context.newPage();
+              attachLivePage(tab.id, page);
+              const response = await page.goto(results[0].url, {
+                waitUntil: "domcontentloaded",
+                timeout: timeoutMs,
+              });
+              setLiveMeta(tab.id, response);
+              snapshot = await captureLiveTabSnapshot(tab, params);
+            } catch (error) {
+              if (!shouldAllowEngineFallback(params)) {
+                throw error;
+              }
+              await closeLiveTab(tab.id);
+              openedEngine = "fetch";
+              openedFallbackFrom = "live";
+              openedFallbackReason = formatToolError(error);
+              const captured = await captureTabSnapshotWithRetries(tab, params);
+              openedRetryCount = captured.attempts;
+              snapshot = captured.snapshot;
+            }
           } else {
-            snapshot = await captureTabSnapshot(tab, params);
+            const captured = await captureTabSnapshotWithRetries(tab, params);
+            openedRetryCount = captured.attempts;
+            snapshot = captured.snapshot;
           }
           openedTab = serializeTab(tab);
         }
@@ -2015,6 +2909,9 @@ export function createBrowserTool(): AnyAgentTool {
           results,
           openedTab,
           openedEngine,
+          openedFallbackFrom,
+          openedFallbackReason,
+          openedRetryCount,
           snapshot,
         };
       }
@@ -2025,39 +2922,70 @@ export function createBrowserTool(): AnyAgentTool {
         navigateTab(tab, url);
         setActiveTab(tab);
         const snapshotAfter = params.snapshotAfter !== false;
-        const engine = resolveEngine(tab);
+        const engine = resolveEngine(tab, params);
+        let usedEngine: BrowserEngineMode = engine;
+        let fallbackFrom: BrowserEngineMode | undefined =
+          requestedEngine === "live" && engine === "fetch" ? "live" : undefined;
+        let fallbackReason: string | undefined =
+          requestedEngine === "live" && engine === "fetch" && !liveAvailable
+            ? "live engine unavailable; using fetch fallback."
+            : undefined;
+        let retryCount = 1;
         let snapshot: BrowserSnapshot | null = null;
         if (engine === "live") {
-          const timeoutMs = clampInt(params.timeoutMs, 1000, 120000, DEFAULT_TIMEOUT_MS);
-          const page = getLivePage(tab.id);
-          if (!page) {
-            const { context } = await ensureLiveRuntime();
-            const created = await context.newPage();
-            attachLivePage(tab.id, created);
-          }
-          const targetPage = getLivePage(tab.id);
-          if (!targetPage) {
-            throw new Error(`live browser page missing for tab ${tab.id}.`);
-          }
-          const response = await targetPage.goto(url, {
-            waitUntil: "domcontentloaded",
-            timeout: timeoutMs,
-          });
-          setLiveMeta(tab.id, response);
-          if (snapshotAfter) {
-            snapshot = await captureLiveTabSnapshot(tab, params);
-          } else {
-            tab.url = normalizeHttpUrl(targetPage.url() || url);
-            tab.history[tab.historyIndex] = tab.url;
-            tab.title = String(await targetPage.title()) || summarizeTitleFromUrl(tab.url);
-            tab.updatedAt = Date.now();
+          try {
+            const timeoutMs = clampInt(params.timeoutMs, 1000, 120000, DEFAULT_TIMEOUT_MS);
+            const page = getLivePage(tab.id);
+            if (!page) {
+              const { context } = await ensureLiveRuntime();
+              const created = await context.newPage();
+              attachLivePage(tab.id, created);
+            }
+            const targetPage = getLivePage(tab.id);
+            if (!targetPage) {
+              throw new Error(`live browser page missing for tab ${tab.id}.`);
+            }
+            const response = await targetPage.goto(url, {
+              waitUntil: "domcontentloaded",
+              timeout: timeoutMs,
+            });
+            setLiveMeta(tab.id, response);
+            if (snapshotAfter) {
+              snapshot = await captureLiveTabSnapshot(tab, params);
+            } else {
+              tab.url = normalizeHttpUrl(targetPage.url() || url);
+              tab.history[tab.historyIndex] = tab.url;
+              tab.title = String(await targetPage.title()) || summarizeTitleFromUrl(tab.url);
+              tab.updatedAt = Date.now();
+            }
+          } catch (error) {
+            if (!shouldAllowEngineFallback(params)) {
+              throw error;
+            }
+            await closeLiveTab(tab.id);
+            usedEngine = "fetch";
+            fallbackFrom = "live";
+            fallbackReason = formatToolError(error);
+            if (snapshotAfter) {
+              const captured = await captureTabSnapshotWithRetries(tab, params);
+              retryCount = captured.attempts;
+              snapshot = captured.snapshot;
+            }
           }
         } else {
-          snapshot = snapshotAfter ? await captureTabSnapshot(tab, params) : null;
+          if (snapshotAfter) {
+            const captured = await captureTabSnapshotWithRetries(tab, params);
+            retryCount = captured.attempts;
+            snapshot = captured.snapshot;
+          }
         }
         return {
           ok: true,
-          engine,
+          engine: usedEngine,
+          requestedEngine,
+          fallbackFrom,
+          fallbackReason,
+          retryCount,
           activeTabId: tab.id,
           tab: serializeTab(tab),
           snapshot,
@@ -2068,33 +2996,64 @@ export function createBrowserTool(): AnyAgentTool {
         const tab = resolveTab(params.tabId);
         setActiveTab(tab);
         const snapshotAfter = params.snapshotAfter !== false;
-        const engine = resolveEngine(tab);
+        const engine = resolveEngine(tab, params);
+        let usedEngine: BrowserEngineMode = engine;
+        let fallbackFrom: BrowserEngineMode | undefined =
+          requestedEngine === "live" && engine === "fetch" ? "live" : undefined;
+        let fallbackReason: string | undefined =
+          requestedEngine === "live" && engine === "fetch" && !liveAvailable
+            ? "live engine unavailable; using fetch fallback."
+            : undefined;
+        let retryCount = 1;
         let snapshot: BrowserSnapshot | null = null;
         if (engine === "live") {
-          const timeoutMs = clampInt(params.timeoutMs, 1000, 120000, DEFAULT_TIMEOUT_MS);
-          const page = getLivePage(tab.id);
-          if (!page) {
-            throw new Error(`tab ${tab.id} is not backed by a live browser page.`);
-          }
-          const response = await page.reload({
-            waitUntil: "domcontentloaded",
-            timeout: timeoutMs,
-          });
-          setLiveMeta(tab.id, response);
-          if (snapshotAfter) {
-            snapshot = await captureLiveTabSnapshot(tab, params);
-          } else {
-            tab.url = normalizeHttpUrl(page.url() || tab.url);
-            tab.history[tab.historyIndex] = tab.url;
-            tab.title = String(await page.title()) || summarizeTitleFromUrl(tab.url);
-            tab.updatedAt = Date.now();
+          try {
+            const timeoutMs = clampInt(params.timeoutMs, 1000, 120000, DEFAULT_TIMEOUT_MS);
+            const page = getLivePage(tab.id);
+            if (!page) {
+              throw new Error(`tab ${tab.id} is not backed by a live browser page.`);
+            }
+            const response = await page.reload({
+              waitUntil: "domcontentloaded",
+              timeout: timeoutMs,
+            });
+            setLiveMeta(tab.id, response);
+            if (snapshotAfter) {
+              snapshot = await captureLiveTabSnapshot(tab, params);
+            } else {
+              tab.url = normalizeHttpUrl(page.url() || tab.url);
+              tab.history[tab.historyIndex] = tab.url;
+              tab.title = String(await page.title()) || summarizeTitleFromUrl(tab.url);
+              tab.updatedAt = Date.now();
+            }
+          } catch (error) {
+            if (!shouldAllowEngineFallback(params)) {
+              throw error;
+            }
+            await closeLiveTab(tab.id);
+            usedEngine = "fetch";
+            fallbackFrom = "live";
+            fallbackReason = formatToolError(error);
+            if (snapshotAfter) {
+              const captured = await captureTabSnapshotWithRetries(tab, params);
+              retryCount = captured.attempts;
+              snapshot = captured.snapshot;
+            }
           }
         } else {
-          snapshot = snapshotAfter ? await captureTabSnapshot(tab, params) : null;
+          if (snapshotAfter) {
+            const captured = await captureTabSnapshotWithRetries(tab, params);
+            retryCount = captured.attempts;
+            snapshot = captured.snapshot;
+          }
         }
         return {
           ok: true,
-          engine,
+          engine: usedEngine,
+          requestedEngine,
+          fallbackFrom,
+          fallbackReason,
+          retryCount,
           activeTabId: tab.id,
           tab: serializeTab(tab),
           snapshot,
@@ -2102,13 +3061,46 @@ export function createBrowserTool(): AnyAgentTool {
       }
 
       if (action === "snapshot") {
-        const tab = resolveTab(params.tabId);
+        const explicitUrl = String(params.url ?? "").trim();
+        const tab = explicitUrl && String(params.tabId ?? "").trim().length === 0 ? createTab(normalizeHttpUrl(explicitUrl)) : resolveTab(params.tabId);
         setActiveTab(tab);
-        const engine = resolveEngine(tab);
-        const snapshot = engine === "live" ? await captureLiveTabSnapshot(tab, params) : await captureTabSnapshot(tab, params);
+        const engine = resolveEngine(tab, params);
+        let usedEngine: BrowserEngineMode = engine;
+        let fallbackFrom: BrowserEngineMode | undefined =
+          requestedEngine === "live" && engine === "fetch" ? "live" : undefined;
+        let fallbackReason: string | undefined =
+          requestedEngine === "live" && engine === "fetch" && !liveAvailable
+            ? "live engine unavailable; using fetch fallback."
+            : undefined;
+        let retryCount = 1;
+        let snapshot: BrowserSnapshot;
+        if (engine === "live") {
+          try {
+            snapshot = await captureLiveTabSnapshot(tab, params);
+          } catch (error) {
+            if (!shouldAllowEngineFallback(params)) {
+              throw error;
+            }
+            await closeLiveTab(tab.id);
+            usedEngine = "fetch";
+            fallbackFrom = "live";
+            fallbackReason = formatToolError(error);
+            const captured = await captureTabSnapshotWithRetries(tab, params);
+            retryCount = captured.attempts;
+            snapshot = captured.snapshot;
+          }
+        } else {
+          const captured = await captureTabSnapshotWithRetries(tab, params);
+          retryCount = captured.attempts;
+          snapshot = captured.snapshot;
+        }
         return {
           ok: true,
-          engine,
+          engine: usedEngine,
+          requestedEngine,
+          fallbackFrom,
+          fallbackReason,
+          retryCount,
           activeTabId: tab.id,
           tab: serializeTab(tab),
           snapshot,
@@ -2138,12 +3130,267 @@ export function createBrowserTool(): AnyAgentTool {
         };
       }
 
+      if (action === "products") {
+        const tab = resolveTab(params.tabId);
+        setActiveTab(tab);
+        const engine = resolveEngine(tab, params);
+        if (!tab.lastSnapshot) {
+          if (engine === "live") {
+            try {
+              await captureLiveTabSnapshot(tab, params);
+            } catch (error) {
+              if (!shouldAllowEngineFallback(params)) {
+                throw error;
+              }
+              await closeLiveTab(tab.id);
+              const captured = await captureTabSnapshotWithRetries(tab, params);
+              tab.lastSnapshot = captured.snapshot;
+            }
+          } else {
+            const captured = await captureTabSnapshotWithRetries(tab, params);
+            tab.lastSnapshot = captured.snapshot;
+          }
+        }
+        const query = String(params.query ?? "").trim() || tab.title || tab.url;
+        const limit = clampInt(params.limit, 1, 50, 12);
+        const candidates = extractEcommerceCandidates({
+          query,
+          outcomes: [
+            {
+              toolName: "browser",
+              content: JSON.stringify({
+                snapshot: tab.lastSnapshot,
+                html: tab.lastHtml,
+              }),
+            },
+          ],
+          limit,
+        });
+        const cheapest = pickCheapestCandidate(candidates);
+        return {
+          ok: true,
+          engine: getLivePage(tab.id) ? "live" : "fetch",
+          activeTabId: tab.id,
+          query,
+          count: candidates.length,
+          products: candidates,
+          cheapest:
+            cheapest && cheapest.price
+              ? {
+                  title: cheapest.title,
+                  url: cheapest.url,
+                  price: cheapest.price,
+                  sourceTool: cheapest.sourceTool,
+                }
+              : null,
+          tab: serializeTab(tab),
+          snapshot: tab.lastSnapshot,
+        };
+      }
+
+      if (action === "login") {
+        const tab = resolveTab(params.tabId);
+        setActiveTab(tab);
+        const timeoutMs = clampInt(params.timeoutMs, 1000, 120000, DEFAULT_TIMEOUT_MS);
+
+        let page = getLivePage(tab.id);
+        if (!page) {
+          const { context } = await ensureLiveRuntime();
+          const created = await context.newPage();
+          attachLivePage(tab.id, created);
+          const response = await created.goto(tab.url, {
+            waitUntil: "domcontentloaded",
+            timeout: timeoutMs,
+          });
+          setLiveMeta(tab.id, response);
+          page = created;
+        }
+
+        const liveUrl = normalizeHttpUrlOrFallback(String(page.url?.() ?? tab.url), tab.url);
+        if (liveUrl !== tab.url) {
+          appendHistoryEntry(tab, liveUrl);
+        }
+        tab.url = liveUrl;
+        tab.updatedAt = Date.now();
+
+        const serviceCandidates = deriveServiceCandidates({
+          explicitServiceRaw: params.service,
+          currentUrl: liveUrl,
+        });
+        if (serviceCandidates.length === 0) {
+          throw new Error(
+            "Could not infer setup service for this page. Pass service=<site> (example: service=havenvaults2-0).",
+          );
+        }
+
+        let resolvedService = serviceCandidates[0];
+        let credential = null;
+        for (const candidate of serviceCandidates) {
+          const found = await getCredential({
+            workspaceDir: process.cwd(),
+            service: candidate,
+          });
+          if (found) {
+            credential = found;
+            resolvedService = candidate;
+            break;
+          }
+        }
+        if (!credential) {
+          throw new Error(
+            `No credential is configured for services=[${serviceCandidates.join(", ")}]. Run /setup <service-or-site> first.`,
+          );
+        }
+
+        const loginResult = await performLiveCredentialLogin({
+          tab,
+          service: resolvedService,
+          identifier: credential.identifier,
+          secret: credential.secret,
+          authMode: credential.authMode,
+          timeoutMs,
+        });
+
+        const snapshotAfter = params.snapshotAfter !== false;
+        const snapshot = snapshotAfter ? await captureLiveTabSnapshot(tab, params) : null;
+        return {
+          ok: true,
+          engine: "live",
+          activeTabId: tab.id,
+          service: loginResult.service,
+          identifier: loginResult.identifierMasked,
+          credentialService: resolvedService,
+          submitted: loginResult.submitted,
+          requiresMfa: loginResult.requiresMfa,
+          authMode: loginResult.authMode,
+          nextStep: loginResult.requiresMfa
+            ? "Ask user for one-time code, then call browser action=mfa with that code."
+            : "Continue with the next authenticated step.",
+          selectors: {
+            identifier: loginResult.identifierSelector,
+            password: loginResult.passwordSelector,
+          },
+          tab: serializeTab(tab),
+          snapshot,
+        };
+      }
+
+      if (action === "mfa") {
+        const tab = resolveTab(params.tabId);
+        setActiveTab(tab);
+        const timeoutMs = clampInt(params.timeoutMs, 1000, 120000, DEFAULT_TIMEOUT_MS);
+
+        let page = getLivePage(tab.id);
+        if (!page) {
+          const { context } = await ensureLiveRuntime();
+          const created = await context.newPage();
+          attachLivePage(tab.id, created);
+          const response = await created.goto(tab.url, {
+            waitUntil: "domcontentloaded",
+            timeout: timeoutMs,
+          });
+          setLiveMeta(tab.id, response);
+          page = created;
+        }
+
+        const liveUrl = normalizeHttpUrlOrFallback(String(page.url?.() ?? tab.url), tab.url);
+        if (liveUrl !== tab.url) {
+          appendHistoryEntry(tab, liveUrl);
+        }
+        tab.url = liveUrl;
+        tab.updatedAt = Date.now();
+
+        const serviceCandidates = deriveServiceCandidates({
+          explicitServiceRaw: params.service,
+          currentUrl: liveUrl,
+        });
+        const providedCode = String(params.code ?? params.value ?? "").trim();
+        let code = providedCode;
+        if (!code && serviceCandidates.length > 0) {
+          for (const candidate of serviceCandidates) {
+            const credential = await getCredential({
+              workspaceDir: process.cwd(),
+              service: candidate,
+            });
+            const fallbackCode = String(credential?.mfaCode ?? "").trim();
+            if (fallbackCode) {
+              code = fallbackCode;
+              break;
+            }
+          }
+        }
+        if (!code) {
+          throw new Error(
+            "No MFA code provided. Ask user for the one-time code and call browser action=mfa with code=<value>.",
+          );
+        }
+
+        const mfaResult = await submitMfaCode({
+          tab,
+          code,
+          timeoutMs,
+        });
+        const snapshotAfter = params.snapshotAfter !== false;
+        const snapshot = snapshotAfter ? await captureLiveTabSnapshot(tab, params) : null;
+        return {
+          ok: true,
+          engine: "live",
+          activeTabId: tab.id,
+          mfaSubmitted: mfaResult.submitted,
+          selector: mfaResult.selector,
+          multiField: mfaResult.multiField,
+          codeMasked: `***${code.slice(-2)}`,
+          tab: serializeTab(tab),
+          snapshot,
+        };
+      }
+
       if (action === "type" || action === "fill") {
         const tab = resolveTab(params.tabId);
         setActiveTab(tab);
+        const engine = resolveEngine(tab);
+
+        const explicitSelector = getExplicitSelector(params, "selector");
+        if (explicitSelector) {
+          if (engine !== "live") {
+            throw new Error("selector-based fill/type requires engine=live.");
+          }
+          const page = requireLivePage(tab);
+          const timeoutMs = clampInt(params.timeoutMs, 1000, 120000, DEFAULT_TIMEOUT_MS);
+          const value = String(params.value ?? "");
+          const slowly = params.slowly === true;
+          const submit = params.submit === true;
+          if (action === "type") {
+            await page.locator(explicitSelector).first().fill("", { timeout: timeoutMs });
+            await page
+              .locator(explicitSelector)
+              .first()
+              .type(value, { timeout: timeoutMs, ...(slowly ? { delay: 35 } : {}) });
+            if (submit) {
+              await page.locator(explicitSelector).first().press("Enter", { timeout: timeoutMs });
+            }
+          } else {
+            await page.locator(explicitSelector).first().fill(value, { timeout: timeoutMs });
+          }
+          tab.updatedAt = Date.now();
+          const snapshotAfter = params.snapshotAfter === true;
+          const snapshot = snapshotAfter ? await captureLiveTabSnapshot(tab, params) : null;
+          return {
+            ok: true,
+            engine,
+            activeTabId: tab.id,
+            action,
+            selector: explicitSelector,
+            value,
+            slowly: action === "type" ? slowly : undefined,
+            submit: action === "type" ? submit : undefined,
+            tab: serializeTab(tab),
+            snapshot,
+          };
+        }
+
         if (!tab.lastSnapshot) {
-          const seedEngine = resolveEngine(tab);
-          if (seedEngine === "live") {
+          if (engine === "live") {
             await captureLiveTabSnapshot(tab, params);
           } else {
             await captureTabSnapshot(tab, params);
@@ -2156,9 +3403,11 @@ export function createBrowserTool(): AnyAgentTool {
           tab.formValues[form.index] = {};
         }
         tab.formValues[form.index][field.name] = value;
-        const engine = resolveEngine(tab);
         if (engine === "live") {
           await liveFillFormField(tab, form, field, value);
+          if (action === "type" && params.submit === true) {
+            await liveSubmitForm(tab, form, clampInt(params.timeoutMs, 1000, 120000, DEFAULT_TIMEOUT_MS));
+          }
         }
         tab.updatedAt = Date.now();
         return {
@@ -2255,6 +3504,8 @@ export function createBrowserTool(): AnyAgentTool {
           setActiveTab(tab);
         }
         const engine = resolveEngine(tab);
+        const requestedType = String(params.type ?? "").trim().toLowerCase();
+        const requestedJpeg = requestedType === "jpeg" || requestedType === "jpg";
         let shot;
         if (tab && engine === "live") {
           shot = await captureLiveScreenshot(tab, params);
@@ -2270,13 +3521,16 @@ export function createBrowserTool(): AnyAgentTool {
             height,
           });
         }
+        const outputType: "png" | "jpeg" = shot.type === "jpeg" ? "jpeg" : "png";
         return {
           ok: true,
           engine: tab ? engine : "fetch",
           activeTabId: tab?.id ?? browserState.activeTabId,
           screenshot: {
             ...shot,
-            mimeType: "image/png",
+            mimeType: outputType === "jpeg" ? "image/jpeg" : "image/png",
+            requestedType: requestedType || undefined,
+            warning: !tab && requestedJpeg ? "jpeg output requires engine=live; returned png screenshot." : undefined,
           },
         };
       }
@@ -2290,6 +3544,7 @@ export function createBrowserTool(): AnyAgentTool {
         }
         const waitForSelector = String(params.waitForSelector ?? "").trim();
         const waitForText = String(params.waitForText ?? "").trim();
+        const textGone = String(params.textGone ?? "").trim();
         const urlContains = String(params.urlContains ?? "").trim();
         if (engine === "live" && tab) {
           const page = requireLivePage(tab);
@@ -2305,6 +3560,15 @@ export function createBrowserTool(): AnyAgentTool {
               `(() => {
                 const bodyText = String(document.body?.innerText ?? "").toLowerCase();
                 return bodyText.includes(${JSON.stringify(wanted)});
+              })()`,
+              { timeout: timeoutMs },
+            );
+          } else if (textGone) {
+            const wanted = textGone.toLowerCase();
+            await page.waitForFunction(
+              `(() => {
+                const bodyText = String(document.body?.innerText ?? "").toLowerCase();
+                return !bodyText.includes(${JSON.stringify(wanted)});
               })()`,
               { timeout: timeoutMs },
             );
@@ -2330,6 +3594,7 @@ export function createBrowserTool(): AnyAgentTool {
           engine,
           activeTabId: tab.id,
           waitedMs: delayMs,
+          textGone: textGone || undefined,
           tab: serializeTab(tab),
           snapshot,
         };
@@ -2627,9 +3892,16 @@ export function createBrowserTool(): AnyAgentTool {
           page,
           `
             const source = String(args.source ?? "").trim();
-            const fn = new Function("return (" + source + ");");
-            const value = fn();
-            return typeof value === "function" ? value() : value;
+            try {
+              const exprFn = new Function("return (" + source + ");");
+              const value = exprFn();
+              return typeof value === "function" ? value() : value;
+            } catch {
+              // Accept statement-style snippets (for example "var x = ...; return x;").
+              const stmtFn = new Function(source);
+              const value = stmtFn();
+              return typeof value === "function" ? value() : value;
+            }
           `,
           { source: expression },
         );
@@ -2744,7 +4016,10 @@ export function createBrowserTool(): AnyAgentTool {
         const clear = params.clear === true;
         const rows = liveConsoleByTabId.get(tab.id) ?? [];
         const limit = clampInt(params.limit, 1, 500, 80);
-        const messages = rows.slice(-limit);
+        const level = String(params.level ?? "").trim().toLowerCase();
+        const filtered =
+          level.length > 0 ? rows.filter((row) => String(row.type ?? "").trim().toLowerCase() === level) : rows;
+        const messages = filtered.slice(-limit);
         if (clear) {
           liveConsoleByTabId.set(tab.id, []);
         }
@@ -2753,7 +4028,8 @@ export function createBrowserTool(): AnyAgentTool {
           engine,
           activeTabId: tab.id,
           count: messages.length,
-          total: rows.length,
+          total: filtered.length,
+          level: level || undefined,
           clear,
           messages,
         };
@@ -3011,6 +4287,34 @@ export function createBrowserTool(): AnyAgentTool {
 
       if (action === "act") {
         const kind = String(params.kind ?? "click").trim().toLowerCase();
+        const requestFields = Array.isArray(params.fields)
+          ? params.fields.filter((entry) => entry && typeof entry === "object")
+          : [];
+        if (kind === "fill" && requestFields.length > 0) {
+          let lastResult: unknown = null;
+          for (const fieldEntry of requestFields) {
+            const row = fieldEntry as Record<string, unknown>;
+            lastResult = await tool.execute("browser-act-fill-delegate", {
+              ...params,
+              action: "fill",
+              fields: undefined,
+              ref: row.ref ?? row.fieldRef ?? params.ref,
+              selector: row.selector ?? params.selector,
+              formIndex: row.formIndex ?? params.formIndex,
+              fieldName: row.fieldName ?? row.name ?? params.fieldName,
+              value: row.value ?? row.text ?? "",
+            });
+          }
+          if (lastResult && typeof lastResult === "object" && !("kind" in (lastResult as Record<string, unknown>))) {
+            return {
+              kind,
+              batch: true,
+              filled: requestFields.length,
+              ...(lastResult as Record<string, unknown>),
+            };
+          }
+          return lastResult;
+        }
         const mappedAction =
           kind === "click" ||
           kind === "type" ||
@@ -3029,13 +4333,15 @@ export function createBrowserTool(): AnyAgentTool {
           kind === "pdf" ||
           kind === "scroll" ||
           kind === "resize" ||
+          kind === "login" ||
+          kind === "mfa" ||
           kind === "close"
             ? kind
             : null;
         if (!mappedAction) {
           throw new Error(`unsupported act kind: ${kind}`);
         }
-        const delegated = await createBrowserTool().execute("browser-act-delegate", {
+        const delegated = await tool.execute("browser-act-delegate", {
           ...params,
           action: mappedAction,
         });
@@ -3127,4 +4433,5 @@ export function createBrowserTool(): AnyAgentTool {
       throw new Error(`unsupported browser action: ${action}`);
     },
   };
+  return tool;
 }

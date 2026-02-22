@@ -2,6 +2,7 @@ import { access, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promi
 import path from "node:path";
 import { Type } from "@mariozechner/pi-ai";
 import type { AnyAgentTool } from "../pi-tools.types.js";
+import { isSensitivePath } from "../../security/credentials-vault.js";
 
 const EDITABLE_START_MARKER = "T560_EDITABLE_START";
 const EDITABLE_END_MARKER = "T560_EDITABLE_END";
@@ -112,6 +113,12 @@ function assertWriteWithinAllowedRanges(existingContent: string, nextContent: st
   }
 }
 
+function assertPathIsNotSensitive(targetPath: string, workspaceDir: string): void {
+  if (isSensitivePath(targetPath, workspaceDir)) {
+    throw new Error("Access to sensitive credential files is blocked.");
+  }
+}
+
 function resolveToolPath(rawPath: string, workspaceDir: string, workspaceOnly: boolean): string {
   const input = rawPath.trim();
   if (!input) {
@@ -122,11 +129,12 @@ function resolveToolPath(rawPath: string, workspaceDir: string, workspaceOnly: b
   if (workspaceOnly && !isPathInside(workspaceDir, resolved)) {
     throw new Error(`Path '${input}' is outside workspace root.`);
   }
+  assertPathIsNotSensitive(resolved, workspaceDir);
 
   return resolved;
 }
 
-async function walkFiles(basePath: string, limit: number, acc: string[]): Promise<void> {
+async function walkFiles(basePath: string, limit: number, acc: string[], workspaceDir: string): Promise<void> {
   if (acc.length >= limit) {
     return;
   }
@@ -138,8 +146,11 @@ async function walkFiles(basePath: string, limit: number, acc: string[]): Promis
     }
 
     const fullPath = path.join(basePath, entry.name);
+    if (isSensitivePath(fullPath, workspaceDir)) {
+      continue;
+    }
     if (entry.isDirectory()) {
-      await walkFiles(fullPath, limit, acc);
+      await walkFiles(fullPath, limit, acc, workspaceDir);
       continue;
     }
 
@@ -270,7 +281,13 @@ export function createFilesystemTools(options: {
       const includeHidden = Boolean(params.includeHidden);
 
       const items = entries
-        .filter((entry) => includeHidden || !entry.name.startsWith("."))
+        .filter((entry) => {
+          const fullPath = path.join(rootPath, entry.name);
+          if (isSensitivePath(fullPath, workspaceDir)) {
+            return false;
+          }
+          return includeHidden || !entry.name.startsWith(".");
+        })
         .map((entry) => ({
           name: entry.name,
           type: entry.isDirectory() ? "dir" : entry.isFile() ? "file" : "other"
@@ -301,7 +318,7 @@ export function createFilesystemTools(options: {
       const limit = Number(params.limit ?? 200);
       const pattern = String(params.pattern ?? "").toLowerCase();
       const scanned: string[] = [];
-      await walkFiles(rootPath, limit * 5, scanned);
+      await walkFiles(rootPath, limit * 5, scanned, workspaceDir);
 
       const matched = scanned
         .filter((file) => (pattern ? file.toLowerCase().includes(pattern) : true))

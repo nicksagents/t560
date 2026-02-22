@@ -2,6 +2,7 @@ import type { GatewayChannelId, GatewayInboundMessage } from "../gateway/types.j
 import { readOnboardingStatus, resolveRoutingTarget, type RoutingTarget } from "../config/state.js";
 import { chatWithProvider } from "../provider/run.js";
 import { emitAgentEvent } from "../agents/agent-events.js";
+import { handleSecureSetupFlow } from "../security/setup-flow.js";
 
 export type ChatResponse = {
   role: "assistant";
@@ -93,6 +94,25 @@ export async function processChatMessage(
   input: GatewayInboundMessage
 ): Promise<ChatResponse> {
   const status = await readOnboardingStatus();
+  const secureSetup = await handleSecureSetupFlow({
+    workspaceDir: process.cwd(),
+    sessionId: input.sessionId,
+    message: input.message,
+  });
+  if (secureSetup.handled) {
+    return {
+      role: "assistant",
+      message: secureSetup.message,
+      thinking: null,
+      toolCalls: [],
+      mode: status.onboarded ? "provider" : "foundation",
+      provider: null,
+      model: null,
+      onboardingRequired: !status.onboarded,
+      missing: status.onboarded ? [] : status.missing
+    };
+  }
+
   if (!status.onboarded) {
     return {
       role: "assistant",
@@ -151,7 +171,7 @@ export async function processChatMessage(
     return {
       role: "assistant",
       message: response.message,
-      thinking: null,
+      thinking: response.thinking,
       toolCalls: response.toolCalls,
       mode: "provider",
       provider: response.provider,
@@ -175,7 +195,7 @@ export async function processChatMessage(
         return {
           role: "assistant",
           message: resumed.message,
-          thinking: null,
+          thinking: resumed.thinking,
           toolCalls: resumed.toolCalls,
           mode: "provider",
           provider: resumed.provider,

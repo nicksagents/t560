@@ -6,6 +6,13 @@ import { createWebFetchTool, createWebSearchTool } from "./tools/web-tools.js";
 export function createT560Tools(options?: {
   config?: T560Config;
 }): AnyAgentTool[] {
-  void options;
-  return [createBrowserTool(), createWebSearchTool(), createWebFetchTool()];
+  const webSearch = createWebSearchTool({
+    config: options?.config,
+    env: process.env,
+  });
+  const webFetch = createWebFetchTool({
+    config: options?.config,
+    env: process.env,
+  });
+  return [createBrowserTool(), ...(webSearch ? [webSearch] : []), ...(webFetch ? [webFetch] : [])];
 }

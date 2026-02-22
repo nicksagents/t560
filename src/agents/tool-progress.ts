@@ -101,6 +101,58 @@ export function progressMessageForToolStart(params: {
   args: Record<string, unknown>;
 }): string | null {
   const tool = params.toolName.toLowerCase();
+  if (tool === "browser") {
+    const action = String(params.args.action ?? "open")
+      .trim()
+      .toLowerCase();
+    const url = typeof params.args.url === "string" ? params.args.url.trim() : "";
+    const query = typeof params.args.query === "string" ? params.args.query.trim() : "";
+    if (action === "launch") {
+      return `Launching the external browser${url ? ` at ${url}` : ""}.`;
+    }
+    if (action === "open" || action === "navigate") {
+      return `Opening browser tab${url ? ` at ${url}` : ""}.`;
+    }
+    if (action === "search") {
+      return `Searching in browser${query ? ` for "${query}"` : ""}.`;
+    }
+    if (action === "snapshot") {
+      return "Capturing current page snapshot.";
+    }
+    if (action === "products") {
+      return "Extracting product candidates from the current page.";
+    }
+    if (action === "click" || action === "fill" || action === "submit" || action === "act") {
+      return `Performing browser action: ${action}.`;
+    }
+    return `Running browser action: ${action || "open"}.`;
+  }
+  if (tool === "web_search") {
+    const query = typeof params.args.query === "string" ? params.args.query.trim() : "";
+    return `Searching the web${query ? ` for "${query}"` : ""}.`;
+  }
+  if (tool === "web_fetch") {
+    const url = typeof params.args.url === "string" ? params.args.url.trim() : "";
+    return `Fetching web page${url ? ` ${url}` : ""}.`;
+  }
+  if (tool === "read") {
+    return "Reading file contents.";
+  }
+  if (tool === "write") {
+    return "Writing file changes.";
+  }
+  if (tool === "edit") {
+    return "Applying targeted file edits.";
+  }
+  if (tool === "ls") {
+    return "Listing directory contents.";
+  }
+  if (tool === "find") {
+    return "Searching for files.";
+  }
+  if (tool === "exists") {
+    return "Checking whether a path exists.";
+  }
   if (tool === "exec") {
     const command = typeof params.args.command === "string" ? params.args.command.trim() : "";
     return command ? describeExecCommand(command) : "Running a shell command.";

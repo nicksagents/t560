@@ -745,7 +745,25 @@ async function handleWsMessage(
         const history = await loadSessionMessages(sessionId);
         history.push({
           role: "assistant",
-          content: message,
+          content: [{ type: "text", text: message }],
+          api: "openai-responses",
+          provider: "webchat",
+          model: "manual-inject",
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              total: 0,
+            },
+          },
+          stopReason: "stop",
           timestamp: Date.now(),
         });
         await saveSessionMessages(sessionId, history);

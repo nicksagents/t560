@@ -7,20 +7,51 @@ export function getToolDefinitions({ enableEmailTools, enableGitHubTools, enable
 
   if (enableWebTools) {
     defs.push(
-      toolDef("web_search", "Search the web for up-to-date information.", {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          query: { type: "string", description: "Search query" },
-          count: {
-            type: ["integer", "null"],
-            minimum: 1,
-            maximum: 10,
-            description: "Number of results (1-10). Use null for default.",
+      toolDef(
+        "web_search",
+        "Search the web for up-to-date information (Brave when configured, automatic DuckDuckGo fallback).",
+        {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            query: { type: "string", description: "Search query" },
+            provider: {
+              type: ["string", "null"],
+              enum: ["brave", "duckduckgo", null],
+              description: "Optional provider override when allowed by runtime config.",
+            },
+            region: {
+              type: ["string", "null"],
+              description: "DuckDuckGo region code (for example wt-wt or us-en).",
+            },
+            count: {
+              type: ["integer", "null"],
+              minimum: 1,
+              maximum: 20,
+              description: "Number of results (1-20). Use null for default.",
+            },
+            fetchTop: {
+              type: ["integer", "null"],
+              minimum: 0,
+              maximum: 5,
+              description: "Optionally fetch top N search results for grounded excerpts.",
+            },
+            fetchMaxBytes: {
+              type: ["integer", "null"],
+              minimum: 10_000,
+              maximum: 400_000,
+              description: "Per-page byte limit when fetchTop > 0.",
+            },
+            timeoutMs: {
+              type: ["integer", "null"],
+              minimum: 1000,
+              maximum: 120000,
+              description: "Network timeout in milliseconds. Use null for default.",
+            },
           },
+          required: ["query"],
         },
-        required: ["query", "count"],
-      }),
+      ),
     );
 
     defs.push(
@@ -35,8 +66,14 @@ export function getToolDefinitions({ enableEmailTools, enableGitHubTools, enable
             maximum: 500_000,
             description: "Max bytes to download (10k-500k). Use null for default.",
           },
+          timeoutMs: {
+            type: ["integer", "null"],
+            minimum: 1000,
+            maximum: 120000,
+            description: "Network timeout in milliseconds. Use null for default.",
+          },
         },
-        required: ["url", "maxBytes"],
+        required: ["url"],
       }),
     );
   }

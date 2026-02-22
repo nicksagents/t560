@@ -26,9 +26,9 @@ function printHelp(): void {
       `${heading("Usage:")} t560 [command]`,
       "",
       `${heading("Commands:")}`,
-      `  ${cmd("start")}        Start the local t560 runtime (default)`,
+      `  ${cmd("start")}        Start the local t560 runtime (legacy readline mode)`,
       `  ${cmd("gateway")}      Start gateway runtime (alias of start)`,
-      `  ${cmd("tui")}          Start terminal UI runtime (alias of start)`,
+      `  ${cmd("tui")}          Start full-screen t560 terminal UI (default)`,
       `  ${cmd("onboard")}      Run onboarding wizard`,
       `  ${cmd("pairing")}      Manage DM pairing approvals`,
       `  ${cmd("completion")}   Show completion scaffold status`,
@@ -135,7 +135,7 @@ async function runStartupPreflight(command: string): Promise<boolean> {
 }
 
 export async function runCli(argv: string[]): Promise<void> {
-  const command = argv[2] ?? "start";
+  const command = argv[2] ?? "tui";
   const version = await resolveVersion();
   printBanner({ version });
 
@@ -193,6 +193,18 @@ export async function runCli(argv: string[]): Promise<void> {
   const preflightReady = await runStartupPreflight(command);
   if (!preflightReady) {
     process.exitCode = 1;
+    return;
+  }
+
+  if (command === "tui") {
+    const tuiModule = await import("../tui/tui.js").catch(() => null);
+    if (!tuiModule || typeof tuiModule.runTui !== "function") {
+      process.stderr.write("tui command unavailable in this recovered build.\n");
+      process.stderr.write("Run `t560 onboard` or rebuild from a fresh clone.\n");
+      process.exitCode = 1;
+      return;
+    }
+    await tuiModule.runTui();
     return;
   }
 

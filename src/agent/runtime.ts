@@ -12,6 +12,7 @@ import { isHeartbeatCheckMessage } from "../gateway/heartbeat.js";
 import { startGatewayRuntime } from "../gateway/runtime.js";
 import type { AgentEvent } from "../agents/agent-events.js";
 import { approvePairingCode, listPendingPairings } from "../channels/pairing.js";
+import { getSetupFlowState, handleSecureSetupFlow } from "../security/setup-flow.js";
 
 function createTerminalSessionId(): string {
   const ts = Date.now().toString(36);
@@ -54,6 +55,31 @@ function parsePairingCommand(raw: string): PairingCommand | null {
   }
 
   return null;
+}
+
+function renderTerminalMenuBar(params: {
+  rich: boolean;
+  sessionId: string;
+  busy: boolean;
+}): string {
+  const setupState = getSetupFlowState(params.sessionId);
+  const status = params.busy
+    ? "processing"
+    : setupState
+      ? setupState.step === "identifier"
+        ? `setup ${setupState.service}: waiting for account identifier`
+        : setupState.step === "authMode"
+          ? `setup ${setupState.service}: waiting for auth mode (password|mfa)`
+          : setupState.authMode === "passwordless_mfa_code"
+            ? `setup ${setupState.service}: waiting for MFA code or skip`
+            : `setup ${setupState.service}: waiting for app password`
+      : "ready";
+
+  const commands = setupState
+    ? "/setup cancel | /setup list | /pair <CODE>"
+    : "/setup <service-or-site> | /setup list | /pair <CODE>";
+  const text = `menu ${status} | ${commands}`;
+  return params.rich ? theme.dim(text) : text;
 }
 
 export async function runAgentRuntime(): Promise<never> {
@@ -115,6 +141,33 @@ export async function runAgentRuntime(): Promise<never> {
   if (terminalRl) {
     const TERMINAL_SESSION_ID = createTerminalSessionId();
     const TERMINAL_USER_ID = "terminal-user";
+    let maskSecretInput = false;
+    const rlWithMask = terminalRl as typeof terminalRl & {
+      _writeToOutput?: (chunk: string) => void;
+    };
+    const originalWriteToOutput =
+      typeof rlWithMask._writeToOutput === "function"
+        ? rlWithMask._writeToOutput.bind(terminalRl)
+        : null;
+    if (originalWriteToOutput) {
+      rlWithMask._writeToOutput = (chunk: string) => {
+        if (!maskSecretInput) {
+          originalWriteToOutput(chunk);
+          return;
+        }
+        const isPromptChunk = chunk.includes(terminalRl.getPrompt());
+        const isControlChunk =
+          chunk.includes("\n") ||
+          chunk.includes("\r") ||
+          chunk.includes("\u0008") ||
+          chunk.includes("\u001b");
+        if (isPromptChunk || isControlChunk) {
+          originalWriteToOutput(chunk);
+          return;
+        }
+        originalWriteToOutput("*");
+      };
+    }
 
     // System message like OpenClaw's chatLog.addSystem()
     process.stdout.write(
@@ -122,6 +175,9 @@ export async function runAgentRuntime(): Promise<never> {
     );
     process.stdout.write(
       `${rich ? theme.dim("pairing tip: use /pair <CODE> or t560 pairing approve telegram <CODE>") : "pairing tip: use /pair <CODE> or t560 pairing approve telegram <CODE>"}\n\n`
+    );
+    process.stdout.write(
+      `${rich ? theme.dim("setup tip: use /setup <service-or-site> (example: /setup havenvaults2-0)") : "setup tip: use /setup <service-or-site> (example: /setup havenvaults2-0)"}\n\n`
     );
 
     let waitingStatus = "";
@@ -136,6 +192,31 @@ export async function runAgentRuntime(): Promise<never> {
       if (waitingActive && waitingStatus) {
         process.stdout.write(`\r\x1b[K${waitingStatus}`);
       }
+    };
+    const renderMenu = () => {
+      const cols = process.stdout.columns || 60;
+      const divider = rich ? theme.border("─".repeat(cols)) : "─".repeat(cols);
+      const menuLine = renderTerminalMenuBar({
+        rich,
+        sessionId: TERMINAL_SESSION_ID,
+        busy: terminalBusy,
+      });
+      process.stdout.write(`${divider}\n${menuLine}\n`);
+    };
+    const promptWithMenu = () => {
+      const setupState = getSetupFlowState(TERMINAL_SESSION_ID);
+      maskSecretInput = Boolean(setupState && setupState.step === "secret");
+      terminalRl.setPrompt(
+        maskSecretInput
+          ? rich
+            ? theme.accent("🔒 ")
+            : "[secret] "
+          : rich
+            ? theme.accent("❯ ")
+            : "> "
+      );
+      renderMenu();
+      terminalRl.prompt();
     };
 
     const handleToolEvent = (event: AgentEvent) => {
@@ -156,17 +237,28 @@ export async function runAgentRuntime(): Promise<never> {
       onEvent: handleToolEvent,
     });
 
-    terminalRl.setPrompt(rich ? theme.accent("❯ ") : "> ");
-    terminalRl.prompt();
+    promptWithMenu();
 
     terminalRl.on("line", async (line) => {
-      const message = line.trim();
+      const rawMessage = line;
+      const message = rawMessage.trim();
       if (!message) {
-        terminalRl.prompt();
+        promptWithMenu();
         return;
       }
       if (isHeartbeatCheckMessage(message)) {
-        terminalRl.prompt();
+        promptWithMenu();
+        return;
+      }
+      const setupHandled = await handleSecureSetupFlow({
+        sessionId: TERMINAL_SESSION_ID,
+        message: rawMessage,
+      });
+      if (setupHandled.handled) {
+        process.stdout.write(
+          `${rich ? theme.system(setupHandled.message) : setupHandled.message}\n\n`
+        );
+        promptWithMenu();
         return;
       }
       const pairingCommand = parsePairingCommand(message);
@@ -214,12 +306,12 @@ export async function runAgentRuntime(): Promise<never> {
           const msg = error instanceof Error ? error.message : String(error);
           process.stderr.write(`${rich ? theme.error(`pairing error: ${msg}`) : `pairing error: ${msg}`}\n\n`);
         }
-        terminalRl.prompt();
+        promptWithMenu();
         return;
       }
       if (terminalBusy) {
         process.stdout.write(`${rich ? theme.dim("waiting for previous response…") : "waiting for previous response..."}\n`);
-        terminalRl.prompt();
+        promptWithMenu();
         return;
       }
 
@@ -264,7 +356,7 @@ export async function runAgentRuntime(): Promise<never> {
         );
       } finally {
         terminalBusy = false;
-        terminalRl.prompt();
+        promptWithMenu();
       }
     });
 

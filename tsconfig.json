@@ -15,5 +15,5 @@
     "declaration": false,
     "sourceMap": true
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/bin/t560.ts", "src/agent/runtime.ts"]
 }
