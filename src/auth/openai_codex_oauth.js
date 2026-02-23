@@ -1,6 +1,15 @@
 import fs from "node:fs";
+import path from "node:path";
 import { loginOpenAICodex, refreshOpenAICodexToken } from "@mariozechner/pi-ai";
-import { resolveOAuthDir, resolveOpenAICodexOAuthPath } from "../config/paths.js";
+import { resolveStateDir } from "../config/state.js";
+
+function resolveOAuthDir(env = process.env) {
+  return path.join(resolveStateDir(env), "oauth");
+}
+
+function resolveOpenAICodexOAuthPath(env = process.env) {
+  return path.join(resolveOAuthDir(env), "openai-codex.json");
+}
 
 function ensureDir(dir) {
   fs.mkdirSync(dir, { recursive: true });
