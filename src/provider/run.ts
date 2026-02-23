@@ -1559,6 +1559,10 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
       ? `Verified steps completed: ${successfulToolOutcomes.length}`
       : "";
   let message = flattened.text || "";
+  const assistantStopReason = String((lastAssistant as { stopReason?: unknown }).stopReason ?? "")
+    .trim()
+    .toLowerCase();
+  const assistantErrored = assistantStopReason === "error" || assistantStopReason === "aborted";
   if (!flattened.text && allToolCalls.length > 0) {
     message = buildToolOnlyFallbackMessage({
       userMessage: params.message,
@@ -1567,7 +1571,7 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
     });
   }
 
-  if (forceToolUse && allToolCalls.length === 0) {
+  if (forceToolUse && allToolCalls.length === 0 && (assistantErrored || !message.trim())) {
     message = [
       "I could not complete this action because no verification steps were completed.",
       "I will only claim completion after direct verification confirms results."

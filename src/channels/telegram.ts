@@ -11,6 +11,7 @@ import type { GatewayInboundMessage } from "../gateway/types.js";
 import { isHeartbeatCheckMessage } from "../gateway/heartbeat.js";
 import type { AgentEvent } from "../agents/agent-events.js";
 import { isPairingApproved, requestPairingCode } from "./pairing.js";
+import { clearSessionMessages } from "../provider/session.js";
 
 export type TelegramBridge = {
   enabled: boolean;
@@ -332,6 +333,17 @@ export async function startTelegramBridge(opts: TelegramBridgeOptions): Promise<
               token,
               chatId,
               `t560 status: ${mode}. dmPolicy=${dmPolicy}. Missing: ${latestStatus.missing.join(", ") || "none"}.`
+            );
+            continue;
+          }
+
+          if (text === "/new" || text === "/reset") {
+            const sessionId = `telegram:${chatId}`;
+            await clearSessionMessages(sessionId);
+            await sendTelegramMessage(
+              token,
+              chatId,
+              "Started a fresh chat session for this conversation."
             );
             continue;
           }
