@@ -4,8 +4,8 @@ export type BraveSearchResult = {
   description: string;
 };
 
-export function braveWebSearch(params: {
-  apiKey?: string;
+export function braveWebSearch(input: {
+  apiKey: string;
   query: string;
   count?: number;
   timeoutMs?: number;

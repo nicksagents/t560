@@ -107,7 +107,7 @@ export function renderStatusView(host: T560App): string {
 
   const gatewayInfoHtml = `<div class="card" style="margin-top:16px">
     <div class="card-title">Gateway Diagnostics</div>
-    <div class="card-sub">OpenClaw-style quick controls for connection, history, and debug actions.</div>
+    <div class="card-sub">Quick controls for connection, history, and debug actions.</div>
     <div class="status-list" style="margin-top:12px">
       <div><span class="muted">WebSocket URL</span><span class="mono">${escapeHtml(host.gatewayWsUrl || "(not connected)")}</span></div>
       <div><span class="muted">Connection</span><span class="mono">${host.connected ? "connected" : "disconnected"}</span></div>

@@ -471,7 +471,8 @@ export function createWebSearchTool(options?: WebToolOptions): AnyAgentTool | nu
       }
 
       const provider = requestedProvider ?? config.provider;
-      if (provider === "brave" && !config.apiKey) {
+      const braveApiKey = config.apiKey;
+      if (provider === "brave" && !braveApiKey) {
         throw new Error("Brave provider requires BRAVE_API_KEY.");
       }
 
@@ -494,7 +495,7 @@ export function createWebSearchTool(options?: WebToolOptions): AnyAgentTool | nu
       if (provider === "brave") {
         try {
           rawResults = await braveWebSearch({
-            apiKey: config.apiKey,
+            apiKey: braveApiKey ?? "",
             query: runQuery,
             count,
             timeoutMs,

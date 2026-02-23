@@ -1,5 +1,5 @@
 /**
- * WebSocket gateway client — simplified version of OpenClaw's protocol.
+ * WebSocket gateway client for the t560 dashboard protocol.
  * Frame types: req (client→server), res (server→client), event (server→client)
  */
 import { uuid } from "./uuid.js";

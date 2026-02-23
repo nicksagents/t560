@@ -20,7 +20,9 @@ Active runtime for `t560` command:
 - `src/web/dashboard.ts`
 - `ui/src/*`
 
-There are also legacy OpenClaw-style modules in this repo (mostly JS under `src/gateway/*.js`, `src/tools/*.js`, `src/skills/runtime.js`). Some are still useful references and some power legacy command paths, but they are not the primary `t560` runtime path above.
+The active runtime is TypeScript-first under `src/` with JS helper modules only where needed for runtime interop.
+
+Embedded upstream reference repos were removed from this workspace (`references/` no longer exists).
 
 If you are fixing behavior seen in normal `t560` usage, start with the active runtime files first.
 
@@ -277,7 +279,7 @@ Runtime provider mapping is handled in:
 `src/config/state.ts` defines `T560Config`:
 - `providers`
 - `routing`
-- `models` (legacy refs)
+- `models` (compatibility model refs)
 - `channels`
 - `tools`
 - `skills`
@@ -298,7 +300,7 @@ Important files:
 - `~/.t560/memory.jsonl`
 - `~/.t560/soul.md`
 - `~/.t560/users.md`
-- `~/.t560/user.md` (legacy mirror)
+- `~/.t560/user.md` (compatibility mirror)
 - `~/.t560/pairing.json`
 
 ### 5.3 Secure credentials
@@ -443,12 +445,11 @@ Update in `src/provider/run.ts`:
 - `summarizeArgsForProgress`
 - `summarizeOutcomeForProgress`
 
-### Step 7: Optional UI/tool-display support
+### Step 7: Optional UI tool-card support
 
-If you want richer tool card rendering metadata:
-- `src/agents/tool-display.json`
-- `src/agents/tool-display.ts`
+If you want richer tool call rendering in chat:
 - `ui/src/ui/chat/tool-cards.ts`
+- keep progress summary strings clean in `src/provider/run.ts` so cards remain readable
 
 ### Step 8: Add tests
 
@@ -529,11 +530,13 @@ Use this skill when...
 - include verification steps
 - include fail-safe behavior
 
-### 9.3 Optional advanced metadata (legacy skill runtime)
+### 9.3 Skill metadata parsed today
 
-`src/skills/runtime.js` supports richer metadata (`requires`, install hints, OS/env/config gating). This is used in legacy skill catalog paths.
+`src/agents/skills.ts` currently reads:
+- `name:` and `description:` from skill frontmatter/body
+- fallback description from first non-empty line when description is missing
 
-If you need that compatibility, follow existing examples:
+Reference examples:
 - `skills/clawhub/SKILL.md`
 - `skills/terminal-exec/SKILL.md`
 
@@ -655,7 +658,7 @@ curl http://127.0.0.1:5600/api/status
 
 ## 14) Change Checklist Before You Merge
 
-1. Did you edit the active runtime path or only legacy files?
+1. Did you edit the active runtime path?
 2. If you added/changed a tool, did you update:
 - registration
 - policy groups/profiles
@@ -676,4 +679,3 @@ curl http://127.0.0.1:5600/api/status
 - Do not edit `dist/` by hand.
 - Verify destructive changes with explicit checks.
 - For major behavior changes, update tests and this document in the same branch.
-

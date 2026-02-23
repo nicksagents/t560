@@ -1,8 +1,0 @@
-{
-  "version": 1,
-  "fallback": {
-    "emoji": "\ud83e\udde9",
-    "label": "run"
-  },
-  "tools": {}
-}

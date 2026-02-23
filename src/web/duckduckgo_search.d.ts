@@ -4,12 +4,9 @@ export type DuckDuckGoSearchResult = {
   description: string;
 };
 
-export function parseDuckDuckGoHtml(
-  html: string,
-  count?: number,
-): DuckDuckGoSearchResult[];
+export function parseDuckDuckGoHtml(html: string, count?: number): DuckDuckGoSearchResult[];
 
-export function duckDuckGoSearch(params: {
+export function duckDuckGoSearch(input: {
   query: string;
   count?: number;
   timeoutMs?: number;
@@ -17,8 +14,8 @@ export function duckDuckGoSearch(params: {
 }): Promise<DuckDuckGoSearchResult[]>;
 
 export const __testing: {
-  decodeHtmlEntities(value: unknown): string;
-  stripTags(value: unknown): string;
-  resolveResultUrl(href: unknown): string;
-  parseDuckDuckGoHtml(html: string, count?: number): DuckDuckGoSearchResult[];
+  decodeHtmlEntities: (value: unknown) => string;
+  stripTags: (value: unknown) => string;
+  resolveResultUrl: (href: unknown) => string;
+  parseDuckDuckGoHtml: (html: string, count?: number) => DuckDuckGoSearchResult[];
 };

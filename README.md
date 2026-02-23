@@ -111,7 +111,7 @@ Wizard configures:
    1. `~/.t560/users.md` (who the human is)
    2. `~/.t560/soul.md` (who t560 is, including personality traits)
 
-The onboarding UI now uses the same Clack-style interactive terminal flow as OpenClaw (selects, confirms, note panels), with T560 branding + banner.
+The onboarding UI uses a Clack-style interactive terminal flow (selects, confirms, note panels) with T560 branding + banner.
 
 OpenAI Codex provider now supports browser OAuth redirect during onboarding (OpenAI sign-in page opens, then credentials are captured and saved).
 
