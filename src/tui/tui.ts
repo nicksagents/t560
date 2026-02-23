@@ -660,9 +660,13 @@ export async function runTui(opts: TuiOptions = {}): Promise<void> {
     slashCommands = getSlashCommands();
   }
   editor.setAutocompleteProvider(new CombinedAutocompleteProvider(slashCommands));
-  const accessUrl = gateway.dashboard.tailscaleUrl || gateway.dashboard.localUrl;
-  addSystem(`server ${accessUrl}`);
+  addSystem(`web local ${gateway.dashboard.localUrl}`);
+  if (gateway.dashboard.tailscaleUrl) {
+    addSystem(`web tailscale ${gateway.dashboard.tailscaleUrl}`);
+  }
+  addSystem(`web bind ${gateway.dashboard.bindHost}:${gateway.dashboard.port}`);
   addSystem(`telegram ${gateway.telegram.info}`);
+  addSystem("channels active: terminal + webchat + telegram");
   if (opts.message?.trim()) {
     editor.setText(opts.message.trim());
   }

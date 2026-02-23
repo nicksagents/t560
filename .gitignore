@@ -1,3 +1,8 @@
 node_modules
 dist
 .t560-secure/
+.t560/
+memory.jsonl
+MEMORY.md
+memory.md
+memory/

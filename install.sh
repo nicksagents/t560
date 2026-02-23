@@ -60,4 +60,4 @@ fi
 echo "[t560] If your shell still reports an old t560 path, run: hash -r"
 
 echo "[t560] Starting agent..."
-exec t560 gateway
+exec t560

@@ -12,8 +12,18 @@ export const TOOL_GROUPS: Record<string, string[]> = {
   "group:runtime": ["exec", "process"],
   "group:messaging": ["message", "sessions_send"],
   "group:web": ["web_search", "web_fetch"],
+  "group:memory": ["memory_search", "memory_get", "memory_save"],
   "group:ui": ["browser"],
-  "group:t560": ["exec", "process", "browser", "web_search", "web_fetch"]
+  "group:t560": [
+    "exec",
+    "process",
+    "browser",
+    "web_search",
+    "web_fetch",
+    "memory_search",
+    "memory_get",
+    "memory_save",
+  ]
 };
 
 const TOOL_PROFILES: Record<ToolProfileId, ToolPolicyLike> = {
@@ -21,7 +31,7 @@ const TOOL_PROFILES: Record<ToolProfileId, ToolPolicyLike> = {
     allow: ["process"]
   },
   coding: {
-    allow: ["group:runtime", "group:fs", "group:web", "group:ui"]
+    allow: ["group:runtime", "group:fs", "group:web", "group:memory", "group:ui"]
   },
   messaging: {
     allow: ["group:messaging", "process"]

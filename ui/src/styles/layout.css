@@ -5,8 +5,8 @@
 .shell {
   --shell-pad: 16px;
   --shell-gap: 16px;
-  --shell-nav-width: 220px;
-  --shell-topbar-height: 56px;
+  --shell-nav-width: 232px;
+  --shell-topbar-height: 62px;
   --shell-focus-duration: 200ms;
   --shell-focus-ease: var(--ease-out);
   height: 100vh;
@@ -60,7 +60,10 @@
   padding: 0 20px;
   height: var(--shell-topbar-height);
   border-bottom: 1px solid var(--border);
-  background: var(--bg);
+  background:
+    radial-gradient(110% 140% at 0% -40%, var(--accent-subtle), transparent 55%),
+    linear-gradient(to bottom, color-mix(in srgb, var(--bg) 95%, transparent), var(--bg));
+  backdrop-filter: blur(12px) saturate(1.08);
 }
 
 .topbar-left {
@@ -90,6 +93,27 @@
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+.brand-badge {
+  width: 30px;
+  height: 30px;
+  border-radius: 10px;
+  display: grid;
+  place-items: center;
+  color: var(--accent);
+  background: var(--accent-subtle);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.brand-badge svg {
+  width: 15px;
+  height: 15px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.6px;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .brand-logo {
@@ -175,7 +199,8 @@
   overflow-y: auto;
   overflow-x: hidden;
   padding: 16px 12px;
-  background: var(--bg);
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--bg) 95%, transparent), var(--bg) 30%);
   scrollbar-width: none;
   transition:
     width var(--shell-focus-duration) var(--shell-focus-ease),
@@ -373,7 +398,7 @@
 
 .content {
   grid-area: content;
-  padding: 12px 16px 32px;
+  padding: 14px 18px 34px;
   display: block;
   min-height: 0;
   overflow-y: auto;
@@ -389,7 +414,7 @@
 .content--chat {
   display: flex;
   flex-direction: column;
-  gap: 24px;
+  gap: 14px;
   overflow: hidden;
   padding-bottom: 0;
 }
@@ -402,7 +427,7 @@
   align-items: flex-end;
   justify-content: space-between;
   gap: 16px;
-  padding: 4px 8px;
+  padding: 2px 4px 8px;
   overflow: hidden;
   transform-origin: top center;
   transition:
@@ -422,7 +447,7 @@
 }
 
 .page-title {
-  font-size: 26px;
+  font-size: 24px;
   font-weight: 700;
   letter-spacing: -0.035em;
   line-height: 1.15;

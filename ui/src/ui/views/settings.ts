@@ -73,11 +73,11 @@ export function renderSettingsView(host: T560App): string {
             <button class="btn primary" data-action="save-soul" ${busy ? "disabled" : ""}>Save soul.md</button>
           </div>
           <label class="field full">
-            <span>users.md</span>
+            <span>user.md / users.md</span>
             <textarea class="settings-editor" data-input="users-draft" ${busy ? "disabled" : ""}>${escapeHtml(host.usersDraft)}</textarea>
           </label>
           <div class="settings-actions">
-            <button class="btn primary" data-action="save-users" ${busy ? "disabled" : ""}>Save users.md</button>
+            <button class="btn primary" data-action="save-users" ${busy ? "disabled" : ""}>Save user profile</button>
           </div>
         </div>
       </div>
@@ -116,4 +116,3 @@ export function renderSettingsView(host: T560App): string {
     </div>
   </div>`;
 }
-

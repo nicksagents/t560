@@ -64,7 +64,9 @@ export function createT560CodingTools(options?: {
       workspaceOnly
     }),
     ...createT560Tools({
-      config: options?.config
+      config: options?.config,
+      workspaceDir,
+      env: process.env,
     }),
   ];
 

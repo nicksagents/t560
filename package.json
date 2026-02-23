@@ -18,7 +18,7 @@
   "scripts": {
     "clean": "rm -rf dist",
     "build:ui": "cd ui && npm install && npx vite build",
-    "build:server": "tsc -p tsconfig.json",
+    "build:server": "tsc -p tsconfig.json && node scripts/copy-source-js.mjs",
     "build": "npm run build:ui && npm run build:server",
     "dev": "tsx src/bin/t560.ts",
     "dev:ui": "cd ui && npx vite",

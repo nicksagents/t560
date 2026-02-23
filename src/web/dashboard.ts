@@ -3,6 +3,7 @@ import { URL, fileURLToPath } from "node:url";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { join, extname, dirname } from "node:path";
+import { spawnSync } from "node:child_process";
 import type { ChatResponse } from "../agent/chat-service.js";
 import type { AgentEvent } from "../agents/agent-events.js";
 import { loadT560BootstrapContext, T560_BOOTSTRAP_FILENAMES } from "../agents/bootstrap-context.js";
@@ -25,6 +26,15 @@ import { summarizeSavedUsage } from "../provider/usage-summary.js";
 import { isHeartbeatCheckMessage } from "../gateway/heartbeat.js";
 import type { GatewayInboundMessage } from "../gateway/types.js";
 import { resolveTailscaleStatus } from "../network/tailscale.js";
+import { listProviderCatalog } from "../onboarding/provider-catalog.js";
+import {
+  deleteCredential,
+  getCredential,
+  listConfiguredServices,
+  normalizeSetupService,
+  setCredential,
+  type CredentialAuthMode,
+} from "../security/credentials-vault.js";
 
 export type DashboardServer = {
   port: number;
@@ -135,18 +145,79 @@ const MIME_TYPES: Record<string, string> = {
 
 /** Resolve the control-ui build directory */
 function resolveUiRoot(): string | null {
+  const candidates: string[] = [];
+
   // Try dist/control-ui relative to the project root
   const __filename = fileURLToPath(import.meta.url);
   const __dirname = dirname(__filename);
-  // From dist/web/dashboard.js -> dist/control-ui
-  const distRoot = join(__dirname, "..", "control-ui");
-  if (existsSync(join(distRoot, "index.html"))) return distRoot;
+  candidates.push(
+    // From dist/web/dashboard.js -> dist/control-ui
+    join(__dirname, "..", "control-ui"),
+    // From src/web/dashboard.ts -> ../../dist/control-ui (dev mode)
+    join(__dirname, "..", "..", "dist", "control-ui"),
+    // Last resort relative to current working directory.
+    join(process.cwd(), "dist", "control-ui"),
+  );
 
-  // Try from src/web -> ../../dist/control-ui (dev mode)
-  const devRoot = join(__dirname, "..", "..", "dist", "control-ui");
-  if (existsSync(join(devRoot, "index.html"))) return devRoot;
+  for (const root of candidates) {
+    if (existsSync(join(root, "index.html"))) {
+      return root;
+    }
+  }
 
   return null;
+}
+
+function resolveProjectRootFromDashboardFile(): string {
+  const __filename = fileURLToPath(import.meta.url);
+  const __dirname = dirname(__filename);
+  const guessed = join(__dirname, "..", "..");
+  if (existsSync(join(guessed, "package.json")) && existsSync(join(guessed, "ui", "package.json"))) {
+    return guessed;
+  }
+  return process.cwd();
+}
+
+function runCommandSync(cmd: string, args: string[], cwd: string): boolean {
+  const result = spawnSync(cmd, args, {
+    cwd,
+    stdio: "inherit",
+    env: process.env,
+  });
+  return result.status === 0;
+}
+
+function ensureControlUiBuilt(): { uiRoot: string | null; autoBuilt: boolean } {
+  const existing = resolveUiRoot();
+  if (existing) {
+    return { uiRoot: existing, autoBuilt: false };
+  }
+
+  if (process.env.T560_AUTO_BUILD_UI === "0") {
+    return { uiRoot: null, autoBuilt: false };
+  }
+
+  const projectRoot = resolveProjectRootFromDashboardFile();
+  const uiDir = join(projectRoot, "ui");
+  if (!existsSync(join(uiDir, "package.json"))) {
+    return { uiRoot: null, autoBuilt: false };
+  }
+
+  console.warn("[dashboard] Control UI bundle missing; auto-building UI...");
+  const hasUiNodeModules = existsSync(join(uiDir, "node_modules"));
+  if (!hasUiNodeModules) {
+    const installed = runCommandSync("npm", ["install"], uiDir);
+    if (!installed) {
+      console.warn("[dashboard] UI dependency install failed.");
+      return { uiRoot: null, autoBuilt: true };
+    }
+  }
+  const built = runCommandSync("npm", ["run", "build"], uiDir);
+  if (!built) {
+    console.warn("[dashboard] UI build failed.");
+    return { uiRoot: null, autoBuilt: true };
+  }
+  return { uiRoot: resolveUiRoot(), autoBuilt: true };
 }
 
 function serveStaticFile(res: ServerResponse, uiRoot: string, pathname: string): boolean {
@@ -401,6 +472,579 @@ function parseConfigObjectFromBody(body: unknown): T560Config {
   return obj as T560Config;
 }
 
+function parseRoutingSlot(slotRaw: unknown): { provider: string; model: string } | null {
+  if (!slotRaw || typeof slotRaw !== "object" || Array.isArray(slotRaw)) {
+    return null;
+  }
+  const slot = slotRaw as Record<string, unknown>;
+  const provider = String(slot.provider ?? "").trim();
+  const model = String(slot.model ?? "").trim();
+  if (!provider || !model) {
+    return null;
+  }
+  return { provider, model };
+}
+
+function sanitizeProviderId(raw: unknown): string | null {
+  const value = String(raw ?? "").trim().toLowerCase();
+  if (!value) {
+    return null;
+  }
+  const normalized = value.replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  return normalized || null;
+}
+
+function parseProviderAuthMode(raw: unknown): "api_key" | "oauth" | "token" {
+  const value = String(raw ?? "").trim().toLowerCase();
+  if (value === "oauth" || value === "token") {
+    return value;
+  }
+  return "api_key";
+}
+
+function resolveCatalogRouteModel(
+  providerId: string,
+  slot: "default" | "planning" | "coding"
+): string | undefined {
+  const entry = listProviderCatalog().find((item) => item.id === providerId);
+  if (!entry) {
+    return undefined;
+  }
+  if (slot === "planning") {
+    return entry.planningModel || entry.models[0];
+  }
+  if (slot === "coding") {
+    return entry.codingModel || entry.models[0];
+  }
+  return entry.defaultModel || entry.models[0];
+}
+
+function resolveProviderRouteModel(
+  providerId: string,
+  profile: { models?: string[] } | undefined,
+  slot: "default" | "planning" | "coding"
+): string | undefined {
+  const catalogModel = resolveCatalogRouteModel(providerId, slot);
+  const rawModels = profile?.models;
+  const providerModels = Array.isArray(rawModels)
+    ? rawModels.map((item) => String(item).trim()).filter(Boolean)
+    : [];
+  if (catalogModel && providerModels.includes(catalogModel)) {
+    return catalogModel;
+  }
+  if (catalogModel) {
+    return catalogModel;
+  }
+  if (providerModels.length > 0) {
+    return providerModels[0];
+  }
+  return undefined;
+}
+
+function parseTelegramDmPolicy(raw: unknown): "pairing" | "allowlist" | "open" | "disabled" {
+  const value = String(raw ?? "").trim().toLowerCase();
+  if (value === "allowlist" || value === "open" || value === "disabled") {
+    return value;
+  }
+  return "pairing";
+}
+
+function parseCredentialAuthMode(raw: unknown): CredentialAuthMode {
+  const value = String(raw ?? "").trim().toLowerCase();
+  if (
+    value === "mfa" ||
+    value === "passwordless" ||
+    value === "passwordless_mfa_code" ||
+    value === "mfa-code"
+  ) {
+    return "passwordless_mfa_code";
+  }
+  return "password";
+}
+
+function parseStringArray(raw: unknown): string[] {
+  if (typeof raw === "string") {
+    return raw
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+  }
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw
+    .map((entry) => String(entry ?? "").trim())
+    .filter(Boolean);
+}
+
+function parseIntegerArray(raw: unknown): number[] {
+  if (typeof raw === "string") {
+    return raw
+      .split(",")
+      .map((entry) => Number(entry.trim()))
+      .filter((value) => Number.isInteger(value));
+  }
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw
+    .map((entry) => Number(entry))
+    .filter((value) => Number.isInteger(value));
+}
+
+function uniq(values: string[]): string[] {
+  return [...new Set(values)];
+}
+
+function hasProviderCredential(profile: unknown): boolean {
+  if (!profile || typeof profile !== "object") {
+    return false;
+  }
+  const obj = profile as Record<string, unknown>;
+  return (
+    String(obj.apiKey ?? "").trim().length > 0 ||
+    String(obj.oauthToken ?? "").trim().length > 0 ||
+    String(obj.token ?? "").trim().length > 0
+  );
+}
+
+function redactIdentifier(identifier: string): string {
+  const trimmed = identifier.trim();
+  if (!trimmed) {
+    return "(empty)";
+  }
+  const at = trimmed.indexOf("@");
+  if (at > 1) {
+    return `${trimmed.slice(0, 1)}***${trimmed.slice(at)}`;
+  }
+  if (trimmed.length <= 3) {
+    return `${trimmed[0] ?? "*"}**`;
+  }
+  return `${trimmed.slice(0, 2)}***${trimmed.slice(-1)}`;
+}
+
+async function buildSetupPayload(config: T560Config): Promise<Record<string, unknown>> {
+  const routing = {
+    default: resolveRoutingTarget(config, "default") ?? null,
+    planning: resolveRoutingTarget(config, "planning") ?? null,
+    coding: resolveRoutingTarget(config, "coding") ?? null,
+  };
+  const providers = Object.fromEntries(
+    Object.entries(config.providers ?? {}).map(([providerId, profile]) => [
+      providerId,
+      {
+        enabled: profile.enabled !== false,
+        provider: profile.provider ?? providerId,
+        authMode: profile.authMode ?? "api_key",
+        models: Array.isArray(profile.models) ? profile.models : [],
+        baseUrl: profile.baseUrl ?? "",
+        api: profile.api ?? "",
+        hasCredential: hasProviderCredential(profile),
+      },
+    ]),
+  );
+  const telegram = config.channels?.telegram;
+  const vaultServices = await listConfiguredServices(process.cwd());
+  return {
+    catalog: listProviderCatalog(),
+    providers,
+    routing,
+    telegram: {
+      dmPolicy: telegram?.dmPolicy ?? "pairing",
+      allowFrom: Array.isArray(telegram?.allowFrom) ? telegram?.allowFrom : [],
+      allowedChatIds: Array.isArray(telegram?.allowedChatIds) ? telegram?.allowedChatIds : [],
+      hasBotToken: Boolean(String(telegram?.botToken ?? "").trim()),
+    },
+    vault: {
+      services: vaultServices,
+    },
+  };
+}
+
+async function handleGetSetup(res: ServerResponse): Promise<void> {
+  const config = await readConfig();
+  sendJson(res, 200, await buildSetupPayload(config));
+}
+
+async function handlePutSetupProvider(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const raw = await readBody(req);
+  let body: unknown = null;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    sendJson(res, 400, { error: "invalid_json", message: "Request body must be valid JSON." });
+    return;
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    sendJson(res, 400, { error: "invalid_body", message: "Body must be an object." });
+    return;
+  }
+  const obj = body as Record<string, unknown>;
+  const providerId = sanitizeProviderId(obj.providerId);
+  if (!providerId) {
+    sendJson(res, 400, { error: "invalid_provider", message: "providerId is required." });
+    return;
+  }
+
+  const config = await readConfig();
+  const providers = { ...(config.providers ?? {}) };
+  const existing = providers[providerId];
+  const authMode = parseProviderAuthMode(obj.authMode ?? existing?.authMode ?? "api_key");
+  const credential = typeof obj.credential === "string" ? obj.credential.trim() : "";
+  const clearCredential = obj.clearCredential === true;
+  const models = uniq(parseStringArray(obj.models));
+  const next = {
+    enabled: typeof obj.enabled === "boolean" ? obj.enabled : existing?.enabled ?? true,
+    provider: providerId,
+    authMode,
+    apiKey: existing?.apiKey,
+    oauthToken: existing?.oauthToken,
+    token: existing?.token,
+    baseUrl:
+      obj.baseUrl === undefined
+        ? existing?.baseUrl
+        : String(obj.baseUrl ?? "").trim() || undefined,
+    api:
+      obj.api === undefined
+        ? existing?.api
+        : String(obj.api ?? "").trim() || undefined,
+    models: models.length > 0 ? models : existing?.models ?? [],
+  };
+
+  if (clearCredential) {
+    next.apiKey = undefined;
+    next.oauthToken = undefined;
+    next.token = undefined;
+  } else if (credential) {
+    if (authMode === "oauth") {
+      next.apiKey = undefined;
+      next.token = undefined;
+      next.oauthToken = credential;
+    } else if (authMode === "token") {
+      next.apiKey = undefined;
+      next.oauthToken = undefined;
+      next.token = credential;
+    } else {
+      next.oauthToken = undefined;
+      next.token = undefined;
+      next.apiKey = credential;
+    }
+  }
+
+  providers[providerId] = next;
+  const nextConfig: T560Config = {
+    ...config,
+    providers,
+  };
+  await writeConfig(nextConfig);
+  sendJson(res, 200, {
+    ok: true,
+    providerId,
+    setup: await buildSetupPayload(await readConfig()),
+  });
+}
+
+async function handleDeleteSetupProvider(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const raw = await readBody(req);
+  let body: unknown = null;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    sendJson(res, 400, { error: "invalid_json", message: "Request body must be valid JSON." });
+    return;
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    sendJson(res, 400, { error: "invalid_body", message: "Body must be an object." });
+    return;
+  }
+  const obj = body as Record<string, unknown>;
+  const providerId = sanitizeProviderId(obj.providerId);
+  if (!providerId) {
+    sendJson(res, 400, { error: "invalid_provider", message: "providerId is required." });
+    return;
+  }
+
+  const config = await readConfig();
+  const providers = { ...(config.providers ?? {}) };
+  if (!providers[providerId]) {
+    sendJson(res, 404, { error: "provider_not_found", message: `${providerId} is not configured.` });
+    return;
+  }
+  delete providers[providerId];
+
+  const remainingProviderIds = Object.keys(providers);
+  const fallbackProvider = remainingProviderIds[0] ?? "";
+
+  const currentDefault = resolveRoutingTarget(config, "default");
+  const currentPlanning = resolveRoutingTarget(config, "planning");
+  const currentCoding = resolveRoutingTarget(config, "coding");
+
+  const fallbackRoute = (
+    current: { provider?: string; model?: string } | null | undefined,
+    slot: "default" | "planning" | "coding"
+  ): { provider: string; model: string } | undefined => {
+    const currentProvider = String(current?.provider ?? "").trim();
+    const currentModel = String(current?.model ?? "").trim();
+    if (
+      currentProvider &&
+      currentModel &&
+      currentProvider !== providerId &&
+      providers[currentProvider]
+    ) {
+      return { provider: currentProvider, model: currentModel };
+    }
+    if (!fallbackProvider || !providers[fallbackProvider]) {
+      return undefined;
+    }
+    const model = resolveProviderRouteModel(fallbackProvider, providers[fallbackProvider], slot);
+    if (!model) {
+      return undefined;
+    }
+    return { provider: fallbackProvider, model };
+  };
+
+  const defaultRoute = fallbackRoute(currentDefault, "default");
+  const planningRoute = fallbackRoute(currentPlanning, "planning");
+  const codingRoute = fallbackRoute(currentCoding, "coding");
+
+  const nextRouting: NonNullable<T560Config["routing"]> = {};
+  if (defaultRoute) {
+    nextRouting.default = defaultRoute;
+  }
+  if (planningRoute) {
+    nextRouting.planning = planningRoute;
+  }
+  if (codingRoute) {
+    nextRouting.coding = codingRoute;
+  }
+
+  const nextModels: NonNullable<T560Config["models"]> = {};
+  if (defaultRoute) {
+    nextModels.default = `${defaultRoute.provider}/${defaultRoute.model}`;
+  }
+  if (planningRoute) {
+    nextModels.planning = `${planningRoute.provider}/${planningRoute.model}`;
+  }
+  if (codingRoute) {
+    nextModels.coding = `${codingRoute.provider}/${codingRoute.model}`;
+  }
+
+  const nextConfig: T560Config = {
+    ...config,
+    providers,
+    provider: defaultRoute?.provider,
+    models: Object.keys(nextModels).length > 0 ? nextModels : undefined,
+    routing: Object.keys(nextRouting).length > 0 ? nextRouting : undefined,
+  };
+
+  await writeConfig(nextConfig);
+  sendJson(res, 200, {
+    ok: true,
+    providerId,
+    removed: true,
+    setup: await buildSetupPayload(await readConfig()),
+  });
+}
+
+async function handlePutSetupRouting(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const raw = await readBody(req);
+  let body: unknown = null;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    sendJson(res, 400, { error: "invalid_json", message: "Request body must be valid JSON." });
+    return;
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    sendJson(res, 400, { error: "invalid_body", message: "Body must be an object." });
+    return;
+  }
+  const obj = body as Record<string, unknown>;
+  const defaultRoute = parseRoutingSlot(obj.default);
+  const planningRoute = parseRoutingSlot(obj.planning);
+  const codingRoute = parseRoutingSlot(obj.coding);
+  if (!defaultRoute || !planningRoute || !codingRoute) {
+    sendJson(res, 400, {
+      error: "invalid_routing",
+      message: "default, planning, and coding routes are required.",
+    });
+    return;
+  }
+
+  const config = await readConfig();
+  const nextConfig: T560Config = {
+    ...config,
+    provider: defaultRoute.provider,
+    models: {
+      ...(config.models ?? {}),
+      default: `${defaultRoute.provider}/${defaultRoute.model}`,
+      planning: `${planningRoute.provider}/${planningRoute.model}`,
+      coding: `${codingRoute.provider}/${codingRoute.model}`,
+    },
+    routing: {
+      default: defaultRoute,
+      planning: planningRoute,
+      coding: codingRoute,
+    },
+  };
+  await writeConfig(nextConfig);
+  sendJson(res, 200, {
+    ok: true,
+    setup: await buildSetupPayload(await readConfig()),
+  });
+}
+
+async function handlePutSetupTelegram(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const raw = await readBody(req);
+  let body: unknown = null;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    sendJson(res, 400, { error: "invalid_json", message: "Request body must be valid JSON." });
+    return;
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    sendJson(res, 400, { error: "invalid_body", message: "Body must be an object." });
+    return;
+  }
+  const obj = body as Record<string, unknown>;
+  const config = await readConfig();
+  const current = config.channels?.telegram;
+  const dmPolicy = parseTelegramDmPolicy(obj.dmPolicy ?? current?.dmPolicy ?? "pairing");
+  const allowFrom = uniq(parseStringArray(obj.allowFrom).map((entry) => entry.replace(/^(telegram|tg):/i, "")));
+  const allowedChatIds = uniq(parseIntegerArray(obj.allowedChatIds).map((entry) => String(entry))).map((entry) =>
+    Number(entry),
+  );
+  const tokenFromBody = obj.botToken;
+  const botToken =
+    tokenFromBody === undefined
+      ? current?.botToken
+      : String(tokenFromBody ?? "").trim() || undefined;
+  const telegramConfig = {
+    botToken,
+    dmPolicy,
+    allowFrom: allowFrom.length > 0 ? allowFrom : dmPolicy === "open" ? ["*"] : undefined,
+    allowedChatIds: allowedChatIds.length > 0 ? allowedChatIds : undefined,
+  };
+
+  const nextConfig: T560Config = {
+    ...config,
+    channels: {
+      ...(config.channels ?? {}),
+      telegram: telegramConfig,
+    },
+  };
+  await writeConfig(nextConfig);
+  sendJson(res, 200, {
+    ok: true,
+    setup: await buildSetupPayload(await readConfig()),
+  });
+}
+
+async function buildVaultEntries(workspaceDir: string): Promise<Array<Record<string, unknown>>> {
+  const services = await listConfiguredServices(workspaceDir);
+  const rows: Array<Record<string, unknown>> = [];
+  for (const service of services) {
+    const record = await getCredential({ workspaceDir, service });
+    if (!record) {
+      continue;
+    }
+    rows.push({
+      service: record.service,
+      identifierMasked: redactIdentifier(record.identifier),
+      authMode: record.authMode,
+      hasMfaCode: Boolean(record.mfaCode),
+      createdAt: record.createdAt,
+      updatedAt: record.updatedAt,
+    });
+  }
+  return rows;
+}
+
+async function handleGetVault(res: ServerResponse): Promise<void> {
+  const workspaceDir = process.cwd();
+  const entries = await buildVaultEntries(workspaceDir);
+  sendJson(res, 200, { entries });
+}
+
+async function handlePutVaultCredential(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const raw = await readBody(req);
+  let body: unknown = null;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    sendJson(res, 400, { error: "invalid_json", message: "Request body must be valid JSON." });
+    return;
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    sendJson(res, 400, { error: "invalid_body", message: "Body must be an object." });
+    return;
+  }
+  const obj = body as Record<string, unknown>;
+  const service = normalizeSetupService(String(obj.service ?? ""));
+  if (!service) {
+    sendJson(res, 400, { error: "invalid_service", message: "service is required." });
+    return;
+  }
+  const identifier = String(obj.identifier ?? "").trim();
+  if (!identifier) {
+    sendJson(res, 400, { error: "invalid_identifier", message: "identifier is required." });
+    return;
+  }
+  const authMode = parseCredentialAuthMode(obj.authMode);
+  const secretRaw = String(obj.secret ?? "");
+  const secret = authMode === "password" ? secretRaw : "";
+  if (authMode === "password" && !secret) {
+    sendJson(res, 400, { error: "invalid_secret", message: "secret is required for password mode." });
+    return;
+  }
+  const mfaCode = typeof obj.mfaCode === "string" ? obj.mfaCode.trim() : "";
+  const workspaceDir = process.cwd();
+  const result = await setCredential({
+    workspaceDir,
+    service,
+    identifier,
+    secret,
+    authMode,
+    ...(mfaCode ? { mfaCode } : {}),
+  });
+  sendJson(res, 200, {
+    ok: true,
+    service: result.service,
+    created: result.created,
+    entries: await buildVaultEntries(workspaceDir),
+  });
+}
+
+async function handleDeleteVaultCredential(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const raw = await readBody(req);
+  let body: unknown = null;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    sendJson(res, 400, { error: "invalid_json", message: "Request body must be valid JSON." });
+    return;
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    sendJson(res, 400, { error: "invalid_body", message: "Body must be an object." });
+    return;
+  }
+  const obj = body as Record<string, unknown>;
+  const service = normalizeSetupService(String(obj.service ?? ""));
+  if (!service) {
+    sendJson(res, 400, { error: "invalid_service", message: "service is required." });
+    return;
+  }
+  const workspaceDir = process.cwd();
+  const removed = await deleteCredential({ workspaceDir, service });
+  sendJson(res, 200, {
+    ok: true,
+    removed,
+    service,
+    entries: await buildVaultEntries(workspaceDir),
+  });
+}
+
 async function handlePutConfig(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const raw = await readBody(req);
   let body: unknown;
@@ -456,6 +1100,12 @@ async function handlePutProfile(req: IncomingMessage, res: ServerResponse, type:
   await ensureStateDir();
   const filePath = type === "soul" ? resolveSoulPath() : resolveUsersPath();
   await writeFile(filePath, body.content, "utf-8");
+  if (type === "users") {
+    const legacyUserPath = resolveLegacyUserPath();
+    if (legacyUserPath !== filePath) {
+      await writeFile(legacyUserPath, body.content, "utf-8");
+    }
+  }
 
   if (type === "soul") {
     bustSoulPromptCache();
@@ -865,6 +1515,38 @@ async function routeRequest(
     await handlePutBootstrapFile(req, res);
     return;
   }
+  if (method === "GET" && pathname === "/api/setup") {
+    await handleGetSetup(res);
+    return;
+  }
+  if (method === "PUT" && pathname === "/api/setup/provider") {
+    await handlePutSetupProvider(req, res);
+    return;
+  }
+  if (method === "DELETE" && pathname === "/api/setup/provider") {
+    await handleDeleteSetupProvider(req, res);
+    return;
+  }
+  if (method === "PUT" && pathname === "/api/setup/routing") {
+    await handlePutSetupRouting(req, res);
+    return;
+  }
+  if (method === "PUT" && pathname === "/api/setup/telegram") {
+    await handlePutSetupTelegram(req, res);
+    return;
+  }
+  if (method === "GET" && pathname === "/api/vault") {
+    await handleGetVault(res);
+    return;
+  }
+  if (method === "PUT" && pathname === "/api/vault") {
+    await handlePutVaultCredential(req, res);
+    return;
+  }
+  if (method === "DELETE" && pathname === "/api/vault") {
+    await handleDeleteVaultCredential(req, res);
+    return;
+  }
   if (method === "GET" && pathname === "/health") {
     sendJson(res, 200, { ok: true });
     return;
@@ -885,6 +1567,26 @@ async function routeRequest(
     }
   }
 
+  if (method === "GET" && (pathname === "/" || pathname === "/index.html") && !uiRoot) {
+    res.statusCode = 503;
+    res.setHeader("content-type", "text/html; charset=utf-8");
+    res.end(
+      [
+        "<!doctype html>",
+        "<html><head><meta charset='utf-8'/>",
+        "<meta name='viewport' content='width=device-width,initial-scale=1'/>",
+        "<title>t560 UI unavailable</title></head>",
+        "<body style='font-family:system-ui,sans-serif;padding:24px'>",
+        "<h1>t560 UI unavailable</h1>",
+        "<p>The web UI bundle is not available yet.</p>",
+        "<p>Run: <code>cd ui && npm install && npm run build</code></p>",
+        "<p>Then restart t560.</p>",
+        "</body></html>",
+      ].join(""),
+    );
+    return;
+  }
+
   sendJson(res, 404, { error: "not_found" });
 }
 
@@ -896,7 +1598,8 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
   const preferredPort = parsePort(process.env.T560_WEB_PORT);
   const bindHost = parseBindHost(process.env.T560_WEB_HOST);
 
-  const uiRoot = resolveUiRoot();
+  const uiResult = ensureControlUiBuilt();
+  const uiRoot = uiResult.uiRoot;
 
   const server = createServer((req, res) => {
     routeRequest(req, res, opts, uiRoot).catch((error: unknown) => {
@@ -969,9 +1672,11 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
   const url = localUrl;
 
   if (uiRoot) {
-    // SPA mode
+    if (uiResult.autoBuilt) {
+      console.warn(`[dashboard] UI ready at ${uiRoot}`);
+    }
   } else {
-    console.warn("[dashboard] UI not built — run: cd ui && npm install && npx vite build");
+    console.warn("[dashboard] UI unavailable. Run: cd ui && npm install && npm run build");
   }
 
   return {

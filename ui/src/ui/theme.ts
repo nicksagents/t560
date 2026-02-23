@@ -45,7 +45,7 @@ export function applyTheme(theme: ThemeValue, event?: MouseEvent): void {
   }
 }
 
-/** Get the theme index for the sliding indicator (0=dark, 1=light, 2=system) */
+/** Get the theme index for the sliding indicator (0=dark, 1=light). */
 export function themeIndex(theme: ThemeValue): number {
   switch (theme) {
     case "dark":
@@ -53,6 +53,6 @@ export function themeIndex(theme: ThemeValue): number {
     case "light":
       return 1;
     case "system":
-      return 2;
+      return window.matchMedia("(prefers-color-scheme: light)").matches ? 1 : 0;
   }
 }

@@ -8,6 +8,17 @@ function asRecord(value: unknown): Record<string, unknown> {
   return {};
 }
 
+function formatTime(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) {
+    return "—";
+  }
+  try {
+    return new Date(value).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  } catch {
+    return "—";
+  }
+}
+
 /** Render the status view */
 export function renderStatusView(host: T560App): string {
   const status = asRecord(host.serverStatus);
@@ -94,6 +105,54 @@ export function renderStatusView(host: T560App): string {
       </div>`
     : "";
 
+  const gatewayInfoHtml = `<div class="card" style="margin-top:16px">
+    <div class="card-title">Gateway Diagnostics</div>
+    <div class="card-sub">OpenClaw-style quick controls for connection, history, and debug actions.</div>
+    <div class="status-list" style="margin-top:12px">
+      <div><span class="muted">WebSocket URL</span><span class="mono">${escapeHtml(host.gatewayWsUrl || "(not connected)")}</span></div>
+      <div><span class="muted">Connection</span><span class="mono">${host.connected ? "connected" : "disconnected"}</span></div>
+      <div><span class="muted">Session</span><span class="mono">${escapeHtml(host.sessionKey || "default")}</span></div>
+      <div><span class="muted">Last error</span><span class="mono">${escapeHtml(host.lastError || "(none)")}</span></div>
+    </div>
+    <div class="settings-actions" style="margin-top:12px">
+      <button class="btn" data-action="reconnect-gateway">Reconnect</button>
+      <button class="btn" data-action="refresh-chat-history">Refresh History</button>
+      <button class="btn" data-action="clear-event-log">Clear Event Log</button>
+    </div>
+  </div>`;
+
+  const injectHtml = `<div class="card" style="margin-top:16px">
+    <div class="card-title">Manual Assistant Inject</div>
+    <div class="card-sub">Append an assistant note to current session using <span class="mono">chat.inject</span> (no model call).</div>
+    <label class="field full" style="margin-top:12px">
+      <span>Inject note</span>
+      <textarea class="settings-editor" style="min-height:110px" data-input="chat-inject-draft" placeholder="Type note to inject into this session">${escapeHtml(host.chatInjectDraft)}</textarea>
+    </label>
+    <div class="settings-actions" style="margin-top:10px">
+      <button class="btn primary" data-action="inject-assistant-note">Inject Assistant Note</button>
+    </div>
+  </div>`;
+
+  const eventLogRows = host.gatewayEventLog
+    .slice(0, 80)
+    .map((entry) => {
+      const cls = entry.level === "error" ? "danger" : entry.level === "warn" ? "warn" : "info";
+      return `<div class="status-log-row ${cls}">
+        <span class="mono">${formatTime(entry.time)}</span>
+        <span class="mono">${escapeHtml(entry.level)}</span>
+        <span>${escapeHtml(entry.text)}</span>
+      </div>`;
+    })
+    .join("");
+
+  const eventLogHtml = `<div class="card" style="margin-top:16px">
+    <div class="card-title">Live Event Stream</div>
+    <div class="card-sub">Recent gateway and agent events (in-memory).</div>
+    <div class="status-log-list" style="margin-top:12px">
+      ${eventLogRows || `<div class="muted">No events yet.</div>`}
+    </div>
+  </div>`;
+
   return `<div class="content">
     <div class="content-header">
       <div>
@@ -106,6 +165,9 @@ export function renderStatusView(host: T560App): string {
     </div>
     ${onboardingHtml}
     ${usageHtml}
+    ${gatewayInfoHtml}
+    ${injectHtml}
+    ${eventLogHtml}
     ${configHtml}
   </div>`;
 }

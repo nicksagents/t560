@@ -5,7 +5,7 @@
 `t560` is a multi-channel agent runtime built around one shared message pipeline.
 
 It accepts messages from:
-- terminal (`t560 start` legacy readline, and `t560 tui` full-screen TUI)
+- terminal (`t560` default command starts full-screen TUI)
 - web chat (dashboard/websocket)
 - Telegram (long-polling bot)
 
@@ -29,14 +29,11 @@ This is the **main path actually used** when running `t560` today.
 
 2. CLI command routing
 - `src/cli/run.ts`
-  - handles command parsing (`tui`, `start`, `gateway`, `onboard`, etc.)
+  - handles command parsing (`tui`, `onboard`, etc.)
   - onboarding gate + preflight gate
 
 3. Runtime startup
-- `src/agent/runtime.ts` (for `start/gateway`)
-  - starts gateway runtime
-  - optional terminal prompt loop
-- `src/tui/tui.ts` (for `tui`)
+- `src/tui/tui.ts`
   - full-screen UI + same gateway runtime behind it
 
 4. Gateway runtime
@@ -65,7 +62,7 @@ This is the **main path actually used** when running `t560` today.
 
 7. Tool execution
 - `src/agents/pi-tools.ts` creates tool list
-- `src/agents/t560-tools.ts` adds browser/web tools
+- `src/agents/t560-tools.ts` adds browser/web/memory tools
 - `src/agents/tools/*.ts` implement actual tools
 - `src/agents/pi-tool-definition-adapter.ts` normalizes calls + executes tool + serializes result
 
@@ -76,11 +73,10 @@ This is the **main path actually used** when running `t560` today.
 
 ---
 
-## 3) What Is Core vs Legacy
+## 3) What Is Core
 
 ### Core (you will edit these most)
 - `src/cli/run.ts`
-- `src/agent/runtime.ts`
 - `src/tui/tui.ts`
 - `src/gateway/runtime.ts`
 - `src/web/dashboard.ts`
@@ -92,11 +88,6 @@ This is the **main path actually used** when running `t560` today.
 - `src/security/*`
 - `ui/src/ui/*`
 
-### Legacy/OpenClaw carryover (not primary t560 runtime path)
-There are additional files/folders from OpenClaw-era structure (some `// @ts-nocheck`). They compile, but are not the main execution path for the current `t560` command flow.
-
-Use caution before spending time editing those unless you know a specific codepath references them.
-
 ---
 
 ## 4) Project Map (By Responsibility)
@@ -104,7 +95,6 @@ Use caution before spending time editing those unless you know a specific codepa
 ## Runtime + Entry
 - `src/bin/t560.ts` - CLI binary entry.
 - `src/cli/run.ts` - command dispatch, onboarding/preflight checks.
-- `src/agent/runtime.ts` - legacy/start mode runtime loop.
 - `src/tui/tui.ts` - full-screen TUI runtime.
 
 ## Gateway + Transport
@@ -128,9 +118,10 @@ Use caution before spending time editing those unless you know a specific codepa
 
 ## Tools Layer
 - `src/agents/pi-tools.ts` - master tool assembly pipeline.
-- `src/agents/t560-tools.ts` - t560-specific tool registration (`browser`, `web_search`, `web_fetch`).
+- `src/agents/t560-tools.ts` - t560-specific tool registration (`browser`, `web_search`, `web_fetch`, `memory_search`, `memory_get`, `memory_save`).
 - `src/agents/tools/browser-tool.ts` - stateful browser automation.
 - `src/agents/tools/web-tools.ts` - web search + web fetch tools.
+- `src/agents/tools/memory-tools.ts` - persistent memory search/get/save engine.
 - `src/agents/tools/fs-tools.ts` - file tools (`read/write/edit/ls/find/exists`) with safety gates.
 - `src/agents/bash-tools.exec.ts` - shell execution tool.
 - `src/agents/bash-tools.process.ts` - background process management tool.
@@ -154,9 +145,15 @@ Use caution before spending time editing those unless you know a specific codepa
 
 ## UI (Web)
 - `ui/src/ui/app.ts` - root web app component.
+- `ui/src/ui/app-render.ts` - shell layout (topbar/sidebar/content) and page routing.
 - `ui/src/ui/app-gateway.ts` - websocket integration + live progress rendering.
+- `ui/src/ui/app-setup.ts` - setup wizard data actions + API writes.
 - `ui/src/ui/views/chat.ts` - chat page layout.
+- `ui/src/ui/views/setup.ts` - setup wizard UI.
+- `ui/src/ui/views/status.ts` - diagnostics/status UI.
+- `ui/src/ui/views/settings.ts` - advanced editors UI.
 - `ui/src/ui/chat/grouped-render.ts` - chat bubble rendering.
+- Dashboard serves this single UI bundle from `dist/control-ui` (auto-built at runtime when missing).
 
 ## Tests
 - `test/*.test.js` - browser/web tool, setup-flow, session, event-streaming, checkout workflow tests.
@@ -212,7 +209,7 @@ If you want to change “agent reliability” behavior, this is usually where.
 - `exec`
 - `process`
 - filesystem tools
-- t560 tools (`browser`, `web_search`, `web_fetch`)
+- t560 tools (`browser`, `web_search`, `web_fetch`, `memory_search`, `memory_get`, `memory_save`)
 
 Then policy filtering applies:
 1. profile policy
@@ -260,7 +257,41 @@ Provider-level settings (in config) live under:
 - `tools.web.search.*`
 - `tools.web.fetch.*`
 
-## 5.6 Secure Credentials + Setup Flow
+## 5.6 Memory Engine
+
+`src/agents/tools/memory-tools.ts` implements long-term memory in the active runtime path.
+
+Tools:
+- `memory_search`
+  - searches two sources:
+    - durable store: `~/.t560/memory.jsonl`
+    - workspace memory docs: `MEMORY.md`, `memory.md`, `memory/*.md`
+  - returns scored refs in a stable format:
+    - `store:<id>`
+    - `file:<relative-path>#L<line>`
+- `memory_get`
+  - fetches exact memory content by `ref`, `id`, or `path`
+  - supports focused line/context retrieval for file-backed memory
+- `memory_save`
+  - writes durable non-secret memory entries to JSONL store
+  - blocks likely secret material (tokens/password-like data/private keys)
+
+Where memory is wired:
+- tool registration: `src/agents/t560-tools.ts`
+- policy/profile availability: `src/agents/tool-policy.ts`
+- prompt recall instructions: `src/agents/system-prompt.ts`
+- live progress narration for memory actions: `src/provider/run.ts`
+
+How to edit memory behavior:
+- ranking/scoring: `computeScore`, `searchStoreEntries`, `searchMemoryFiles` in `src/agents/tools/memory-tools.ts`
+- ref format / retrieval semantics: `parseFileRef`, `createMemoryGetTool` in `src/agents/tools/memory-tools.ts`
+- secret-blocking heuristics: `containsLikelySecret` in `src/agents/tools/memory-tools.ts`
+- prompt strategy for when the model should recall/save memory: `src/agents/system-prompt.ts`
+
+Memory tests:
+- `test/memory_tools.test.js`
+
+## 5.7 Secure Credentials + Setup Flow
 
 `src/security/credentials-vault.ts`:
 - credential blob is encrypted in workspace `.t560-secure/credentials.v1.enc`
@@ -280,7 +311,7 @@ Security guardrails:
 - fs tools block sensitive path access (`isSensitivePath`)
 - exec tool blocks direct access to sensitive credential paths
 
-## 5.7 Session Storage + Repair
+## 5.8 Session Storage + Repair
 
 `src/provider/session.ts`:
 - persists session messages under `~/.t560/sessions/<session>.json`
@@ -291,7 +322,7 @@ Security guardrails:
 
 This is critical for long-lived reliability.
 
-## 5.8 Progress Updates Across Channels
+## 5.9 Progress Updates Across Channels
 
 Progress event source:
 - `src/provider/run.ts` emits `assistant` stream progress lines.
@@ -300,7 +331,6 @@ Transport:
 - `src/agents/agent-events.ts` event bus.
 
 Consumers:
-- terminal runtime: `src/agent/runtime.ts`
 - TUI: `src/tui/tui.ts`
 - Telegram batched updates: `src/channels/telegram.ts`
 - webchat “Working update” block: `ui/src/ui/app-gateway.ts`
@@ -309,6 +339,129 @@ If updates disappear or become generic, inspect:
 - prompt instructions in `src/agents/system-prompt.ts`
 - progress gating/filtering in `src/provider/run.ts`
 - channel relay throttling in Telegram/UI files
+
+## 5.10 Web App Layout + Runtime Flow (Current)
+
+The web app is a single SPA shell with four pages:
+- `Chat` (`/chat`)
+- `Setup` (`/setup`)
+- `Status` (`/status`, `/overview` alias maps here)
+- `Settings` (`/settings`)
+
+Routing and shell:
+- path-to-tab mapping: `ui/src/ui/navigation.ts`
+- shell/topbar/sidebar/content render: `ui/src/ui/app-render.ts`
+- app state + event delegation: `ui/src/ui/app.ts`
+
+Startup flow in browser:
+1. `ui/src/ui/app.ts` (`connectedCallback`) loads local UI settings and persisted chat state.
+2. It calls `connectGateway()` from `ui/src/ui/app-gateway.ts`.
+3. On WebSocket `hello`, the app marks connected, stores snapshot status/session, then calls `chat.history`.
+4. Incoming gateway events update chat, status, and the live progress block in-place.
+
+Gateway/WebSocket protocol touchpoints:
+- WebSocket endpoint: `/ws` in `src/web/dashboard.ts`
+- RPC methods used by web app:
+  - `chat.send`
+  - `chat.abort`
+  - `chat.history`
+  - `chat.inject`
+- streamed events consumed by UI:
+  - `chat`
+  - `chat.sending`
+  - `chat.done`
+  - `chat.error`
+  - `agent.event`
+  - `status`
+
+Live activity behavior:
+- UI only renders assistant progress lines (`event.stream === "assistant"`) as a rolling “Working update” block.
+- Implementation: `summarizeAgentEvent()` + `pushLiveProgress()` in `ui/src/ui/app-gateway.ts`.
+- Detailed diagnostic logs are still available in Status page event log.
+
+## 5.11 Web Pages (What Each Page Does)
+
+### Chat page (`ui/src/ui/views/chat.ts`)
+- Displays grouped conversation bubbles using `ui/src/ui/chat/grouped-render.ts`.
+- Has a small corner “new chat” button (`new-chat-session`) to reset session key + local thread.
+- Supports queued messages, image paste attachments, and Stop/Submit actions.
+- Input behavior (enter-to-send, shift+enter newline, autosize, draft persistence) is wired in `ui/src/ui/app.ts`.
+
+### Setup page (`ui/src/ui/views/setup.ts`)
+This is the main onboarding/config surface for most users.
+
+Sections:
+- `Provider`
+  - “Quick Setup” guidance
+  - drag-and-drop model routing board for `default/planning/coding`
+  - provider add/edit flow: choose provider template -> click “Use Provider” -> choose model/auth -> save
+  - configured provider cards with quick route assignment and delete
+- `Routing`
+  - direct manual provider/model fields for all three route slots
+- `Telegram`
+  - bot token, DM policy, allowlists
+- `Vault`
+  - secure site credential management (`/api/vault`)
+- `Files`
+  - edit `soul.md`, `users.md`, `config.json`, and bootstrap prompt files
+
+Setup actions/data layer:
+- all setup network actions and normalization live in `ui/src/ui/app-setup.ts`
+- backend endpoints:
+  - `GET /api/setup`
+  - `PUT /api/setup/provider`
+  - `DELETE /api/setup/provider`
+  - `PUT /api/setup/routing`
+  - `PUT /api/setup/telegram`
+  - `GET|PUT|DELETE /api/vault`
+
+### Status page (`ui/src/ui/views/status.ts`)
+- Runtime cards (connection/mode/provider/model)
+- Onboarding/missing state visibility
+- usage estimate panel from `/api/status`
+- gateway diagnostics and manual actions:
+  - reconnect websocket
+  - refresh chat history
+  - clear event log
+  - inject assistant note into session (`chat.inject`)
+- live event stream viewer (in-memory UI log)
+
+### Settings page (`ui/src/ui/views/settings.ts`)
+- Advanced direct editing surface.
+- Profile files editor (`soul.md`, `user.md/users.md`)
+- Raw `config.json` editor (with format + save)
+- Bootstrap file editor (for prompt-injected workspace files)
+
+## 5.12 Web UI Editing Map (If You Want To Modify Layout/UX)
+
+Core files:
+- app state + event handlers: `ui/src/ui/app.ts`
+- shell layout + tab rendering: `ui/src/ui/app-render.ts`
+- page components:
+  - `ui/src/ui/views/chat.ts`
+  - `ui/src/ui/views/setup.ts`
+  - `ui/src/ui/views/status.ts`
+  - `ui/src/ui/views/settings.ts`
+- setup actions/API: `ui/src/ui/app-setup.ts`
+- gateway/ws client behavior: `ui/src/ui/app-gateway.ts`
+- nav paths/tabs: `ui/src/ui/navigation.ts`
+
+Styling files:
+- global/base theme + variables: `ui/src/styles/base.css`
+- shell/layout desktop: `ui/src/styles/layout.css`
+- shell/layout mobile: `ui/src/styles/layout.mobile.css`
+- shared components/forms/cards: `ui/src/styles/components.css`
+- chat spacing/text/grouping:
+  - `ui/src/styles/chat/layout.css`
+  - `ui/src/styles/chat/grouped.css`
+  - `ui/src/styles/chat/text.css`
+
+Practical edit recipes:
+- Change page structure/content: edit the relevant file in `ui/src/ui/views/*`.
+- Add a new button/action: add markup `data-action=...` in a view, then handle it in `ui/src/ui/app.ts`.
+- Add a new setup API action: implement in `ui/src/ui/app-setup.ts`, then add backend route handler in `src/web/dashboard.ts`.
+- Change live progress rendering logic: `ui/src/ui/app-gateway.ts`.
+- Change topbar/sidebar/nav behavior: `ui/src/ui/app-render.ts` + `ui/src/ui/navigation.ts`.
 
 ---
 
@@ -327,8 +480,20 @@ Key sections:
 ## 6.2 Runtime/session data
 - `~/.t560/sessions/*.json`
 - `~/.t560/pairing.json`
+- `~/.t560/memory.jsonl`
 - `~/.t560/soul.md`
 - `~/.t560/users.md` and `~/.t560/user.md`
+- workspace memory docs: `<workspace>/MEMORY.md` and `<workspace>/memory/*.md`
+
+Memory privacy + git behavior:
+- default durable memory store is outside this repo at `~/.t560/memory.jsonl`.
+- if you override state directory into workspace, memory artifacts should remain untracked.
+- repo gitignore includes:
+  - `.t560/`
+  - `memory.jsonl`
+  - `MEMORY.md`
+  - `memory.md`
+  - `memory/`
 
 ## 6.3 Secure credential storage
 - workspace: `<repo>/.t560-secure/credentials.v1.enc`
@@ -512,10 +677,7 @@ cd ui && npx vite build
 ## Run
 
 ```bash
-t560 tui
-# or
-
-t560 start
+t560
 ```
 
 ## Quick smoke checks
@@ -545,7 +707,6 @@ node --import tsx --test test/tool_event_streaming.test.js
 ## Risks / Maintenance Hotspots
 - `src/provider/run.ts` is very large and central; regressions there affect all channels.
 - `src/agents/tools/browser-tool.ts` is large and complex (high leverage, high risk).
-- Mixed modern t560 and legacy OpenClaw modules in repo can confuse edits.
 - Session trimming can still hide long-context interactions if too many turns accumulate quickly.
 
 ## Suggested refactor directions (future)
@@ -578,7 +739,7 @@ node --import tsx --test test/tool_event_streaming.test.js
 
 ## 13) Quick Ownership Matrix
 
-- Runtime startup issues: `src/cli/run.ts`, `src/agent/runtime.ts`, `src/tui/tui.ts`
+- Runtime startup issues: `src/cli/run.ts`, `src/tui/tui.ts`
 - Message routing issues: `src/agent/chat-service.ts`
 - Tool invocation issues: `src/provider/run.ts`, `src/agents/pi-tool-definition-adapter.ts`
 - Browser auth/web automation issues: `src/agents/tools/browser-tool.ts`

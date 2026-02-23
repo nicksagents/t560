@@ -46,6 +46,10 @@ export function buildAgentSystemPrompt(params: {
       web_search:
         "Search the web for up-to-date info (Brave when configured, DuckDuckGo fallback) and optionally fetch top results for grounded excerpts.",
       web_fetch: "Fetch a URL and return a readable text snapshot.",
+      memory_search:
+        "Search saved memory entries and workspace memory docs (MEMORY.md/memory/*.md) for prior decisions, preferences, and context.",
+      memory_get: "Fetch exact memory content by ref/id/path for precise recall.",
+      memory_save: "Persist durable non-secret memory (preferences, recurring workflows, decisions).",
     };
     const toolOrder = [
       "read",
@@ -57,6 +61,9 @@ export function buildAgentSystemPrompt(params: {
       "browser",
       "web_search",
       "web_fetch",
+      "memory_search",
+      "memory_get",
+      "memory_save",
       "exec",
       "process",
     ];
@@ -146,6 +153,29 @@ export function buildAgentSystemPrompt(params: {
         );
       }
       lines.push("");
+    }
+
+    const hasMemorySearch = availableTools.has("memory_search");
+    const hasMemoryGet = availableTools.has("memory_get");
+    const hasMemorySave = availableTools.has("memory_save");
+    if (hasMemorySearch || hasMemoryGet || hasMemorySave) {
+      lines.push("## Memory Recall");
+      if (hasMemorySearch && hasMemoryGet) {
+        lines.push(
+          "Before answering anything about prior work, decisions, dates, people, preferences, or todos: run memory_search first, then use memory_get for exact snippets you need to cite.",
+        );
+      } else if (hasMemorySearch) {
+        lines.push(
+          "Before answering about prior work, preferences, or decisions, run memory_search and ground your response in returned memory snippets.",
+        );
+      }
+      if (hasMemorySave) {
+        lines.push(
+          "When the user shares durable preferences, recurring workflows, or stable account context, save concise notes with memory_save.",
+          "Never store secrets (passwords, one-time codes, private keys, tokens, recovery phrases).",
+        );
+      }
+      lines.push("If memory search is low confidence, say you checked memory and what remained uncertain.", "");
     }
   }
 

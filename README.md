@@ -39,7 +39,7 @@ chmod +x install.sh
 1. `npm install`
 2. `npm run build`
 3. `npm link` (global `t560` command)
-4. starts `t560 gateway`
+4. starts `t560 tui`
 
 If shell still sees old path:
 
@@ -51,8 +51,7 @@ which -a t560
 ## Core commands
 
 ```bash
-t560 start
-t560 gateway      # alias of start
+t560
 t560 onboard      # interactive onboarding wizard
 t560 pairing list
 t560 pairing approve telegram <code>
@@ -64,7 +63,7 @@ t560 help
 Start runtime:
 
 ```bash
-t560 start
+t560
 ```
 
 If required setup is missing, `t560` will show what is missing and prompt to start onboarding immediately.
@@ -74,13 +73,17 @@ If Telegram is configured, startup also validates the bot token (`getMe` check) 
 
 What starts:
 
-1. Banner + runtime loop
+1. Banner + full-screen TUI
 2. Dashboard on all interfaces (default bind `0.0.0.0:5600`)
 3. Dashboard access URLs printed for:
    1. local (`http://127.0.0.1:<port>`)
    2. tailscale (`http://<tailscale-ip>:<port>`)
-4. Terminal live chat prompt (`t560>`) when running in TTY
+4. In-terminal chat UI plus live progress updates
 5. Telegram bridge if bot token exists
+
+Web UI behavior:
+- `t560` serves a single webchat UI from `dist/control-ui`.
+- If `dist/control-ui` is missing, startup auto-builds the UI from `ui/` and then serves it.
 
 Webchat + Telegram + terminal all use the same gateway message handler.
 Heartbeat-style messages (`heartbeat`, `ping`, `healthcheck`) are ignored to keep chat clean.
@@ -150,9 +153,9 @@ curl -X POST http://127.0.0.1:5600/api/chat \
 ## Environment variables
 
 ```bash
-T560_WEB_PORT=5610 t560 start
-T560_WEB_HOST=0.0.0.0 t560 start
-T560_TELEGRAM_BOT_TOKEN="<token>" t560 start
+T560_WEB_PORT=5610 t560
+T560_WEB_HOST=0.0.0.0 t560
+T560_TELEGRAM_BOT_TOKEN="<token>" t560
 ```
 
 `T560_TELEGRAM_BOT_TOKEN` overrides config token.

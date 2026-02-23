@@ -4,12 +4,12 @@
 
 .chat-thinking {
   margin-bottom: 10px;
-  padding: 10px 12px;
-  border-radius: 10px;
+  padding: 8px 9px;
+  border-radius: 7px;
   border: 1px dashed rgba(255, 255, 255, 0.18);
   background: rgba(255, 255, 255, 0.04);
   color: var(--muted);
-  font-size: 12px;
+  font-size: 11px;
   line-height: 1.4;
 }
 
@@ -19,8 +19,8 @@
 }
 
 .chat-text {
-  font-size: 14px;
-  line-height: 1.5;
+  font-size: 13px;
+  line-height: 1.45;
   word-wrap: break-word;
   overflow-wrap: break-word;
 }

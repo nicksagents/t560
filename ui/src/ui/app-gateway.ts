@@ -11,6 +11,22 @@ type LiveProgressState = {
 
 const progressByHost = new WeakMap<T560App, LiveProgressState>();
 
+function appendGatewayEvent(host: T560App, level: "info" | "warn" | "error", text: string): void {
+  const message = text.trim();
+  if (!message) {
+    return;
+  }
+  host.gatewayEventLog = [
+    {
+      id: uuid(),
+      level,
+      text: message,
+      time: Date.now(),
+    },
+    ...host.gatewayEventLog,
+  ].slice(0, 240);
+}
+
 function getLiveProgressState(host: T560App): LiveProgressState {
   const existing = progressByHost.get(host);
   if (existing) {
@@ -116,12 +132,103 @@ function pushLiveProgress(host: T560App, line: string): void {
   progressByHost.set(host, state);
 }
 
+function mapHistoryPayloadMessages(historyPayload: any): Array<{
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  thinking: null;
+  toolCalls: string[];
+  timestamp: number;
+  provider: null;
+  model: null;
+}> {
+  const messages = Array.isArray(historyPayload?.messages) ? historyPayload.messages : [];
+  return messages.map((item: any) => ({
+    id: String(item?.id ?? uuid()),
+    role: item?.role === "user" ? "user" : "assistant",
+    content: String(item?.message ?? ""),
+    thinking: null,
+    toolCalls: [],
+    timestamp: typeof item?.timestamp === "number" ? item.timestamp : Date.now(),
+    provider: null,
+    model: null,
+  }));
+}
+
+export async function reloadChatHistory(host: T560App, limit = 120): Promise<void> {
+  const previousCount = host.chatMessages.length;
+  host.chatHistoryReloading = true;
+  host.chatHistoryStatus = "Reloading history…";
+  host.chatHistoryStatusKind = "info";
+  if (!host.gateway?.connected) {
+    appendGatewayEvent(host, "warn", "Cannot refresh history while disconnected.");
+    host.chatHistoryReloading = false;
+    host.chatHistoryStatus = "Disconnected. Reconnect gateway first.";
+    host.chatHistoryStatusKind = "warn";
+    return;
+  }
+  try {
+    const historyPayload = await host.gateway.request("chat.history", {
+      sessionKey: host.sessionKey || undefined,
+      limit,
+    });
+    if (historyPayload?.sessionKey) {
+      host.sessionKey = String(historyPayload.sessionKey);
+    }
+    const mapped = mapHistoryPayloadMessages(historyPayload);
+    if (mapped.length > 0 || host.chatMessages.length === 0) {
+      host.chatMessages = mapped;
+    }
+    host.chatLastSyncedAt = Date.now();
+    if (mapped.length === 0 && previousCount > 0) {
+      host.chatHistoryStatus = "No stored history found for this session; current chat kept.";
+      host.chatHistoryStatusKind = "warn";
+    } else {
+      host.chatHistoryStatus = `Loaded ${mapped.length} messages from gateway.`;
+      host.chatHistoryStatusKind = "success";
+    }
+    appendGatewayEvent(host, "info", `Loaded ${mapped.length} messages from chat.history.`);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    host.chatHistoryStatus = "History reload not supported by this gateway.";
+    host.chatHistoryStatusKind = "warn";
+    appendGatewayEvent(host, "warn", `chat.history unavailable on this gateway (${reason}).`);
+  } finally {
+    host.chatHistoryReloading = false;
+  }
+}
+
+export async function injectAssistantNote(host: T560App, message: string): Promise<void> {
+  const trimmed = message.trim();
+  if (!trimmed) {
+    appendGatewayEvent(host, "warn", "Inject note skipped because message is empty.");
+    return;
+  }
+  if (!host.gateway?.connected) {
+    appendGatewayEvent(host, "warn", "Cannot inject note while disconnected.");
+    return;
+  }
+
+  try {
+    await host.gateway.request("chat.inject", {
+      sessionKey: host.sessionKey || undefined,
+      message: trimmed,
+    });
+    appendGatewayEvent(host, "info", "Injected assistant note into the session.");
+  } catch (error) {
+    const text = error instanceof Error ? error.message : String(error);
+    appendGatewayEvent(host, "error", `chat.inject failed: ${text}`);
+  }
+}
+
 /** Connect the gateway WebSocket and wire events to the app */
 export function connectGateway(host: T560App): void {
   // Determine WebSocket URL from current location
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   const wsUrl = host.settings.gatewayUrl || `${proto}//${location.host}/ws`;
   console.log(`[gateway] Connecting to: ${wsUrl}`);
+  host.gatewayWsUrl = wsUrl;
+  appendGatewayEvent(host, "info", `Connecting to ${wsUrl}`);
 
   if (host.gateway) {
     host.gateway.close();
@@ -133,6 +240,7 @@ export function connectGateway(host: T560App): void {
     onHello(payload: any) {
       host.connected = true;
       host.lastError = "";
+      appendGatewayEvent(host, "info", "Gateway handshake complete.");
 
       // Apply snapshot if provided
       if (payload?.snapshot) {
@@ -141,31 +249,7 @@ export function connectGateway(host: T560App): void {
         if (!host.sessionKey && snap.sessionKey) host.sessionKey = snap.sessionKey;
       }
 
-      gateway.request("chat.history", {
-        sessionKey: host.sessionKey || undefined,
-        limit: 120,
-      }).then((historyPayload: any) => {
-        if (historyPayload?.sessionKey) {
-          host.sessionKey = String(historyPayload.sessionKey);
-        }
-        const messages = Array.isArray(historyPayload?.messages) ? historyPayload.messages : [];
-        const mapped = messages.map((item: any) => ({
-          id: String(item?.id ?? uuid()),
-          role: item?.role === "user" ? "user" : "assistant",
-          content: String(item?.message ?? ""),
-          thinking: null,
-          toolCalls: [],
-          timestamp: typeof item?.timestamp === "number" ? item.timestamp : Date.now(),
-          provider: null,
-          model: null,
-        }));
-        // Keep locally restored messages if the server has no history for this session.
-        if (mapped.length > 0 || host.chatMessages.length === 0) {
-          host.chatMessages = mapped;
-        }
-      }).catch(() => {
-        // Older gateways may not implement chat.history yet.
-      });
+      void reloadChatHistory(host);
     },
 
     onEvent(event: string, payload: any) {
@@ -174,10 +258,12 @@ export function connectGateway(host: T560App): void {
 
     onClose(_code: number, _reason: string) {
       host.connected = false;
+      appendGatewayEvent(host, "warn", "Gateway connection closed.");
     },
 
     onError(error: string) {
       host.lastError = error;
+      appendGatewayEvent(host, "error", error);
     },
   });
 
@@ -212,6 +298,7 @@ function handleGatewayEvent(host: T560App, event: string, payload: any): void {
       const line = summarizeAgentEvent(payload);
       if (line) {
         pushLiveProgress(host, line);
+        appendGatewayEvent(host, "info", `Agent: ${line}`);
       }
       break;
     }
@@ -235,6 +322,7 @@ function handleGatewayEvent(host: T560App, event: string, payload: any): void {
     }
     case "status": {
       if (payload) host.serverStatus = payload;
+      appendGatewayEvent(host, "info", "Received status event.");
       break;
     }
     default:

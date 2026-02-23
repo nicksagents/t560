@@ -762,6 +762,29 @@ function summarizeArgsForProgress(toolName: string, args: unknown): string | nul
     }
     return null;
   }
+  if (toolName === "memory_search") {
+    if (query) {
+      return `I'm searching saved memory for "${query}" and then I'll pull exact snippets to verify.`;
+    }
+    return "I'm searching saved memory for relevant context before I answer.";
+  }
+  if (toolName === "memory_get") {
+    const ref = String(params.ref ?? params.id ?? "").trim();
+    if (ref) {
+      return `I'm pulling the exact memory snippet from ${ref} so I can answer precisely.`;
+    }
+    if (path) {
+      return `I'm reading ${path} to pull the exact memory lines we need.`;
+    }
+    return "I'm pulling the exact memory snippet needed for this step.";
+  }
+  if (toolName === "memory_save") {
+    const title = String(params.title ?? "").trim();
+    if (title) {
+      return `I'm saving a durable memory note titled "${title}" so I can reuse it in future tasks.`;
+    }
+    return "I'm saving this as durable memory so I can reuse it later.";
+  }
   if (toolName === "read" && path) {
     return `I'm opening ${path} to inspect what it contains.`;
   }
@@ -802,6 +825,54 @@ function summarizeOutcomeForProgress(params: {
   }
   const parsed = parseJsonRecord(raw);
   if (parsed) {
+    if (params.toolName === "memory_search") {
+      const results = Array.isArray(parsed.results) ? parsed.results : [];
+      const searched = getNestedRecord(parsed, "searched");
+      const storeEntriesScanned = Number(searched?.storeEntriesScanned ?? 0);
+      const filesScanned = Number(searched?.filesScanned ?? 0);
+      if (results.length > 0) {
+        const top = results[0];
+        if (top && typeof top === "object") {
+          const row = top as Record<string, unknown>;
+          const topRef = String(row.ref ?? "").trim();
+          const topPreview = firstSentence(String(row.preview ?? "").trim(), 130);
+          if (topRef && topPreview) {
+            return `I found ${results.length} relevant memory matches (scanned ${storeEntriesScanned} saved entries and ${filesScanned} memory files). Top match ${topRef} says: ${topPreview} Next I'll pull the exact lines I need.`;
+          }
+          if (topRef) {
+            return `I found ${results.length} relevant memory matches (scanned ${storeEntriesScanned} saved entries and ${filesScanned} memory files), with ${topRef} as the strongest lead. Next I'll pull exact lines.`;
+          }
+        }
+        return `I found ${results.length} relevant memory matches. Next I'll pull the exact snippet to ground the answer.`;
+      }
+      return `I searched memory (scanned ${storeEntriesScanned} saved entries and ${filesScanned} memory files) but didn't find a strong match yet. I'll continue with fresh evidence.`;
+    }
+    if (params.toolName === "memory_get") {
+      const source = String(parsed.source ?? "").trim().toLowerCase();
+      const ref = String(parsed.ref ?? "").trim();
+      const content = firstSentence(String(parsed.content ?? "").trim(), 150);
+      if (ref && content) {
+        return `I pulled ${ref} from ${source || "memory"} and it states: ${content} I'll use this directly in the answer.`;
+      }
+      if (ref) {
+        return `I pulled exact memory from ${ref} and I'm now applying it to your request.`;
+      }
+      if (content) {
+        return `I pulled exact memory details: ${content} I'll apply this to your request now.`;
+      }
+    }
+    if (params.toolName === "memory_save") {
+      const ref = String(parsed.ref ?? "").trim();
+      const title = String(parsed.title ?? "").trim();
+      if (ref && title) {
+        return `I saved this as durable memory (${title}, ${ref}) so I can reuse it in future tasks.`;
+      }
+      if (ref) {
+        return `I saved this as durable memory (${ref}) so it's available for future tasks.`;
+      }
+      return "I saved this as durable memory so I can recall it later.";
+    }
+
     const mfa = getNestedRecord(parsed, "mfa");
     const requiresMfa =
       parsed.requiresMfa === true || mfa?.required === true || mfa?.requiresMfa === true;
