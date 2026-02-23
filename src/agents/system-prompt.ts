@@ -50,6 +50,12 @@ export function buildAgentSystemPrompt(params: {
         "Search saved memory entries and workspace memory docs (MEMORY.md/memory/*.md) for prior decisions, preferences, and context.",
       memory_get: "Fetch exact memory content by ref/id/path for precise recall.",
       memory_save: "Persist durable non-secret memory (preferences, recurring workflows, decisions).",
+      memory_delete: "Delete outdated or incorrect durable memory entries by id/ref/title.",
+      memory_list: "List durable memory entries with filters for audit/debug visibility.",
+      memory_prune: "Apply retention cleanup to stale memory entries (supports dry-run).",
+      memory_feedback: "Reinforce or down-rank memory entries based on usefulness feedback.",
+      memory_stats: "Report memory quality analytics (namespace distribution, trust mix, stale candidates).",
+      memory_compact: "Compact durable memory storage after heavy updates/deletes.",
     };
     const toolOrder = [
       "read",
@@ -64,6 +70,12 @@ export function buildAgentSystemPrompt(params: {
       "memory_search",
       "memory_get",
       "memory_save",
+      "memory_delete",
+      "memory_list",
+      "memory_prune",
+      "memory_feedback",
+      "memory_stats",
+      "memory_compact",
       "exec",
       "process",
     ];
@@ -158,11 +170,18 @@ export function buildAgentSystemPrompt(params: {
     const hasMemorySearch = availableTools.has("memory_search");
     const hasMemoryGet = availableTools.has("memory_get");
     const hasMemorySave = availableTools.has("memory_save");
-    if (hasMemorySearch || hasMemoryGet || hasMemorySave) {
+    const hasMemoryDelete = availableTools.has("memory_delete");
+    const hasMemoryList = availableTools.has("memory_list");
+    const hasMemoryPrune = availableTools.has("memory_prune");
+    const hasMemoryFeedback = availableTools.has("memory_feedback");
+    const hasMemoryStats = availableTools.has("memory_stats");
+    const hasMemoryCompact = availableTools.has("memory_compact");
+    if (hasMemorySearch || hasMemoryGet || hasMemorySave || hasMemoryDelete || hasMemoryList || hasMemoryPrune || hasMemoryFeedback || hasMemoryStats || hasMemoryCompact) {
       lines.push("## Memory Recall");
       if (hasMemorySearch && hasMemoryGet) {
         lines.push(
           "Before answering anything about prior work, decisions, dates, people, preferences, or todos: run memory_search first, then use memory_get for exact snippets you need to cite.",
+          "Use namespace and minTrustTier parameters to avoid cross-user leakage and low-confidence memory.",
         );
       } else if (hasMemorySearch) {
         lines.push(
@@ -172,8 +191,30 @@ export function buildAgentSystemPrompt(params: {
       if (hasMemorySave) {
         lines.push(
           "When the user shares durable preferences, recurring workflows, or stable account context, save concise notes with memory_save.",
+          "If new facts contradict an existing memory, use memory_save with onConflict='replace' to supersede stale entries.",
+          "Use namespace/trustTier on save to keep memory scoped and trustworthy; namespace quotas may evict low-signal entries automatically.",
           "Never store secrets (passwords, one-time codes, private keys, tokens, recovery phrases).",
         );
+      }
+      if (hasMemoryDelete) {
+        lines.push(
+          "If the user corrects prior facts or asks to forget stale context, delete the outdated entry with memory_delete.",
+        );
+      }
+      if (hasMemoryList) {
+        lines.push("Use memory_list when auditing what durable memory is currently stored.");
+      }
+      if (hasMemoryPrune) {
+        lines.push("Use memory_prune (dry-run first) for retention cleanup when memory becomes stale or oversized.");
+      }
+      if (hasMemoryFeedback) {
+        lines.push("Use memory_feedback to reinforce memories that proved useful and down-rank ones that were noisy or wrong.");
+      }
+      if (hasMemoryStats) {
+        lines.push("Use memory_stats to audit memory quality and detect stale/noisy namespaces before pruning.");
+      }
+      if (hasMemoryCompact) {
+        lines.push("Use memory_compact (dry-run first) after many updates/deletes to keep memory storage fast and clean.");
       }
       lines.push("If memory search is low confidence, say you checked memory and what remained uncertain.", "");
     }

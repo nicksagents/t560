@@ -1,8 +1,10 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { URL, fileURLToPath } from "node:url";
 import { existsSync, readFileSync, statSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { join, extname, dirname } from "node:path";
+import { homedir } from "node:os";
 import { spawnSync } from "node:child_process";
 import type { ChatResponse } from "../agent/chat-service.js";
 import type { AgentEvent } from "../agents/agent-events.js";
@@ -26,7 +28,9 @@ import { summarizeSavedUsage } from "../provider/usage-summary.js";
 import { isHeartbeatCheckMessage } from "../gateway/heartbeat.js";
 import type { GatewayInboundMessage } from "../gateway/types.js";
 import { resolveTailscaleStatus } from "../network/tailscale.js";
-import { listProviderCatalog } from "../onboarding/provider-catalog.js";
+import { listProviderCatalog, normalizeProviderModels } from "../onboarding/provider-catalog.js";
+import { loginOpenAICodex } from "@mariozechner/pi-ai";
+import { saveOpenAICodexOAuth } from "../auth/openai_codex_oauth.js";
 import {
   deleteCredential,
   getCredential,
@@ -57,6 +61,103 @@ type ChatRequest = {
   message?: string;
   sessionKey?: string;
 };
+
+/* ═══════════════════════════════════════════
+   Codex OAuth Job Store
+   ═══════════════════════════════════════════ */
+
+type CodexOAuthJob = {
+  status: "starting" | "awaiting_signin" | "done" | "error";
+  url: string | null;
+  resolveManualCode: ((value: string) => void) | null;
+  error: string | null;
+};
+
+const codexOAuthJobs = new Map<string, CodexOAuthJob>();
+
+async function handleStartCodexOAuth(res: ServerResponse): Promise<void> {
+  const jobId = randomUUID();
+  let resolveManualCode: ((value: string) => void) | null = null;
+  const manualCodePromise = new Promise<string>((resolve) => {
+    resolveManualCode = resolve;
+  });
+
+  const job: CodexOAuthJob = {
+    status: "starting",
+    url: null,
+    resolveManualCode,
+    error: null,
+  };
+  codexOAuthJobs.set(jobId, job);
+
+  // Start OAuth flow in background — does not block this request handler.
+  void loginOpenAICodex({
+    onAuth: ({ url }) => {
+      job.url = url;
+      job.status = "awaiting_signin";
+    },
+    onPrompt: async () => manualCodePromise,
+    onManualCodeInput: () => manualCodePromise,
+    onProgress: () => { /* suppress */ },
+  }).then(async (creds) => {
+    saveOpenAICodexOAuth(creds);
+    job.status = "done";
+  }).catch((err: unknown) => {
+    job.status = "error";
+    job.error = String((err as Error)?.message ?? err);
+  });
+
+  // Briefly wait for the OAuth URL to be generated (usually < 500 ms).
+  const deadline = Date.now() + 8_000;
+  while (!job.url && job.status !== "error" && Date.now() < deadline) {
+    await new Promise<void>((r) => setTimeout(r, 50));
+  }
+
+  if (!job.url) {
+    codexOAuthJobs.delete(jobId);
+    sendJson(res, 500, { ok: false, error: job.error ?? "OAuth flow failed to generate a URL." });
+    return;
+  }
+
+  sendJson(res, 200, { ok: true, jobId, url: job.url });
+}
+
+async function handleCodexOAuthCode(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const raw = await readBody(req);
+  let body: unknown = null;
+  try { body = JSON.parse(raw); } catch {
+    sendJson(res, 400, { ok: false, error: "invalid_json" });
+    return;
+  }
+  const obj = (body ?? {}) as Record<string, unknown>;
+  const jobId = String(obj.jobId ?? "").trim();
+  const redirectUrl = String(obj.redirectUrl ?? "").trim();
+  if (!jobId || !redirectUrl) {
+    sendJson(res, 400, { ok: false, error: "jobId and redirectUrl are required." });
+    return;
+  }
+  const job = codexOAuthJobs.get(jobId);
+  if (!job) {
+    sendJson(res, 404, { ok: false, error: "OAuth job not found." });
+    return;
+  }
+  job.resolveManualCode?.(redirectUrl);
+  sendJson(res, 200, { ok: true });
+}
+
+function handleCodexOAuthStatus(url: URL, res: ServerResponse): void {
+  const jobId = url.searchParams.get("jobId") ?? "";
+  const job = codexOAuthJobs.get(jobId);
+  if (!job) {
+    sendJson(res, 404, { ok: false, error: "OAuth job not found." });
+    return;
+  }
+  sendJson(res, 200, { ok: true, status: job.status, error: job.error ?? null });
+  if (job.status === "done" || job.status === "error") {
+    // Clean up completed jobs to avoid memory leaks.
+    setTimeout(() => codexOAuthJobs.delete(jobId), 30_000);
+  }
+}
 
 /* ═══════════════════════════════════════════
    HTTP Helpers
@@ -319,10 +420,14 @@ function buildFallbackChatResponse(error: unknown): ChatResponse {
 }
 
 function toWsAssistantChatPayload(reply: ChatResponse): Record<string, unknown> {
+  const trimmedMessage = String(reply.message ?? "").trim();
+  const safeMessage =
+    trimmedMessage ||
+    "I could not generate a non-empty response for this request. Please retry and I will continue from the current session state.";
   return {
     id: crypto.randomUUID(),
     role: "assistant",
-    message: reply.message,
+    message: safeMessage,
     thinking: reply.thinking,
     toolCalls: reply.toolCalls,
     provider: reply.provider,
@@ -371,15 +476,17 @@ async function readWebchatHistory(sessionKey: string, limit: number): Promise<Ar
   const all = await loadSessionMessages(sessionId);
   const filtered = all.filter((entry) => entry?.role === "user" || entry?.role === "assistant");
   const tail = filtered.length > limit ? filtered.slice(filtered.length - limit) : filtered;
-  return tail.map((entry) => {
+  const mapped = tail.map((entry) => {
     const role = entry.role === "assistant" ? "assistant" : "user";
+    const message = extractTextContent(entry.content).trim();
     return {
       id: crypto.randomUUID(),
       role,
-      message: extractTextContent(entry.content),
+      message,
       timestamp: typeof entry.timestamp === "number" ? entry.timestamp : Date.now(),
     };
   });
+  return mapped.filter((entry) => String(entry.message ?? "").trim().length > 0);
 }
 
 function bindClientEvents(client: WsClient, opts: DashboardServerOptions): void {
@@ -526,9 +633,12 @@ function resolveProviderRouteModel(
 ): string | undefined {
   const catalogModel = resolveCatalogRouteModel(providerId, slot);
   const rawModels = profile?.models;
-  const providerModels = Array.isArray(rawModels)
-    ? rawModels.map((item) => String(item).trim()).filter(Boolean)
-    : [];
+  const providerModels = normalizeProviderModels(
+    providerId,
+    Array.isArray(rawModels)
+      ? rawModels.map((item) => String(item).trim()).filter(Boolean)
+      : []
+  );
   if (catalogModel && providerModels.includes(catalogModel)) {
     return catalogModel;
   }
@@ -636,7 +746,10 @@ async function buildSetupPayload(config: T560Config): Promise<Record<string, unk
         enabled: profile.enabled !== false,
         provider: profile.provider ?? providerId,
         authMode: profile.authMode ?? "api_key",
-        models: Array.isArray(profile.models) ? profile.models : [],
+        models: normalizeProviderModels(
+          providerId,
+          Array.isArray(profile.models) ? profile.models : []
+        ),
         baseUrl: profile.baseUrl ?? "",
         api: profile.api ?? "",
         hasCredential: hasProviderCredential(profile),
@@ -659,6 +772,24 @@ async function buildSetupPayload(config: T560Config): Promise<Record<string, unk
       services: vaultServices,
     },
   };
+}
+
+async function handleGetCcToken(res: ServerResponse): Promise<void> {
+  try {
+    const credPath = join(homedir(), ".claude", ".credentials.json");
+    const raw = await readFile(credPath, "utf8");
+    const data = JSON.parse(raw) as Record<string, unknown>;
+    const oauth = data.claudeAiOauth as Record<string, unknown> | undefined;
+    const accessToken = typeof oauth?.accessToken === "string" ? oauth.accessToken.trim() : "";
+    if (!accessToken) {
+      sendJson(res, 200, { ok: false, error: "No Claude Code OAuth token found." });
+      return;
+    }
+    const expiresAt = typeof oauth?.expiresAt === "number" ? oauth.expiresAt : 0;
+    sendJson(res, 200, { ok: true, token: accessToken, expiresAt });
+  } catch {
+    sendJson(res, 200, { ok: false, error: "Claude Code credentials not found. Make sure you are logged in to the Claude Code CLI." });
+  }
 }
 
 async function handleGetSetup(res: ServerResponse): Promise<void> {
@@ -692,7 +823,7 @@ async function handlePutSetupProvider(req: IncomingMessage, res: ServerResponse)
   const authMode = parseProviderAuthMode(obj.authMode ?? existing?.authMode ?? "api_key");
   const credential = typeof obj.credential === "string" ? obj.credential.trim() : "";
   const clearCredential = obj.clearCredential === true;
-  const models = uniq(parseStringArray(obj.models));
+  const models = normalizeProviderModels(providerId, uniq(parseStringArray(obj.models)));
   const next = {
     enabled: typeof obj.enabled === "boolean" ? obj.enabled : existing?.enabled ?? true,
     provider: providerId,
@@ -1513,6 +1644,22 @@ async function routeRequest(
   }
   if (method === "PUT" && pathname === "/api/context/bootstrap") {
     await handlePutBootstrapFile(req, res);
+    return;
+  }
+  if (method === "POST" && pathname === "/api/setup/oauth/codex/start") {
+    await handleStartCodexOAuth(res);
+    return;
+  }
+  if (method === "POST" && pathname === "/api/setup/oauth/codex/code") {
+    await handleCodexOAuthCode(req, res);
+    return;
+  }
+  if (method === "GET" && pathname === "/api/setup/oauth/codex/status") {
+    handleCodexOAuthStatus(url, res);
+    return;
+  }
+  if (method === "GET" && pathname === "/api/setup/cc-token") {
+    await handleGetCcToken(res);
     return;
   }
   if (method === "GET" && pathname === "/api/setup") {

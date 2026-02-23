@@ -31,7 +31,9 @@ import {
   saveSetupTelegram,
   saveVaultCredential,
   selectSetupProvider,
+  startCodexOAuth,
   startSetupProviderDraft,
+  submitCodexOAuthCode,
 } from "./app-setup.js";
 import { setTheme, toggleNav, toggleThinking } from "./app-settings.js";
 import { handleNewMessage, scrollToBottom, setupScrollListener } from "./app-scroll.js";
@@ -151,10 +153,25 @@ export class T560App extends LitElement {
   @state() setupVaultSecret = "";
   @state() setupVaultMfaCode = "";
 
+  // Codex OAuth sign-in state
+  @state() setupOAuthJobId = "";
+  @state() setupOAuthUrl = "";
+  @state() setupOAuthStatus: "idle" | "starting" | "awaiting_signin" | "done" | "error" = "idle";
+  @state() setupOAuthError = "";
+  @state() setupOAuthRedirectDraft = "";
+
+  // Claude Code token load state (inline feedback near the Load button)
+  @state() setupCcTokenStatus: "" | "loading" | "ok" | "error" = "";
+  @state() setupCcTokenMessage = "";
+
   // Settings (loaded from localStorage)
   settings = loadSettings();
 
   private previousMessageCount = 0;
+  private _contentScrollSave = 0;
+  private _chatScrollSave = 0;
+  private _chatScrollToBottom = false;
+  private _chatWasNearBottom = false;
   private isComposing = false;
   private chatDraft = "";
   private readonly onPopState = () => {
@@ -234,12 +251,48 @@ export class T560App extends LitElement {
     });
   }
 
-  updated(changed: Map<string, unknown>) {
-    // Auto-scroll when new messages arrive
-    if (changed.has("chatMessages")) {
-      if (this.chatMessages.length > this.previousMessageCount) {
-        handleNewMessage(this);
+  override willUpdate(changed: Map<string | symbol, unknown>): void {
+    // Capture chat-thread scroll state BEFORE unsafeHTML replaces the DOM.
+    // isNearBottom must be checked here, not in updated(), because the new
+    // .chat-thread element starts at scrollTop=0 after each re-render.
+    if (this.activeTab === "chat") {
+      const thread = this.querySelector(".chat-thread") as HTMLElement | null;
+      if (thread) {
+        this._chatScrollSave = thread.scrollTop;
       }
+      if (changed.has("chatMessages") && this.chatMessages.length > this.previousMessageCount) {
+        const nearBottom = !thread ||
+          thread.scrollHeight - thread.scrollTop - thread.clientHeight < 120;
+        this._chatWasNearBottom = nearBottom;
+        if (nearBottom) this._chatScrollToBottom = true;
+      }
+    }
+  }
+
+  updated(changed: Map<string, unknown>) {
+    // Chat scroll restoration — runs after every render while in chat tab.
+    // unsafeHTML recreates .chat-thread from scratch (scrollTop=0) on every
+    // state change, so we must restore the position here.
+    if (this.activeTab === "chat") {
+      const thread = this.querySelector(".chat-thread") as HTMLElement | null;
+      if (thread) {
+        if (this._chatScrollToBottom) {
+          thread.scrollTo({ top: thread.scrollHeight, behavior: "instant" });
+          this._chatScrollToBottom = false;
+        } else {
+          thread.scrollTop = this._chatScrollSave;
+        }
+      }
+      // Re-attach scroll listener to the newly created .chat-thread element.
+      setupScrollListener(this);
+    }
+
+    // Show new-messages badge when user is scrolled up and new messages arrive.
+    if (changed.has("chatMessages")) {
+      if (this.chatMessages.length > this.previousMessageCount && !this._chatWasNearBottom) {
+        this.hasNewMessages = true;
+      }
+      this._chatWasNearBottom = false;
       this.previousMessageCount = this.chatMessages.length;
     }
 
@@ -261,9 +314,15 @@ export class T560App extends LitElement {
       document.title = `${title} · t560`;
     }
 
-    // Re-setup scroll listener when switching to chat
-    if (changed.has("activeTab")) {
-      requestAnimationFrame(() => setupScrollListener(this));
+    // Restore scroll position on setup/settings pages after every re-render.
+    // unsafeHTML replaces the entire .content DOM node on each render, resetting
+    // scrollTop to 0. We restore from _contentScrollSave which is captured before
+    // each action (click or input) that triggers a state change.
+    if (this.activeTab === "setup" || this.activeTab === "settings") {
+      const content = this.querySelector(".content") as HTMLElement | null;
+      if (content) {
+        content.scrollTop = this._contentScrollSave;
+      }
     }
   }
 
@@ -317,10 +376,13 @@ export class T560App extends LitElement {
       if (!actionEl) return;
 
       const action = actionEl.getAttribute("data-action");
-      const setupScrollTop =
-        this.activeTab === "setup"
-          ? (this.querySelector(".content") as HTMLElement | null)?.scrollTop ?? null
-          : null;
+
+      // Save scroll position before any action on pages that re-render fully via unsafeHTML.
+      // We restore it in updated() after every render so async actions don't lose position.
+      if (this.activeTab === "setup" || this.activeTab === "settings") {
+        this._contentScrollSave = (this.querySelector(".content") as HTMLElement | null)?.scrollTop ?? 0;
+      }
+
       switch (action) {
         case "toggle-nav":
           toggleNav(this);
@@ -328,6 +390,7 @@ export class T560App extends LitElement {
         case "nav": {
           const tab = actionEl.getAttribute("data-tab");
           if (tab) {
+            this._contentScrollSave = 0; // always start new page at top
             this.setActiveTab(tab, { pushHistory: true });
             if (tab === "setup") {
               void loadSetupState(this);
@@ -389,8 +452,10 @@ export class T560App extends LitElement {
           toggleThinking(this);
           break;
         case "scroll-bottom":
-          scrollToBottom(this, true);
+          // Clear badge and flag scroll-to-bottom; willUpdate/updated() will
+          // scroll the newly created .chat-thread after the re-render.
           this.hasNewMessages = false;
+          this._chatScrollToBottom = true;
           break;
         case "remove-attachment": {
           const idx = parseInt(actionEl.getAttribute("data-index") ?? "0", 10);
@@ -454,10 +519,21 @@ export class T560App extends LitElement {
           }
           break;
         }
+        case "tap-assign-route": {
+          const slot = actionEl.getAttribute("data-slot");
+          const provider = actionEl.getAttribute("data-provider") ?? "";
+          const model = actionEl.getAttribute("data-model") ?? "";
+          if (provider && model && (slot === "default" || slot === "planning" || slot === "coding")) {
+            void assignSetupRouteModel(this, slot, provider, model);
+          }
+          break;
+        }
         case "select-setup-provider": {
           const provider = actionEl.getAttribute("data-provider");
           if (provider) {
             selectSetupProvider(this, provider);
+            // Sync the provider-type dropdown so the form reflects what's loaded
+            this.setupNewProviderTemplate = provider;
           }
           break;
         }
@@ -473,6 +549,71 @@ export class T560App extends LitElement {
         case "refresh-vault":
           void refreshVault(this);
           break;
+        case "start-codex-oauth":
+          void startCodexOAuth(this);
+          break;
+        case "submit-codex-oauth-code":
+          void submitCodexOAuthCode(this);
+          break;
+        case "reset-codex-oauth":
+          this.setupOAuthStatus = "idle";
+          this.setupOAuthJobId = "";
+          this.setupOAuthUrl = "";
+          this.setupOAuthError = "";
+          this.setupOAuthRedirectDraft = "";
+          break;
+        case "add-setup-provider":
+          this.setupSelectedProvider = "__new__";
+          this.setupNewProviderTemplate = "";
+          this.setupNewProviderId = "";
+          this.setupProviderCredential = "";
+          this.setupProviderModels = "";
+          this.setupProviderBaseUrl = "";
+          this.setupProviderApi = "";
+          this.setupProviderEnabled = true;
+          this.setupProviderAuthMode = "api_key";
+          this.setupOAuthStatus = "idle";
+          this.setupOAuthJobId = "";
+          this.setupOAuthUrl = "";
+          this.setupOAuthError = "";
+          this.setupOAuthRedirectDraft = "";
+          this.setupCcTokenStatus = "";
+          this.setupCcTokenMessage = "";
+          break;
+        case "cancel-setup-provider":
+          this.setupSelectedProvider = "";
+          this.setupOAuthStatus = "idle";
+          this.setupOAuthJobId = "";
+          this.setupOAuthUrl = "";
+          this.setupOAuthError = "";
+          this.setupCcTokenStatus = "";
+          this.setupCcTokenMessage = "";
+          break;
+        case "fetch-cc-token":
+          void (async () => {
+            if (this.setupLoading || this.setupSaving) return;
+            this.setupCcTokenStatus = "loading";
+            this.setupCcTokenMessage = "";
+            try {
+              const res = await fetch("/api/setup/cc-token");
+              const data = await res.json() as { ok: boolean; token?: string; expiresAt?: number; error?: string };
+              if (data.ok && data.token) {
+                this.setupProviderCredential = data.token;
+                const expiry = data.expiresAt && data.expiresAt > 0
+                  ? ` Expires ${new Date(data.expiresAt).toLocaleDateString()}.`
+                  : "";
+                this.setupCcTokenStatus = "ok";
+                this.setupCcTokenMessage = `Token loaded.${expiry} Click Save Provider to apply.`;
+              } else {
+                this.setupCcTokenStatus = "error";
+                this.setupCcTokenMessage = data.error ?? "Could not load token.";
+              }
+            } catch {
+              this.setupCcTokenStatus = "error";
+              this.setupCcTokenMessage = "Request failed — server may not be running.";
+            }
+          })();
+          break;
         case "select-setup-section": {
           const section = actionEl.getAttribute("data-section");
           if (
@@ -482,6 +623,7 @@ export class T560App extends LitElement {
             section === "vault" ||
             section === "files"
           ) {
+            this._contentScrollSave = 0; // scroll to top when switching sections
             this.setupSection = section;
             if (section === "files") {
               void loadDashboardSettings(this);
@@ -498,18 +640,6 @@ export class T560App extends LitElement {
         }
       }
 
-      if (
-        setupScrollTop !== null &&
-        action !== "nav" &&
-        action !== "toggle-nav"
-      ) {
-        requestAnimationFrame(() => {
-          const content = this.querySelector(".content") as HTMLElement | null;
-          if (content) {
-            content.scrollTop = setupScrollTop;
-          }
-        });
-      }
     });
 
     this.addEventListener("dragstart", (e: Event) => {
@@ -638,6 +768,13 @@ export class T560App extends LitElement {
       const target = e.target as HTMLElement;
       const inputName = target.getAttribute("data-input");
       if (!inputName) return;
+
+      // Save scroll position on setup/settings pages so typing in a form field
+      // doesn't cause the page to scroll back to top after each re-render.
+      if (inputName !== "chat" && (this.activeTab === "setup" || this.activeTab === "settings")) {
+        this._contentScrollSave = (this.querySelector(".content") as HTMLElement | null)?.scrollTop ?? this._contentScrollSave;
+      }
+
       const textarea = target as HTMLTextAreaElement;
 
       if (inputName === "chat") {
@@ -673,6 +810,11 @@ export class T560App extends LitElement {
       }
       if (inputName === "setup-new-provider-template") {
         this.setupNewProviderTemplate = textarea.value.trim();
+        // Auto-apply the template so the model list and auth options update
+        // immediately — only when a real template is selected.
+        if (this.setupNewProviderTemplate) {
+          startSetupProviderDraft(this);
+        }
         return;
       }
       if (inputName === "setup-provider-auth") {
@@ -703,28 +845,25 @@ export class T560App extends LitElement {
         this.setupProviderEnabled = textarea.value === "true";
         return;
       }
-      if (inputName === "setup-routing-default-provider") {
-        this.setupRoutingDefaultProvider = textarea.value;
+      if (inputName === "setup-role-default") {
+        const [provider = "", model = ""] = textarea.value.split("::");
+        this.setupRoutingDefaultProvider = provider;
+        this.setupRoutingDefaultModel = model;
+        if (provider && model) void assignSetupRouteModel(this, "default", provider, model);
         return;
       }
-      if (inputName === "setup-routing-default-model") {
-        this.setupRoutingDefaultModel = textarea.value;
+      if (inputName === "setup-role-planning") {
+        const [provider = "", model = ""] = textarea.value.split("::");
+        this.setupRoutingPlanningProvider = provider;
+        this.setupRoutingPlanningModel = model;
+        if (provider && model) void assignSetupRouteModel(this, "planning", provider, model);
         return;
       }
-      if (inputName === "setup-routing-planning-provider") {
-        this.setupRoutingPlanningProvider = textarea.value;
-        return;
-      }
-      if (inputName === "setup-routing-planning-model") {
-        this.setupRoutingPlanningModel = textarea.value;
-        return;
-      }
-      if (inputName === "setup-routing-coding-provider") {
-        this.setupRoutingCodingProvider = textarea.value;
-        return;
-      }
-      if (inputName === "setup-routing-coding-model") {
-        this.setupRoutingCodingModel = textarea.value;
+      if (inputName === "setup-role-coding") {
+        const [provider = "", model = ""] = textarea.value.split("::");
+        this.setupRoutingCodingProvider = provider;
+        this.setupRoutingCodingModel = model;
+        if (provider && model) void assignSetupRouteModel(this, "coding", provider, model);
         return;
       }
       if (inputName === "setup-telegram-token") {
@@ -761,6 +900,10 @@ export class T560App extends LitElement {
       }
       if (inputName === "setup-vault-mfa-code") {
         this.setupVaultMfaCode = textarea.value;
+        return;
+      }
+      if (inputName === "setup-oauth-redirect") {
+        this.setupOAuthRedirectDraft = textarea.value;
         return;
       }
       if (inputName === "chat-inject-draft") {

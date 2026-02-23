@@ -143,16 +143,18 @@ function mapHistoryPayloadMessages(historyPayload: any): Array<{
   model: null;
 }> {
   const messages = Array.isArray(historyPayload?.messages) ? historyPayload.messages : [];
-  return messages.map((item: any) => ({
-    id: String(item?.id ?? uuid()),
-    role: item?.role === "user" ? "user" : "assistant",
-    content: String(item?.message ?? ""),
-    thinking: null,
-    toolCalls: [],
-    timestamp: typeof item?.timestamp === "number" ? item.timestamp : Date.now(),
-    provider: null,
-    model: null,
-  }));
+  return messages
+    .map((item: any) => ({
+      id: String(item?.id ?? uuid()),
+      role: item?.role === "user" ? "user" : "assistant",
+      content: String(item?.message ?? "").trim(),
+      thinking: null,
+      toolCalls: [],
+      timestamp: typeof item?.timestamp === "number" ? item.timestamp : Date.now(),
+      provider: null,
+      model: null,
+    }))
+    .filter((msg) => msg.content.length > 0);
 }
 
 export async function reloadChatHistory(host: T560App, limit = 120): Promise<void> {
@@ -332,11 +334,19 @@ function handleGatewayEvent(host: T560App, event: string, payload: any): void {
 
 function handleChatEvent(host: T560App, payload: any): void {
   if (!payload) return;
+  const role = payload.role === "user" ? "user" : "assistant";
+  const rawContent = String(payload.message ?? "").trim();
+  const content =
+    rawContent ||
+    (role === "assistant"
+      ? "I could not generate a non-empty response for this request. Please retry and I will continue from the current session state."
+      : "");
+  if (!content) return;
 
   const msg = {
     id: payload.id ?? uuid(),
-    role: payload.role as "user" | "assistant",
-    content: payload.message ?? "",
+    role,
+    content,
     thinking: payload.thinking ?? null,
     toolCalls: payload.toolCalls ?? [],
     timestamp: payload.timestamp ?? Date.now(),

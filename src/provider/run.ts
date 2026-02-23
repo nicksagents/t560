@@ -28,6 +28,7 @@ import { executeToolCall, toToolDefinitions } from "../agents/pi-tool-definition
 import { normalizeToolParameters } from "../agents/pi-tools.schema.js";
 import { resolveSkillsPromptForRun } from "../agents/skills.js";
 import { buildAgentSystemPrompt } from "../agents/system-prompt.js";
+import { createMemorySaveTool } from "../agents/tools/memory-tools.js";
 import { emitAgentEvent } from "../agents/agent-events.js";
 import { extractEcommerceCandidates, pickCheapestCandidate } from "../agents/ecommerce.js";
 import {
@@ -65,6 +66,23 @@ export function bustSoulPromptCache(): void {}
 export function bustUsersPromptCache(): void {}
 
 const SUPPORTED_PROVIDERS = new Set<string>(getProviders());
+const OPENAI_RUNTIME_PROVIDER = "openai";
+const PROVIDER_RUNTIME_ALIASES: Record<string, KnownProvider> = {
+  "deepseek": "openai",
+  "local-openai": "openai",
+};
+const DEEPSEEK_MODEL_ALIAS_MAP: Record<string, string> = {
+  "deepseek-chat": "deepseek-chat",
+  "deepseek-v3": "deepseek-chat",
+  "deepseek-v3-0324": "deepseek-chat",
+  "deepseek-v3.1": "deepseek-chat",
+  "deepseek-v3.1-terminus": "deepseek-chat",
+  "deepseek-v3.2": "deepseek-chat",
+  "deepseek-v3.2-exp": "deepseek-chat",
+  "deepseek-reasoner": "deepseek-reasoner",
+  "deepseek-r1": "deepseek-reasoner",
+  "deepseek-r1-0528": "deepseek-reasoner",
+};
 const MAX_TOOL_ROUNDS = 20;
 const TOOL_ERROR_PREVIEW_MAX_CHARS = 240;
 const EMPTY_REPLY_URL_SCAN_LIMIT = 20;
@@ -74,6 +92,7 @@ const MAX_PROVIDER_TIMEOUT_MS = 15 * 60_000;
 const MFA_PENDING_SESSION_MAX = 1024;
 const LIVE_PROGRESS_LINE_MAX = 420;
 const LIVE_PROGRESS_LINES_PER_ROUND = 8;
+const AUTO_MEMORY_MAX_CANDIDATES = 2;
 const GENERIC_PROGRESS_PATTERNS: RegExp[] = [
   /^i am using the latest findings(?: to choose the next step)?\.?$/i,
   /^using the latest findings(?: to choose the next step)?\.?$/i,
@@ -91,6 +110,142 @@ type PendingMfaSession = {
 
 const pendingMfaBySession = new Map<string, PendingMfaSession>();
 
+type AutoMemoryCandidate = {
+  title: string;
+  content: string;
+  tags: string[];
+};
+
+function isAutoMemoryEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = String(env.T560_MEMORY_AUTO_SAVE ?? "").trim().toLowerCase();
+  if (!raw) {
+    return true;
+  }
+  if (raw === "0" || raw === "false" || raw === "no" || raw === "off") {
+    return false;
+  }
+  return true;
+}
+
+function clipAutoMemoryText(value: string, maxChars: number): string {
+  const compact = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (compact.length <= maxChars) {
+    return compact;
+  }
+  return `${compact.slice(0, maxChars - 3).trim()}...`;
+}
+
+function extractAutoMemoryCandidates(message: string): AutoMemoryCandidate[] {
+  const source = String(message ?? "").trim();
+  if (!source || source.length > 600) {
+    return [];
+  }
+  if (/\b(?:don't|do not)\s+remember\b/i.test(source)) {
+    return [];
+  }
+
+  const candidates: AutoMemoryCandidate[] = [];
+  const seen = new Set<string>();
+  const addCandidate = (candidate: AutoMemoryCandidate) => {
+    const title = clipAutoMemoryText(candidate.title, 80);
+    const content = clipAutoMemoryText(candidate.content, 420);
+    const tags = Array.from(
+      new Set(
+        candidate.tags
+          .map((tag) => String(tag ?? "").trim().toLowerCase())
+          .filter(Boolean),
+      ),
+    ).slice(0, 8);
+    if (!title || !content) {
+      return;
+    }
+    const key = `${title}\n${content}`.toLowerCase();
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    candidates.push({ title, content, tags });
+  };
+
+  const explicitRemember = /\b(?:remember|for future reference|note that)\b[:,-]?\s*(.+)$/i.exec(source);
+  if (explicitRemember?.[1]) {
+    addCandidate({
+      title: "User explicit memory",
+      content: explicitRemember[1],
+      tags: ["user", "explicit", "memory"],
+    });
+  }
+
+  const preference = /\b(?:i|we)\s+(?:prefer|like)\s+(.{3,220})$/i.exec(source);
+  if (preference?.[1]) {
+    addCandidate({
+      title: "User preference",
+      content: `User preference: ${preference[1]}`,
+      tags: ["user", "preference"],
+    });
+  }
+
+  const name = /\b(?:my name is|call me)\s+([A-Za-z][A-Za-z0-9 _-]{1,40})\b/i.exec(source);
+  if (name?.[1]) {
+    addCandidate({
+      title: "User identity",
+      content: `Preferred name: ${name[1].trim()}`,
+      tags: ["user", "identity"],
+    });
+  }
+
+  const timezone = /\bmy timezone is\s+([A-Za-z0-9_+/:-]{2,64})\b/i.exec(source);
+  if (timezone?.[1]) {
+    addCandidate({
+      title: "User timezone",
+      content: `Timezone: ${timezone[1].trim()}`,
+      tags: ["user", "timezone"],
+    });
+  }
+
+  const workflow = /\b(?:always|default to)\s+(.{4,220})$/i.exec(source);
+  if (workflow?.[1]) {
+    addCandidate({
+      title: "User workflow preference",
+      content: `Workflow preference: ${workflow[1]}`,
+      tags: ["user", "workflow", "preference"],
+    });
+  }
+
+  return candidates.slice(0, AUTO_MEMORY_MAX_CANDIDATES);
+}
+
+async function maybeAutoSaveMemoryFromUserMessage(params: {
+  message: string;
+  workspaceDir: string;
+  env?: NodeJS.ProcessEnv;
+  skip: boolean;
+}): Promise<void> {
+  if (params.skip) {
+    return;
+  }
+  const env = params.env ?? process.env;
+  if (!isAutoMemoryEnabled(env)) {
+    return;
+  }
+  const candidates = extractAutoMemoryCandidates(params.message);
+  if (candidates.length === 0) {
+    return;
+  }
+  const tool = createMemorySaveTool({
+    workspaceDir: params.workspaceDir,
+    env,
+  });
+  for (let idx = 0; idx < candidates.length; idx += 1) {
+    const candidate = candidates[idx];
+    try {
+      await tool.execute(`auto-memory-${Date.now()}-${idx}`, candidate);
+    } catch {
+      // Best effort: do not fail the user response if autosave is blocked or invalid.
+    }
+  }
+}
+
 function resolveProviderTimeoutMs(): number {
   const rawSec = Number(process.env.T560_PROVIDER_TIMEOUT_SEC ?? "");
   if (Number.isFinite(rawSec) && rawSec > 0) {
@@ -103,11 +258,58 @@ function resolveProviderTimeoutMs(): number {
   return DEFAULT_PROVIDER_TIMEOUT_MS;
 }
 
-function assertSupportedProvider(provider: string): KnownProvider {
-  if (!SUPPORTED_PROVIDERS.has(provider)) {
-    throw new Error(`Provider '${provider}' is not supported by the provider runtime.`);
+function defaultBaseUrlForProviderAlias(providerId: string): string | undefined {
+  const normalized = String(providerId ?? "").trim().toLowerCase();
+  if (normalized === "deepseek") {
+    return "https://api.deepseek.com/v1";
   }
-  return provider as KnownProvider;
+  if (normalized === "local-openai") {
+    return "http://127.0.0.1:8080/v1";
+  }
+  return undefined;
+}
+
+function resolveRuntimeProvider(params: {
+  routeProviderId: string;
+  profile: ProviderProfile;
+}): {
+  requestedProvider: string;
+  runtimeProvider: KnownProvider;
+  baseUrlOverride?: string;
+} {
+  const routeProviderId = String(params.routeProviderId ?? "").trim().toLowerCase();
+  const profileProvider = String(params.profile.provider ?? "").trim().toLowerCase();
+  const requestedProvider = profileProvider || routeProviderId;
+
+  if (!requestedProvider) {
+    throw new Error(`Provider route '${params.routeProviderId}' does not specify a runtime provider.`);
+  }
+
+  if (SUPPORTED_PROVIDERS.has(requestedProvider)) {
+    return {
+      requestedProvider,
+      runtimeProvider: requestedProvider as KnownProvider,
+    };
+  }
+
+  const alias = PROVIDER_RUNTIME_ALIASES[requestedProvider];
+  if (alias && SUPPORTED_PROVIDERS.has(alias)) {
+    return {
+      requestedProvider,
+      runtimeProvider: alias,
+      baseUrlOverride: defaultBaseUrlForProviderAlias(requestedProvider),
+    };
+  }
+
+  const hasCustomBaseUrl = Boolean(normalizeBaseUrl(params.profile.baseUrl));
+  if (hasCustomBaseUrl && SUPPORTED_PROVIDERS.has(OPENAI_RUNTIME_PROVIDER)) {
+    return {
+      requestedProvider,
+      runtimeProvider: OPENAI_RUNTIME_PROVIDER as KnownProvider,
+    };
+  }
+
+  throw new Error(`Provider '${requestedProvider}' is not supported by the provider runtime.`);
 }
 
 async function loadTextFile(path: string): Promise<string | undefined> {
@@ -384,14 +586,25 @@ function buildCustomModelDefinition(params: {
   } as ReturnType<typeof getModel>;
 }
 
-function resolveModelAlias(provider: KnownProvider, modelId: string): string {
-  const trimmed = modelId.trim();
+function resolveModelAlias(params: {
+  runtimeProvider: KnownProvider;
+  requestedProvider: string;
+  modelId: string;
+}): string {
+  const trimmed = params.modelId.trim();
   if (!trimmed) {
-    return modelId;
+    return params.modelId;
   }
   const canonical = trimmed.toLowerCase();
 
-  if (provider === "openai-codex") {
+  if (params.requestedProvider === "deepseek") {
+    const deepseekAlias = DEEPSEEK_MODEL_ALIAS_MAP[canonical];
+    if (deepseekAlias) {
+      return deepseekAlias;
+    }
+  }
+
+  if (params.runtimeProvider === "openai-codex") {
     if (canonical === "gpt-5-mini" || canonical === "gpt-s-mini") {
       return "gpt-5.1-codex-mini";
     }
@@ -785,6 +998,61 @@ function summarizeArgsForProgress(toolName: string, args: unknown): string | nul
     }
     return "I'm saving this as durable memory so I can reuse it later.";
   }
+  if (toolName === "memory_delete") {
+    const ref = String(params.ref ?? params.id ?? "").trim();
+    const title = String(params.title ?? "").trim();
+    if (ref) {
+      return `I'm deleting the outdated memory entry ${ref} so future replies don't reuse it.`;
+    }
+    if (title) {
+      return `I'm deleting the outdated memory entry titled "${title}".`;
+    }
+    return "I'm deleting outdated memory so future replies stay accurate.";
+  }
+  if (toolName === "memory_list") {
+    if (query) {
+      return `I'm auditing saved memory entries matching "${query}" to verify what is currently stored.`;
+    }
+    return "I'm auditing saved memory entries so we can review memory quality.";
+  }
+  if (toolName === "memory_prune") {
+    const maxEntries = String(params.maxEntries ?? "").trim();
+    const olderThanDays = String(params.olderThanDays ?? "").trim();
+    const dryRun = params.dryRun !== false;
+    if (maxEntries || olderThanDays) {
+      const clauses = [
+        maxEntries ? `keep newest ${maxEntries}` : "",
+        olderThanDays ? `remove older than ${olderThanDays} days` : "",
+      ].filter(Boolean);
+      return dryRun
+        ? `I'm running a retention dry-run (${clauses.join(", ")}) to preview prune impact safely.`
+        : `I'm applying retention cleanup (${clauses.join(", ")}) to remove stale memory entries.`;
+    }
+    return dryRun
+      ? "I'm running a dry-run retention check to preview stale memory cleanup."
+      : "I'm applying retention cleanup to stale memory.";
+  }
+  if (toolName === "memory_compact") {
+    const dryRun = params.dryRun !== false;
+    return dryRun
+      ? "I'm running a storage compaction dry-run to estimate how much memory history can be cleaned."
+      : "I'm compacting the durable memory store to remove stale history rows and improve performance.";
+  }
+  if (toolName === "memory_feedback") {
+    const signal = String(params.signal ?? "").trim().toLowerCase();
+    const ref = String(params.ref ?? params.id ?? "").trim();
+    if (ref && signal) {
+      return `I'm applying ${signal} feedback to ${ref} so future memory ranking reflects this signal.`;
+    }
+    return "I'm applying memory feedback to improve future retrieval quality.";
+  }
+  if (toolName === "memory_stats") {
+    const namespace = String(params.namespace ?? "").trim();
+    if (namespace) {
+      return `I'm auditing memory quality metrics for namespace "${namespace}" to identify stale or noisy context.`;
+    }
+    return "I'm auditing global memory quality metrics to identify stale or noisy context.";
+  }
   if (toolName === "read" && path) {
     return `I'm opening ${path} to inspect what it contains.`;
   }
@@ -864,13 +1132,95 @@ function summarizeOutcomeForProgress(params: {
     if (params.toolName === "memory_save") {
       const ref = String(parsed.ref ?? "").trim();
       const title = String(parsed.title ?? "").trim();
+      const upserted = parsed.upserted === true;
+      const conflictDetected = parsed.conflictDetected === true;
+      const replacedIds = Array.isArray(parsed.replacedIds) ? parsed.replacedIds.length : 0;
+      const evictedIds = Array.isArray(parsed.evictedIds) ? parsed.evictedIds.length : 0;
       if (ref && title) {
-        return `I saved this as durable memory (${title}, ${ref}) so I can reuse it in future tasks.`;
+        if (replacedIds > 0) {
+          return `I replaced ${replacedIds} conflicting memory entr${replacedIds === 1 ? "y" : "ies"} and saved the new canonical note (${title}, ${ref}).`;
+        }
+        if (conflictDetected) {
+          return `I saved memory (${title}, ${ref}) and flagged a potential contradiction so we can replace stale context if needed.`;
+        }
+        if (evictedIds > 0) {
+          return `I saved memory (${title}, ${ref}) and evicted ${evictedIds} low-priority entries to satisfy namespace quota.`;
+        }
+        return upserted
+          ? `I updated durable memory (${title}, ${ref}) so it reflects the latest context.`
+          : `I saved this as durable memory (${title}, ${ref}) so I can reuse it in future tasks.`;
       }
       if (ref) {
-        return `I saved this as durable memory (${ref}) so it's available for future tasks.`;
+        if (replacedIds > 0) {
+          return `I replaced conflicting memory and saved the new canonical entry (${ref}).`;
+        }
+        if (conflictDetected) {
+          return `I saved memory (${ref}) and flagged a potential contradiction for review.`;
+        }
+        if (evictedIds > 0) {
+          return `I saved memory (${ref}) and evicted ${evictedIds} low-priority entries to satisfy namespace quota.`;
+        }
+        return upserted
+          ? `I updated durable memory (${ref}) with the latest details.`
+          : `I saved this as durable memory (${ref}) so it's available for future tasks.`;
       }
       return "I saved this as durable memory so I can recall it later.";
+    }
+    if (params.toolName === "memory_delete") {
+      const ref = String(parsed.ref ?? "").trim();
+      const title = String(parsed.title ?? "").trim();
+      if (ref && title) {
+        return `I deleted outdated memory (${title}, ${ref}) so it won't influence future replies.`;
+      }
+      if (ref) {
+        return `I deleted outdated memory (${ref}) so it won't influence future replies.`;
+      }
+      return "I deleted the outdated memory entry.";
+    }
+    if (params.toolName === "memory_list") {
+      const total = Number(parsed.total ?? 0);
+      const returned = Array.isArray(parsed.results) ? parsed.results.length : 0;
+      const scanned = Number(parsed.scanned ?? 0);
+      if (returned > 0) {
+        return `I audited durable memory and found ${total} matching entries (returned ${returned}, scanned ${scanned}). I'll use this to tighten memory quality and recall behavior.`;
+      }
+      return `I audited durable memory (scanned ${scanned}) and found no matching entries for that filter.`;
+    }
+    if (params.toolName === "memory_prune") {
+      const dryRun = parsed.dryRun !== false;
+      const wouldPrune = Number(parsed.wouldPrune ?? 0);
+      const pruned = Number(parsed.pruned ?? 0);
+      const scanned = Number(parsed.scanned ?? 0);
+      if (dryRun) {
+        return `Retention dry-run complete: ${wouldPrune} of ${scanned} entries would be pruned.`;
+      }
+      return `Retention cleanup complete: pruned ${pruned} entries (scanned ${scanned}).`;
+    }
+    if (params.toolName === "memory_compact") {
+      const dryRun = parsed.dryRun !== false;
+      const reclaimedLines = Number(parsed.reclaimedLines ?? 0);
+      const linesBefore = Number(parsed.linesBefore ?? 0);
+      const linesAfter = Number(parsed.linesAfter ?? 0);
+      if (dryRun) {
+        return `Compaction dry-run complete: ${reclaimedLines} history rows can be removed (${linesBefore} -> ${linesAfter}).`;
+      }
+      return `Memory compaction complete: removed ${reclaimedLines} stale rows (${linesBefore} -> ${linesAfter}).`;
+    }
+    if (params.toolName === "memory_feedback") {
+      const signal = String(parsed.signal ?? "").trim();
+      const ref = String(parsed.ref ?? "").trim();
+      const reinforceCount = Number(parsed.reinforceCount ?? 0);
+      if (ref && signal) {
+        return `Memory feedback applied (${signal}) to ${ref}; reinforcement score is now ${reinforceCount}.`;
+      }
+      return "Memory feedback applied to improve future retrieval ranking.";
+    }
+    if (params.toolName === "memory_stats") {
+      const totals = getNestedRecord(parsed, "totals");
+      const filteredEntries = Number(totals?.filteredEntries ?? 0);
+      const namespaces = Number(totals?.namespaces ?? 0);
+      const stale = Array.isArray(parsed.staleCandidates) ? parsed.staleCandidates.length : 0;
+      return `Memory analytics complete: ${filteredEntries} active entries across ${namespaces} namespace(s), with ${stale} stale candidates flagged.`;
     }
 
     const mfa = getNestedRecord(parsed, "mfa");
@@ -1170,16 +1520,27 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
   }
 
   const credential = extractCredential(profile);
-  const normalizedBaseUrl = normalizeBaseUrl(profile.baseUrl);
+  const runtimeResolution = resolveRuntimeProvider({
+    routeProviderId: provider,
+    profile,
+  });
+  const normalizedBaseUrl = normalizeBaseUrl(profile.baseUrl) ?? normalizeBaseUrl(runtimeResolution.baseUrlOverride);
+  const routeProviderId = String(provider).trim().toLowerCase();
+  const profileProviderId = String(profile.provider ?? "").trim().toLowerCase();
   const allowMissingCredential = Boolean(
-    normalizedBaseUrl && (profile.provider === "openai" || provider === "local-openai"),
+    normalizedBaseUrl &&
+      runtimeResolution.runtimeProvider === OPENAI_RUNTIME_PROVIDER &&
+      (routeProviderId === "local-openai" || profileProviderId === "openai"),
   );
   if (!credential && !allowMissingCredential) {
     throw new Error(`Credentials missing for provider '${provider}'.`);
   }
 
-  const runtimeProvider = profile.provider || provider;
-  const typedProvider = assertSupportedProvider(runtimeProvider);
+  const typedProvider = runtimeResolution.runtimeProvider;
+  const runtimeProfile: ProviderProfile =
+    normalizedBaseUrl && normalizeBaseUrl(profile.baseUrl) !== normalizedBaseUrl
+      ? { ...profile, baseUrl: normalizedBaseUrl }
+      : profile;
 
   const sessionId = params.sessionId || params.externalUserId || "default";
   const history = await loadSessionMessages(sessionId);
@@ -1199,12 +1560,16 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
     timestamp: Date.now()
   };
 
-  const resolvedModelId = resolveModelAlias(typedProvider, model);
+  const resolvedModelId = resolveModelAlias({
+    runtimeProvider: typedProvider,
+    requestedProvider: runtimeResolution.requestedProvider,
+    modelId: model,
+  });
   const discovered = getModel(typedProvider, resolvedModelId as never);
   let modelDef = discovered
     ? applyProfileModelOverrides({
         provider: typedProvider,
-        profile,
+        profile: runtimeProfile,
         modelDef: discovered,
       })
     : undefined;
@@ -1212,7 +1577,7 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
   if (!modelDef) {
     modelDef = buildCustomModelDefinition({
       provider: typedProvider,
-      profile,
+      profile: runtimeProfile,
       modelId: resolvedModelId,
     });
   }
@@ -1680,6 +2045,22 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
       .filter(Boolean)
       .join("\n");
   }
+
+  await maybeAutoSaveMemoryFromUserMessage({
+    message: params.message,
+    workspaceDir: process.cwd(),
+    env: process.env,
+    skip: allToolCalls.some((toolName) => {
+      const normalized = String(toolName ?? "").trim().toLowerCase();
+      return (
+        normalized === "memory_save" ||
+        normalized === "memory_delete" ||
+        normalized === "memory_prune" ||
+        normalized === "memory_feedback" ||
+        normalized === "memory_compact"
+      );
+    }),
+  });
 
   return {
     message,

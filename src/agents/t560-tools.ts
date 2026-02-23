@@ -2,9 +2,15 @@ import type { T560Config } from "../config/state.js";
 import type { AnyAgentTool } from "./pi-tools.types.js";
 import { createBrowserTool } from "./tools/browser-tool.js";
 import {
+  createMemoryCompactTool,
+  createMemoryDeleteTool,
+  createMemoryFeedbackTool,
   createMemoryGetTool,
+  createMemoryListTool,
+  createMemoryPruneTool,
   createMemorySaveTool,
   createMemorySearchTool,
+  createMemoryStatsTool,
 } from "./tools/memory-tools.js";
 import { createWebFetchTool, createWebSearchTool } from "./tools/web-tools.js";
 
@@ -34,6 +40,30 @@ export function createT560Tools(options?: {
     workspaceDir,
     env: options?.env ?? process.env,
   });
+  const memoryDelete = createMemoryDeleteTool({
+    workspaceDir,
+    env: options?.env ?? process.env,
+  });
+  const memoryList = createMemoryListTool({
+    workspaceDir,
+    env: options?.env ?? process.env,
+  });
+  const memoryPrune = createMemoryPruneTool({
+    workspaceDir,
+    env: options?.env ?? process.env,
+  });
+  const memoryCompact = createMemoryCompactTool({
+    workspaceDir,
+    env: options?.env ?? process.env,
+  });
+  const memoryFeedback = createMemoryFeedbackTool({
+    workspaceDir,
+    env: options?.env ?? process.env,
+  });
+  const memoryStats = createMemoryStatsTool({
+    workspaceDir,
+    env: options?.env ?? process.env,
+  });
   return [
     createBrowserTool(),
     ...(webSearch ? [webSearch] : []),
@@ -41,5 +71,11 @@ export function createT560Tools(options?: {
     memorySearch,
     memoryGet,
     memorySave,
+    memoryDelete,
+    memoryList,
+    memoryPrune,
+    memoryFeedback,
+    memoryStats,
+    memoryCompact,
   ];
 }

@@ -203,8 +203,18 @@ function parseTelegramDmPolicy(value: unknown): TelegramDmPolicy {
   return "pairing";
 }
 
-export function resolveStateDir(): string {
-  return path.join(os.homedir(), ".t560");
+export function resolveStateDir(env: NodeJS.ProcessEnv = process.env): string {
+  const raw = String(env.T560_STATE_DIR ?? "").trim();
+  if (!raw) {
+    return path.join(os.homedir(), ".t560");
+  }
+  if (raw === "~") {
+    return os.homedir();
+  }
+  if (raw.startsWith("~/")) {
+    return path.join(os.homedir(), raw.slice(2));
+  }
+  return path.resolve(raw);
 }
 
 export function resolveConfigPath(): string {

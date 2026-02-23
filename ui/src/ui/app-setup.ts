@@ -356,12 +356,15 @@ function applySetupPayload(host: T560App, payload: SetupResponse): void {
   host.setupCatalog = catalog;
   host.setupProviders = providers;
 
-  const preferredProvider =
-    host.setupSelectedProvider && (providers[host.setupSelectedProvider] || catalog.some((entry) => entry.id === host.setupSelectedProvider))
-      ? host.setupSelectedProvider
-      : routingDefault?.provider || Object.keys(providers)[0] || catalog[0]?.id || "";
-  host.setupSelectedProvider = preferredProvider;
-  applyProviderDraftFromSelection(host);
+  // Only keep setupSelectedProvider open if the user was already editing a real provider.
+  // Never auto-open the form on page load (when setupSelectedProvider is "").
+  if (host.setupSelectedProvider && host.setupSelectedProvider !== "__new__") {
+    if (providers[host.setupSelectedProvider] || catalog.some((entry) => entry.id === host.setupSelectedProvider)) {
+      applyProviderDraftFromSelection(host); // refresh form fields for the provider being edited
+    } else {
+      host.setupSelectedProvider = ""; // provider was deleted — close the form
+    }
+  }
 
   host.setupRoutingDefaultProvider = routingDefault?.provider ?? "";
   host.setupRoutingDefaultModel = routingDefault?.model ?? "";
@@ -494,6 +497,7 @@ export async function saveSetupProvider(host: T560App): Promise<void> {
     const setupPayload = asRecord(payloadRecord.setup);
     applySetupPayload(host, setupPayload);
     host.setupProviderCredential = "";
+    host.setupSelectedProvider = "";
     setSetupNotice(host, "success", `Saved provider settings for ${providerId}.`);
   } catch (error: unknown) {
     setSetupNotice(host, "error", toErrorMessage(error, "Failed to save provider settings."));
@@ -523,6 +527,7 @@ export async function deleteSetupProvider(host: T560App, providerId: string): Pr
     const payloadRecord = asRecord(payload);
     const setupPayload = asRecord(payloadRecord.setup);
     applySetupPayload(host, setupPayload);
+    host.setupSelectedProvider = "";
     setSetupNotice(host, "success", `Removed provider ${target}.`);
   } catch (error: unknown) {
     setSetupNotice(host, "error", toErrorMessage(error, "Failed to remove provider."));
@@ -718,6 +723,80 @@ export async function deleteVaultCredential(host: T560App, service: string): Pro
   } finally {
     host.setupSaving = false;
   }
+}
+
+export async function startCodexOAuth(host: T560App): Promise<void> {
+  if (host.setupOAuthStatus === "starting" || host.setupOAuthStatus === "awaiting_signin") return;
+  host.setupOAuthStatus = "starting";
+  host.setupOAuthError = "";
+  host.setupOAuthUrl = "";
+  host.setupOAuthJobId = "";
+  host.setupOAuthRedirectDraft = "";
+  try {
+    const res = await requestJson<{ ok: boolean; jobId?: string; url?: string; error?: string }>(
+      "/api/setup/oauth/codex/start",
+      { method: "POST" }
+    );
+    if (!res.ok || !res.jobId || !res.url) {
+      host.setupOAuthStatus = "error";
+      host.setupOAuthError = res.error ?? "Failed to start OAuth flow.";
+      return;
+    }
+    host.setupOAuthJobId = res.jobId;
+    host.setupOAuthUrl = res.url;
+    host.setupOAuthStatus = "awaiting_signin";
+    pollCodexOAuthStatus(host);
+  } catch (err: unknown) {
+    host.setupOAuthStatus = "error";
+    host.setupOAuthError = toErrorMessage(err, "Failed to start OAuth flow.");
+  }
+}
+
+export async function submitCodexOAuthCode(host: T560App): Promise<void> {
+  const redirectUrl = host.setupOAuthRedirectDraft.trim();
+  if (!redirectUrl || !host.setupOAuthJobId) return;
+  try {
+    await requestJson("/api/setup/oauth/codex/code", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jobId: host.setupOAuthJobId, redirectUrl }),
+    });
+  } catch {
+    // Ignore — polling will catch the error
+  }
+}
+
+async function pollCodexOAuthStatus(host: T560App): Promise<void> {
+  const jobId = host.setupOAuthJobId;
+  if (!jobId) return;
+  for (let i = 0; i < 240; i++) {
+    await new Promise<void>((r) => setTimeout(r, 2_500));
+    if (host.setupOAuthJobId !== jobId) return; // user restarted
+    try {
+      const res = await requestJson<{ ok: boolean; status?: string; error?: string }>(
+        `/api/setup/oauth/codex/status?jobId=${encodeURIComponent(jobId)}`
+      );
+      if (res.status === "done") {
+        host.setupOAuthStatus = "done";
+        host.setupOAuthJobId = "";
+        host.setupOAuthUrl = "";
+        // Reload setup state so the new provider appears
+        await loadSetupState(host, true);
+        // Close the provider form
+        host.setupSelectedProvider = "";
+        return;
+      }
+      if (res.status === "error") {
+        host.setupOAuthStatus = "error";
+        host.setupOAuthError = res.error ?? "OAuth sign-in failed.";
+        return;
+      }
+    } catch {
+      // Transient network error — keep polling
+    }
+  }
+  host.setupOAuthStatus = "error";
+  host.setupOAuthError = "OAuth sign-in timed out. Please try again.";
 }
 
 export async function refreshVault(host: T560App): Promise<void> {

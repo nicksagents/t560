@@ -16,6 +16,7 @@ import { resolveOpenClawPackageRootSync } from "../infra/openclaw-root.js";
 import {
   getProviderCatalogEntry,
   listProviderCatalog,
+  normalizeProviderModels,
   type ProviderCatalogEntry
 } from "./provider-catalog.js";
 import {
@@ -111,7 +112,7 @@ function normalizeProviderProfile(id: string, existing?: ProviderProfile): Provi
     apiKey: existing?.apiKey,
     oauthToken: existing?.oauthToken,
     token: existing?.token,
-    models: existing?.models ?? catalog?.models
+    models: normalizeProviderModels(id, existing?.models ?? catalog?.models ?? [])
   };
 }
 
@@ -239,13 +240,16 @@ async function configureProviderAuth(params: {
     oauthToken = undefined;
   }
 
-  const currentModels = base.models ?? params.provider.models;
+  const currentModels = normalizeProviderModels(
+    params.provider.id,
+    base.models ?? params.provider.models
+  );
   const keepModels = await params.askYesNo(
     `Use preset model list for ${params.provider.label} (${currentModels.join(", ")})?`,
     true
   );
 
-  const models = keepModels
+  const inputModels = keepModels
     ? currentModels
     : unique(
         parseCsv(
@@ -255,6 +259,7 @@ async function configureProviderAuth(params: {
           )
         )
       );
+  const models = normalizeProviderModels(params.provider.id, inputModels);
 
   if (params.provider.id === "openai" || params.provider.id === "local-openai") {
     const suggestedBaseUrl =
@@ -361,7 +366,10 @@ async function chooseRoutingTarget(params: {
 
   const profile = params.providers[providerId];
   const catalog = resolveCatalogByProvider(providerId);
-  const providerModels = unique([...(profile.models ?? []), ...catalog.models]);
+  const providerModels = normalizeProviderModels(
+    providerId,
+    unique([...(profile.models ?? []), ...catalog.models])
+  );
 
   const defaultModel =
     params.slot === "planning"

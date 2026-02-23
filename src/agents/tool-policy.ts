@@ -12,7 +12,7 @@ export const TOOL_GROUPS: Record<string, string[]> = {
   "group:runtime": ["exec", "process"],
   "group:messaging": ["message", "sessions_send"],
   "group:web": ["web_search", "web_fetch"],
-  "group:memory": ["memory_search", "memory_get", "memory_save"],
+  "group:memory": ["memory_search", "memory_get", "memory_save", "memory_delete", "memory_list", "memory_prune", "memory_feedback", "memory_stats", "memory_compact"],
   "group:ui": ["browser"],
   "group:t560": [
     "exec",
@@ -23,6 +23,12 @@ export const TOOL_GROUPS: Record<string, string[]> = {
     "memory_search",
     "memory_get",
     "memory_save",
+    "memory_delete",
+    "memory_list",
+    "memory_prune",
+    "memory_feedback",
+    "memory_stats",
+    "memory_compact",
   ]
 };
 

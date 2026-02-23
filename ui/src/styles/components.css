@@ -208,6 +208,7 @@
   font-weight: 500;
   letter-spacing: -0.01em;
   cursor: pointer;
+  touch-action: manipulation;
   transition: border-color var(--duration-fast) var(--ease-out), background var(--duration-fast) var(--ease-out), box-shadow var(--duration-fast) var(--ease-out), transform var(--duration-fast) var(--ease-out);
 }
 
@@ -326,6 +327,7 @@
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
+  touch-action: manipulation;
   transition: border-color var(--duration-fast) ease, background var(--duration-fast) ease, color var(--duration-fast) ease;
 }
 
@@ -538,7 +540,31 @@
   font-size: 11px;
 }
 
+.setup-model-token__assign {
+  display: none; /* hidden on desktop — use drag and drop */
+}
+
+.btn--xs {
+  padding: 2px 8px;
+  font-size: 10px;
+  min-height: 24px;
+  height: 24px;
+  border-radius: 6px;
+  line-height: 1;
+}
+
 @media (max-width: 900px) {
+  .setup-model-token {
+    cursor: default;
+  }
+
+  .setup-model-token__assign {
+    display: flex;
+    gap: 4px;
+    margin-top: 8px;
+    flex-wrap: wrap;
+  }
+
   .setup-routing-row {
     grid-template-columns: 1fr;
   }
@@ -584,11 +610,14 @@
     font-size: 11px;
   }
 
+  /* Prevent iOS auto-zoom on focus - must be ≥16px */
   .field input,
   .field textarea,
-  .field select {
-    font-size: 13px;
-    padding: 7px 10px;
+  .field select,
+  .setup-routing-row select,
+  .setup-routing-row input {
+    font-size: 16px;
+    padding: 10px 12px;
   }
 
   .field textarea {
@@ -630,6 +659,29 @@
 
   .setup-model-pool {
     grid-template-columns: 1fr;
+  }
+
+  /* Ensure stat grid is always 2-col on mobile */
+  .stat-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+  }
+
+  /* Collapse log row columns for narrow screens */
+  .status-log-row {
+    grid-template-columns: 72px 52px minmax(0, 1fr);
+  }
+
+  /* Better touch targets for buttons on mobile */
+  .btn {
+    min-height: 40px;
+    touch-action: manipulation;
+  }
+
+  /* Better touch targets for setup section chips */
+  .setup-section-chip {
+    min-height: 36px;
+    touch-action: manipulation;
   }
 }
 
@@ -816,3 +868,51 @@
 .compaction-indicator--complete { color: var(--ok); border-color: rgba(34, 197, 94, 0.35); }
 
 @keyframes compaction-spin { to { transform: rotate(360deg); } }
+
+/* ===========================================
+   Roles Grid (Setup two-card layout)
+   =========================================== */
+
+.roles-grid {
+  display: grid;
+  grid-template-columns: 64px 1fr;
+  gap: 8px;
+  align-items: center;
+  margin-top: 12px;
+}
+
+.roles-grid > span {
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.roles-grid select {
+  border: 1px solid var(--input);
+  background: var(--card);
+  border-radius: var(--radius-md);
+  padding: 8px 36px 8px 10px;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23a1a1aa' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  cursor: pointer;
+  outline: none;
+  box-shadow: inset 0 1px 0 var(--card-highlight);
+  transition: border-color var(--duration-fast) ease, box-shadow var(--duration-fast) ease;
+  width: 100%;
+}
+
+.roles-grid select:focus {
+  border-color: var(--ring);
+  box-shadow: var(--focus-ring);
+}
+
+@media (max-width: 900px) {
+  .roles-grid select {
+    font-size: 16px;
+    padding: 10px 36px 10px 12px;
+  }
+  .roles-grid > span {
+    font-size: 12px;
+  }
+}
