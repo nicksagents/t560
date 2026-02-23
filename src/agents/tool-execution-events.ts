@@ -1,7 +1,8 @@
 import { emitAgentEvent } from "./agent-events.js";
 import { progressMessageForToolStart } from "./tool-progress.js";
 
-const EMIT_SYNTHETIC_PROGRESS = process.env.T560_SYNTH_PROGRESS !== "0";
+// Default OFF. Enable with T560_SYNTH_PROGRESS=1 for low-level tool-start narration.
+const EMIT_SYNTHETIC_PROGRESS = process.env.T560_SYNTH_PROGRESS === "1";
 
 export function handleToolExecutionStart(params: {
   sessionId: string;

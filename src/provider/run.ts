@@ -72,6 +72,16 @@ const DEFAULT_PROVIDER_TIMEOUT_MS = 30_000;
 const MIN_PROVIDER_TIMEOUT_MS = 5_000;
 const MAX_PROVIDER_TIMEOUT_MS = 15 * 60_000;
 const MFA_PENDING_SESSION_MAX = 1024;
+const LIVE_PROGRESS_LINE_MAX = 420;
+const LIVE_PROGRESS_LINES_PER_ROUND = 8;
+const GENERIC_PROGRESS_PATTERNS: RegExp[] = [
+  /^i am using the latest findings(?: to choose the next step)?\.?$/i,
+  /^using the latest findings(?: to choose the next step)?\.?$/i,
+  /^i am (?:continuing|proceeding|working) (?:on|with) (?:the )?(?:task|request|analysis)\.?$/i,
+  /^i will continue from here\.?$/i,
+  /^working on it\.?$/i,
+  /^analyzing(?: request)?(?: and planning)?(?: tool steps)?\.?$/i,
+];
 
 type PendingMfaSession = {
   service?: string;
@@ -180,6 +190,89 @@ function flattenAssistantMessage(message: AssistantMessage): FlattenedMessage {
     thinking: thinkingParts.length > 0 ? thinkingParts.join("\n").trim() : null,
     toolCalls
   };
+}
+
+function clipProgressText(value: string, max = LIVE_PROGRESS_LINE_MAX): string {
+  const compact = value.replace(/\s+/g, " ").trim();
+  if (!compact) {
+    return "";
+  }
+  if (compact.length <= max) {
+    return compact;
+  }
+
+  const punctuationCut = Math.max(
+    compact.lastIndexOf(". ", max),
+    compact.lastIndexOf("! ", max),
+    compact.lastIndexOf("? ", max),
+  );
+  if (punctuationCut >= Math.floor(max * 0.55)) {
+    return compact.slice(0, punctuationCut + 1).trim();
+  }
+
+  const wordCut = compact.lastIndexOf(" ", max - 1);
+  const cutAt = wordCut >= Math.floor(max * 0.55) ? wordCut : max - 1;
+  return `${compact.slice(0, cutAt).trim()}.`;
+}
+
+function cleanProgressLine(value: string): string {
+  return String(value ?? "")
+    .replace(/^[\s>*\-•↳🧠]+/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function hasConcreteProgressDetail(value: string): boolean {
+  const text = value.toLowerCase();
+  if (/https?:\/\//i.test(value)) {
+    return true;
+  }
+  if (/\b[a-z0-9.-]+\.[a-z]{2,}(?:\/\S*)?\b/i.test(value)) {
+    return true;
+  }
+  if (/["“”'][^"“”']{2,}["“”']/.test(value)) {
+    return true;
+  }
+  if (/[/$][A-Za-z0-9_.\-\\/]+/.test(value)) {
+    return true;
+  }
+  if (/\b\d+(?:\.\d+)?%?\b/.test(value)) {
+    return true;
+  }
+  return /\b(page|site|url|file|folder|path|title|price|value|result|results|entry|entries|line|lines|error|code|mfa|login|logout|source|sources|dashboard|portfolio)\b/.test(
+    text,
+  );
+}
+
+function isGenericProgressLine(value: string): boolean {
+  const text = cleanProgressLine(value).toLowerCase();
+  if (!text) {
+    return true;
+  }
+  if (text.length < 16) {
+    return true;
+  }
+  if (GENERIC_PROGRESS_PATTERNS.some((pattern) => pattern.test(text))) {
+    return true;
+  }
+  if (!hasConcreteProgressDetail(text)) {
+    return /\b(working|checking|looking|continuing|proceeding|planning|thinking|using|handling)\b/.test(text);
+  }
+  return false;
+}
+
+function selectAssistantProgressText(raw: string): string | null {
+  const lines = String(raw ?? "")
+    .split(/\n+/)
+    .map((line) => cleanProgressLine(line))
+    .filter(Boolean);
+  for (const line of lines) {
+    if (isGenericProgressLine(line)) {
+      continue;
+    }
+    return line;
+  }
+  return null;
 }
 
 function getModelsSafe(provider: KnownProvider): string[] {
@@ -585,6 +678,190 @@ function parseJsonRecord(content: string): Record<string, unknown> | null {
     // ignore
   }
   return null;
+}
+
+function shortUrlForProgress(raw: string): string {
+  const value = String(raw ?? "").trim();
+  if (!value) {
+    return "";
+  }
+  try {
+    const parsed = new URL(value);
+    const host = parsed.hostname.replace(/^www\./i, "");
+    const first = parsed.pathname.split("/").filter(Boolean)[0] ?? "";
+    return first ? `${host}/${first.slice(0, 24)}` : host;
+  } catch {
+    return value.length > 72 ? `${value.slice(0, 69)}...` : value;
+  }
+}
+
+function firstSentence(text: string, max = 180): string {
+  const compact = String(text ?? "").replace(/\s+/g, " ").trim();
+  if (!compact) {
+    return "";
+  }
+  const punct = compact.search(/[.!?](\s|$)/);
+  const base = punct >= 0 ? compact.slice(0, punct + 1).trim() : compact;
+  if (base.length <= max) {
+    return base;
+  }
+  const cut = base.lastIndexOf(" ", max - 1);
+  const end = cut >= Math.floor(max * 0.6) ? cut : max - 1;
+  return `${base.slice(0, end).trim()}...`;
+}
+
+function summarizeArgsForProgress(toolName: string, args: unknown): string | null {
+  const params =
+    args && typeof args === "object" ? (args as Record<string, unknown>) : {};
+  const url = String(params.url ?? params.targetUrl ?? "").trim();
+  const query = String(params.query ?? "").trim();
+  const path = String(params.path ?? "").trim();
+  const service = String(params.service ?? "").trim();
+  const action = String(params.action ?? "").trim().toLowerCase();
+  const command = String(params.command ?? "").trim();
+
+  if (toolName === "browser") {
+    if (action === "login" && service) {
+      return `I'm attempting sign-in for ${service} now.`;
+    }
+    if (action === "mfa") {
+      return "I'm submitting the one-time code and checking whether access is granted.";
+    }
+    if (query) {
+      return `I'm searching for "${query}" to find the strongest source.`;
+    }
+    if (url) {
+      return `I'm opening ${shortUrlForProgress(url)} and checking the relevant details.`;
+    }
+    if (action === "snapshot") {
+      return "I'm capturing the current page state so I can target the right next click.";
+    }
+    if (action === "click") {
+      return "I'm clicking the selected page element and checking where it leads.";
+    }
+    if (action === "fill") {
+      return "I'm filling the visible form field and then validating the page response.";
+    }
+    if (action === "submit") {
+      return "I'm submitting the current form and checking whether the next page confirms success.";
+    }
+    if (action === "open") {
+      return "I'm loading the requested page and checking what is visible there.";
+    }
+    return null;
+  }
+  if (toolName === "web_search") {
+    if (query) {
+      return `I'm searching for "${query}" and evaluating the top sources.`;
+    }
+    return null;
+  }
+  if (toolName === "web_fetch") {
+    if (url) {
+      return `I'm reading ${shortUrlForProgress(url)} for concrete details.`;
+    }
+    return null;
+  }
+  if (toolName === "read" && path) {
+    return `I'm opening ${path} to inspect what it contains.`;
+  }
+  if ((toolName === "find" || toolName === "ls" || toolName === "exists") && path) {
+    return `I'm checking ${path} to locate the right file or data.`;
+  }
+  if ((toolName === "write" || toolName === "edit") && path) {
+    return `I'm updating ${path} and then verifying the change.`;
+  }
+  if (toolName === "exec" && command) {
+    return `I'm running a workspace command and checking the output: ${firstSentence(command, 120)}`;
+  }
+  if (toolName === "process") {
+    return "I'm checking the background task state and output.";
+  }
+  return null;
+}
+
+function summarizeOutcomeForProgress(params: {
+  toolName: string;
+  content: string;
+  isError: boolean;
+}): string | null {
+  if (params.isError) {
+    const err = summarizeToolContent(params.content);
+    if (params.toolName === "browser") {
+      return `The page interaction failed with: ${err}. I'll try a different navigation path.`;
+    }
+    if (params.toolName === "read" || params.toolName === "write" || params.toolName === "edit") {
+      return `The file step failed with: ${err}. I'll adjust the approach and retry safely.`;
+    }
+    return `That step failed with: ${err}. I'll try a different path.`;
+  }
+
+  const raw = String(params.content ?? "").trim();
+  if (!raw) {
+    return null;
+  }
+  const parsed = parseJsonRecord(raw);
+  if (parsed) {
+    const mfa = getNestedRecord(parsed, "mfa");
+    const requiresMfa =
+      parsed.requiresMfa === true || mfa?.required === true || mfa?.requiresMfa === true;
+    if (requiresMfa) {
+      return "I found that this sign-in requires a one-time code, so I'm waiting for your code.";
+    }
+
+    const snapshot = getNestedRecord(parsed, "snapshot") ?? getNestedRecord(parsed, "openedSnapshot");
+    const snapUrl = String(snapshot?.url ?? getNestedRecord(parsed, "tab")?.url ?? parsed.url ?? "").trim();
+    const snapTitle = String(snapshot?.title ?? getNestedRecord(parsed, "tab")?.title ?? "").trim();
+    if (snapUrl && snapTitle) {
+      return `I reached ${shortUrlForProgress(snapUrl)} and the page shows "${firstSentence(snapTitle, 90)}". I'm now checking whether this matches your target.`;
+    }
+    if (snapUrl) {
+      return `I reached ${shortUrlForProgress(snapUrl)} and captured the latest page state. I'm now validating the key details.`;
+    }
+
+    if (Array.isArray(parsed.results) && parsed.results.length > 0) {
+      const top = parsed.results[0];
+      if (top && typeof top === "object") {
+        const row = top as Record<string, unknown>;
+        const title = firstSentence(String(row.title ?? "").trim(), 90);
+        const url = shortUrlForProgress(String(row.url ?? "").trim());
+        if (title && url) {
+          return `I found several sources; the strongest lead right now is "${title}" on ${url}. I'll verify it before finalizing.`;
+        }
+      }
+      return `I found ${parsed.results.length} potential sources and I'm now verifying the strongest one.`;
+    }
+
+    const readPath = String(parsed.path ?? "").trim();
+    if (readPath && typeof parsed.content === "string") {
+      return `I found ${readPath} and reviewed its contents. I'm now checking it against your request.`;
+    }
+    if (readPath && typeof parsed.bytes === "number") {
+      return `I updated ${readPath} (${parsed.bytes} bytes). I'm now validating the result.`;
+    }
+    if (Array.isArray(parsed.entries)) {
+      return `I checked that location and found ${parsed.entries.length} entries. I'm narrowing to the relevant item now.`;
+    }
+    const fetchedText = String(parsed.text ?? "").trim();
+    if (fetchedText) {
+      const summary = firstSentence(fetchedText, 160);
+      const source = String(parsed.url ?? "").trim();
+      if (source) {
+        return `I pulled details from ${shortUrlForProgress(source)}: ${summary} I'm cross-checking this before finalizing.`;
+      }
+      return `I pulled a concrete detail: ${summary} I'm cross-checking this before finalizing.`;
+    }
+  }
+
+  const summary = firstSentence(raw, 170);
+  if (!summary || isGenericProgressLine(summary)) {
+    return null;
+  }
+  const normalized = /[.!?]$/.test(summary) ? summary : `${summary}.`;
+  if (!hasConcreteProgressDetail(normalized)) {
+    return null;
+  }
+  return `${normalized} I'll validate this against the other evidence next.`;
 }
 
 function getNestedRecord(source: Record<string, unknown>, key: string): Record<string, unknown> | null {
@@ -1004,12 +1281,23 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
     sessionId,
     userMessage: params.message,
   });
-  emitAssistantProgress("Analyzing request and planning tool steps.", "pretool");
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    if (round > 0) {
-      emitAssistantProgress(`Continuing with tool-assisted reasoning (round ${round + 1}/${MAX_TOOL_ROUNDS}).`);
-    }
+    let roundProgressCount = 0;
+    const emitRoundProgress = (text: string, phase: "pretool" | "progress" = "progress") => {
+      if (roundProgressCount >= LIVE_PROGRESS_LINES_PER_ROUND) {
+        return;
+      }
+      const trimmed = clipProgressText(cleanProgressLine(text));
+      if (!trimmed) {
+        return;
+      }
+      if (isGenericProgressLine(trimmed)) {
+        return;
+      }
+      emitAssistantProgress(trimmed, phase);
+      roundProgressCount += 1;
+    };
     const context: Context = {
       systemPrompt,
       tools: finalizationPromptSent ? [] : toolDefinitions,
@@ -1024,9 +1312,15 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
       (block): block is Extract<AssistantMessage["content"][number], { type: "toolCall" }> =>
         block.type === "toolCall"
     );
+    const roundFlattened = flattenAssistantMessage(assistant);
+    if (toolCalls.length > 0 && roundFlattened.text) {
+      const assistantProgress = selectAssistantProgressText(roundFlattened.text);
+      if (assistantProgress) {
+        emitRoundProgress(assistantProgress, round === 0 ? "pretool" : "progress");
+      }
+    }
 
     if (toolCalls.length === 0) {
-      const roundFlattened = flattenAssistantMessage(assistant);
       if (
         looksLikeLoginIntent(params.message) &&
         assistantIsAskingForIdentifier(roundFlattened.text) &&
@@ -1037,7 +1331,6 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
           toolOutcomes,
         });
         if (savedService) {
-          emitAssistantProgress("Saved credentials found for current login site; continuing without asking for email.");
           messages.push({
             role: "user",
             content: [
@@ -1051,7 +1344,6 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
         }
       }
       if (!roundFlattened.text && !emptyReplyRecoveryPromptSent) {
-        emitAssistantProgress("Model returned an empty reply; requesting explicit completion.");
         emptyReplyRecoveryPromptSent = true;
         const emptyRecoveryInstruction =
           forceToolUse && hasLikelyLogoutIntent(params.message)
@@ -1067,7 +1359,6 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
         continue;
       }
       if (!roundFlattened.text && !finalizationPromptSent && allToolCalls.length > 0) {
-        emitAssistantProgress("Tool execution finished; finalizing the user-facing answer.");
         finalizationPromptSent = true;
         messages.push({
           role: "user",
@@ -1078,7 +1369,6 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
         continue;
       }
       if (round === 0 && forceToolUse) {
-        emitAssistantProgress("Request needs verified tool execution before answering.");
         const toolForceInstruction = hasLikelyLogoutIntent(params.message)
           ? buildLogoutToolForceInstruction()
           : "System instruction: this request requires real tool execution. Use tools now and only report verified outcomes from tool results.";
@@ -1097,7 +1387,6 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
           toolOutcomes
         })
       ) {
-        emitAssistantProgress("Primary browser path failed; switching to web recovery flow.");
         recoveryPromptSent = true;
         messages.push({
           role: "user",
@@ -1110,6 +1399,13 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
     }
 
     for (const toolCall of toolCalls) {
+      const argsProgress = summarizeArgsForProgress(
+        String(toolCall.name ?? "").trim().toLowerCase(),
+        toolCall.arguments,
+      );
+      if (argsProgress) {
+        emitRoundProgress(argsProgress, round === 0 ? "pretool" : "progress");
+      }
       allToolCalls.push(toolCall.name);
       let outcome: { isError: boolean; content: string };
       const checkoutDecision = enforceCheckoutWorkflow({
@@ -1188,6 +1484,14 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
         isError: outcome.isError,
         content: outcome.content
       });
+      const progressFromOutcome = summarizeOutcomeForProgress({
+        toolName: String(toolCall.name ?? "").trim().toLowerCase(),
+        content: outcome.content,
+        isError: outcome.isError,
+      });
+      if (progressFromOutcome) {
+        emitRoundProgress(progressFromOutcome);
+      }
       if (String(toolCall.name ?? "").trim().toLowerCase() === "browser") {
         updatePendingMfaStateFromBrowserTool({
           sessionId,
@@ -1247,17 +1551,15 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
     failedToolOutcomes.length > 0
       ? failedToolOutcomes
           .slice(0, 4)
-          .map((entry) => `- ${entry.toolName}: ${summarizeToolContent(entry.content)}`)
+          .map((entry) => `- ${summarizeToolContent(entry.content)}`)
           .join("\n")
       : "";
   const successSummary =
     successfulToolOutcomes.length > 0
-      ? `Successful tool calls: ${successfulToolOutcomes.map((entry) => entry.toolName).join(", ")}`
+      ? `Verified steps completed: ${successfulToolOutcomes.length}`
       : "";
   let message = flattened.text || "";
-  let usedToolOnlyFallback = false;
   if (!flattened.text && allToolCalls.length > 0) {
-    usedToolOnlyFallback = true;
     message = buildToolOnlyFallbackMessage({
       userMessage: params.message,
       successfulToolOutcomes,
@@ -1267,15 +1569,15 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
 
   if (forceToolUse && allToolCalls.length === 0) {
     message = [
-      "I could not complete this action because no tools were executed.",
-      "I will only claim completion after real tool execution confirms results."
+      "I could not complete this action because no verification steps were completed.",
+      "I will only claim completion after direct verification confirms results."
     ].join("\n");
   }
 
   if (!message.trim()) {
     message = allToolCalls.length > 0
       ? [
-          "I completed tool execution but did not receive a final textual summary from the model.",
+          "I completed verification but did not receive a final textual summary from the model.",
           successSummary || null,
         ]
           .filter(Boolean)
@@ -1285,21 +1587,12 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
 
   if (failedToolOutcomes.length > 0 && successfulToolOutcomes.length === 0) {
     const lines = [
-      "I completed this request with tool failures, so you should not trust any unstated success claims.",
-      successSummary || "No successful tool calls were confirmed.",
-      "Tool errors:",
+      "I completed this request with verification failures, so you should not trust any unstated success claims.",
+      successSummary || "No successful verification steps were confirmed.",
+      "Errors:",
       errorSummary
     ];
     message = lines.filter(Boolean).join("\n");
-  } else if (failedToolOutcomes.length > 0 && !usedToolOnlyFallback) {
-    const warning = [
-      "Note: some tool calls failed, but the response is based on successful tool outputs.",
-      successSummary || "",
-      `Failed tools: ${failedToolOutcomes.map((entry) => entry.toolName).join(", ")}`,
-    ]
-      .filter(Boolean)
-      .join("\n");
-    message = [message, warning].filter(Boolean).join("\n\n");
   }
 
   if (checkoutBlockedMessage) {
@@ -1316,7 +1609,7 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
   return {
     message,
     thinking: flattened.thinking,
-    toolCalls: allToolCalls.length > 0 ? allToolCalls : flattened.toolCalls,
+    toolCalls: [],
     provider: typedProvider,
     model: resolvedModelId
   };

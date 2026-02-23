@@ -539,13 +539,6 @@ export function formatTelegramResponse(reply: ChatResponse): string {
     parts.push(`<blockquote expandable>💭 <b>Thinking</b>\n${escaped}</blockquote>`);
   }
 
-  if (reply.toolCalls.length > 0) {
-    const tools = reply.toolCalls
-      .map((name) => `⚡ <code>${escapeHtml(name)}</code>`)
-      .join("\n");
-    parts.push(tools);
-  }
-
   if (reply.message) {
     parts.push(markdownToTelegramHtml(reply.message));
   }
@@ -626,15 +619,7 @@ export function formatWebchatMessage(reply: ChatResponse): {
     ? `<details class="thinking-block"><summary>💭 Thinking</summary><pre class="thinking-content">${escapeHtml(reply.thinking)}</pre></details>`
     : null;
 
-  const toolCallsHtml =
-    reply.toolCalls.length > 0
-      ? reply.toolCalls
-          .map(
-            (name) =>
-              `<div class="tool-call"><span class="tool-icon">⚡</span> <code>${escapeHtml(name)}</code></div>`
-          )
-          .join("")
-      : null;
+  const toolCallsHtml = null;
 
   const html = markdownToWebHtml(reply.message);
   return { html, thinkingHtml, toolCallsHtml, providerInfo: null };

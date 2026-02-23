@@ -378,33 +378,6 @@ export async function runTui(opts: TuiOptions = {}): Promise<void> {
   const unsubscribeEvents = gateway.subscribeEvents({
     sessionId,
     onEvent: (event: AgentEvent) => {
-      if (event.stream === "tool") {
-        const phase = event.data.phase;
-        const toolCallId = event.data.toolCallId;
-        if (!toolCallId) {
-          return;
-        }
-        if (phase === "start") {
-          chatLog.startTool(toolCallId, event.data.name || "tool", event.data.args);
-        } else if (phase === "update") {
-          if (traceMode === "full") {
-            chatLog.updateToolResult(toolCallId, event.data.partialResult, { partial: true });
-          }
-        } else if (phase === "end") {
-          chatLog.updateToolResult(toolCallId, event.data.result, { isError: false });
-        } else if (phase === "error") {
-          chatLog.updateToolResult(
-            toolCallId,
-            event.data.result ?? {
-              content: [{ type: "text", text: event.data.error ?? "tool error" }],
-            },
-            { isError: true },
-          );
-        }
-        requestRender();
-        return;
-      }
-
       if (event.stream === "assistant") {
         if (traceMode === "none") {
           return;
@@ -415,18 +388,6 @@ export async function runTui(opts: TuiOptions = {}): Promise<void> {
         }
         const prefix = event.data.phase === "pretool" ? "🧠" : "↳";
         addSystem(`${prefix} ${text}`);
-        return;
-      }
-
-      if (event.stream === "status") {
-        if (traceMode === "none") {
-          return;
-        }
-        if (event.data.phase === "route") {
-          const slot = event.data.slot ?? "default";
-          const route = `${event.data.provider ?? "?"}/${event.data.model ?? "?"}`;
-          addSystem(`route ${slot} -> ${route}`);
-        }
       }
     },
   });

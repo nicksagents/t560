@@ -45,6 +45,10 @@ type TelegramApiResponse<T> = {
   result: T;
 };
 
+type TelegramProgressRelay = {
+  close: () => Promise<void>;
+};
+
 async function callTelegramApi<T>(
   token: string,
   method: string,
@@ -82,6 +86,121 @@ async function sendTelegramMessage(
     text,
     ...(parseMode ? { parse_mode: parseMode } : {})
   });
+}
+
+function progressTextFromAgentEvent(event: AgentEvent): string | null {
+  if (event.stream === "assistant") {
+    const text = event.data.text.trim();
+    return text || null;
+  }
+  return null;
+}
+
+function createTelegramProgressRelay(params: {
+  token: string;
+  chatId: number;
+  sessionId: string;
+  subscribeEvents?: (params: {
+    sessionId?: string;
+    onEvent: (event: AgentEvent) => void;
+  }) => () => void;
+}): TelegramProgressRelay {
+  if (!params.subscribeEvents) {
+    return {
+      close: async () => {}
+    };
+  }
+
+  const queue: string[] = [];
+  const MAX_PROGRESS_MESSAGES = 8;
+  const BATCH_LINES = 3;
+  let sentCount = 0;
+  let lastText = "";
+  let lastSentAt = 0;
+  let flushTimer: NodeJS.Timeout | null = null;
+  let closed = false;
+  let sendChain: Promise<void> = Promise.resolve();
+
+  const flush = async (): Promise<void> => {
+    if (queue.length === 0 || sentCount >= MAX_PROGRESS_MESSAGES) {
+      queue.length = 0;
+      return;
+    }
+
+    const lines = queue.splice(0, BATCH_LINES);
+    if (lines.length === 0) {
+      return;
+    }
+
+    sentCount += 1;
+    const heading = sentCount === 1 ? "Working update:" : "Update:";
+    const body = lines.map((line) => `- ${line}`).join("\n");
+    const text = `${heading}\n${body}`;
+
+    sendChain = sendChain
+      .then(async () => {
+        await sendTelegramMessage(params.token, params.chatId, text);
+        lastSentAt = Date.now();
+      })
+      .catch(() => {});
+
+    await sendChain;
+
+    if (!closed && queue.length > 0 && sentCount < MAX_PROGRESS_MESSAGES) {
+      flushTimer = setTimeout(() => {
+        void flush();
+      }, 1400);
+    }
+  };
+
+  const scheduleFlush = (): void => {
+    if (flushTimer || closed) {
+      return;
+    }
+    flushTimer = setTimeout(() => {
+      flushTimer = null;
+      void flush();
+    }, 900);
+  };
+
+  const unsubscribe = params.subscribeEvents({
+    sessionId: params.sessionId,
+    onEvent: (event) => {
+      if (closed || sentCount >= MAX_PROGRESS_MESSAGES) {
+        return;
+      }
+      const text = progressTextFromAgentEvent(event);
+      if (!text) {
+        return;
+      }
+      if (text === lastText) {
+        return;
+      }
+      const now = Date.now();
+      if (now - lastSentAt < 450) {
+        return;
+      }
+      lastText = text;
+      queue.push(text);
+      scheduleFlush();
+    }
+  });
+
+  return {
+    close: async () => {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      unsubscribe();
+      if (flushTimer) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+      }
+      await flush();
+      await sendChain.catch(() => {});
+    }
+  };
 }
 
 async function resolveDmPolicy(): Promise<TelegramDmPolicy> {
@@ -250,13 +369,28 @@ export async function startTelegramBridge(opts: TelegramBridgeOptions): Promise<
             continue;
           }
 
-          const reply = await opts.handleMessage({
-            channel: "telegram",
-            message: text,
-            sessionId: `telegram:${chatId}`,
-            externalUserId: String(fromId),
-            receivedAt: Date.now()
+          const sessionId = `telegram:${chatId}`;
+          const progressRelay = createTelegramProgressRelay({
+            token,
+            chatId,
+            sessionId,
+            subscribeEvents: opts.subscribeEvents
           });
+          let reply: ChatResponse | null = null;
+          try {
+            reply = await opts.handleMessage({
+              channel: "telegram",
+              message: text,
+              sessionId,
+              externalUserId: String(fromId),
+              receivedAt: Date.now()
+            });
+          } finally {
+            await progressRelay.close();
+          }
+          if (!reply) {
+            continue;
+          }
           const formatted = formatTelegramResponse(reply);
           await sendTelegramMessage(token, chatId, formatted, "HTML");
         }

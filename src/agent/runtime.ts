@@ -6,7 +6,6 @@ import {
   formatWaitingStatus,
   formatElapsed,
   formatFooter,
-  formatTerminalToolEvent,
 } from "../format/message-formatter.js";
 import { isHeartbeatCheckMessage } from "../gateway/heartbeat.js";
 import { startGatewayRuntime } from "../gateway/runtime.js";
@@ -219,22 +218,26 @@ export async function runAgentRuntime(): Promise<never> {
       terminalRl.prompt();
     };
 
-    const handleToolEvent = (event: AgentEvent) => {
+    const handleAgentEvent = (event: AgentEvent) => {
       if (!terminalBusy) {
         return;
       }
-      const rendered = formatTerminalToolEvent(event);
-      if (!rendered) {
+      if (event.stream !== "assistant") {
         return;
       }
+      const text = event.data.text.trim();
+      if (!text) {
+        return;
+      }
+      const prefix = event.data.phase === "pretool" ? "🧠 " : "↳ ";
       clearWaitingLine();
-      process.stdout.write(`${rendered}\n`);
+      process.stdout.write(`${prefix}${text}\n`);
       restoreWaitingLine();
     };
 
     const unsubscribeEvents = gateway.subscribeEvents({
       sessionId: TERMINAL_SESSION_ID,
-      onEvent: handleToolEvent,
+      onEvent: handleAgentEvent,
     });
 
     promptWithMenu();

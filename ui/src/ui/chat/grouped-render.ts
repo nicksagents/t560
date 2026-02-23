@@ -1,6 +1,5 @@
 import type { ChatMessage } from "../app.js";
 import { renderMarkdown, detectDirection } from "../markdown.js";
-import { renderToolCards } from "./tool-cards.js";
 import { renderCopyButton } from "./copy-as-markdown.js";
 
 export interface MessageGroup {
@@ -34,11 +33,6 @@ export function renderMessageGroup(group: MessageGroup, showThinking: boolean): 
     // Thinking block
     if (showThinking && msg.thinking) {
       html += `<div class="chat-thinking">${renderMarkdown(msg.thinking)}</div>`;
-    }
-
-    // Tool cards
-    if (msg.toolCalls.length > 0) {
-      html += renderToolCards(msg.toolCalls);
     }
 
     // Message content

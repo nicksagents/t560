@@ -2,6 +2,120 @@ import { GatewayBrowserClient } from "./gateway.js";
 import type { T560App } from "./app.js";
 import { uuid } from "./uuid.js";
 
+type LiveProgressState = {
+  messageId: string | null;
+  lines: string[];
+  lastLine: string;
+  lastAt: number;
+};
+
+const progressByHost = new WeakMap<T560App, LiveProgressState>();
+
+function getLiveProgressState(host: T560App): LiveProgressState {
+  const existing = progressByHost.get(host);
+  if (existing) {
+    return existing;
+  }
+  const created: LiveProgressState = {
+    messageId: null,
+    lines: [],
+    lastLine: "",
+    lastAt: 0,
+  };
+  progressByHost.set(host, created);
+  return created;
+}
+
+function resetLiveProgressState(host: T560App): void {
+  progressByHost.set(host, {
+    messageId: null,
+    lines: [],
+    lastLine: "",
+    lastAt: 0,
+  });
+}
+
+function summarizeAgentEvent(event: any): string | null {
+  if (!event || typeof event !== "object") {
+    return null;
+  }
+
+  if (event.stream === "assistant") {
+    const text = typeof event.data?.text === "string" ? event.data.text.trim() : "";
+    return text || null;
+  }
+  return null;
+}
+
+function pushLiveProgress(host: T560App, line: string): void {
+  const text = line.trim();
+  if (!text) {
+    return;
+  }
+
+  const now = Date.now();
+  const state = getLiveProgressState(host);
+  if (text === state.lastLine && now - state.lastAt < 5000) {
+    return;
+  }
+  if (now - state.lastAt < 450) {
+    return;
+  }
+
+  state.lastLine = text;
+  state.lastAt = now;
+  state.lines = [...state.lines, text].slice(-8);
+  const content = `**Working update**\n${state.lines.map((entry) => `- ${entry}`).join("\n")}`;
+
+  if (!state.messageId) {
+    state.messageId = uuid();
+    host.chatMessages = [
+      ...host.chatMessages,
+      {
+        id: state.messageId,
+        role: "assistant",
+        content,
+        thinking: null,
+        toolCalls: [],
+        timestamp: now,
+        provider: null,
+        model: null,
+      },
+    ];
+    progressByHost.set(host, state);
+    return;
+  }
+
+  const idx = host.chatMessages.findIndex((msg) => msg.id === state.messageId);
+  if (idx < 0) {
+    state.messageId = uuid();
+    host.chatMessages = [
+      ...host.chatMessages,
+      {
+        id: state.messageId,
+        role: "assistant",
+        content,
+        thinking: null,
+        toolCalls: [],
+        timestamp: now,
+        provider: null,
+        model: null,
+      },
+    ];
+    progressByHost.set(host, state);
+    return;
+  }
+
+  const updated = [...host.chatMessages];
+  updated[idx] = {
+    ...updated[idx],
+    content,
+    timestamp: now,
+  };
+  host.chatMessages = updated;
+  progressByHost.set(host, state);
+}
+
 /** Connect the gateway WebSocket and wire events to the app */
 export function connectGateway(host: T560App): void {
   // Determine WebSocket URL from current location
@@ -79,11 +193,13 @@ function handleGatewayEvent(host: T560App, event: string, payload: any): void {
     }
     case "chat.sending": {
       host.chatSending = true;
+      resetLiveProgressState(host);
       break;
     }
     case "chat.done": {
       host.chatSending = false;
       host.chatLoading = false;
+      resetLiveProgressState(host);
       // Flush queue
       if (host.chatQueue.length > 0) {
         const next = host.chatQueue[0];
@@ -92,9 +208,17 @@ function handleGatewayEvent(host: T560App, event: string, payload: any): void {
       }
       break;
     }
+    case "agent.event": {
+      const line = summarizeAgentEvent(payload);
+      if (line) {
+        pushLiveProgress(host, line);
+      }
+      break;
+    }
     case "chat.error": {
       host.chatSending = false;
       host.chatLoading = false;
+      resetLiveProgressState(host);
       const errMsg = payload?.message ?? "An error occurred";
       host.chatMessages = [
         ...host.chatMessages,
