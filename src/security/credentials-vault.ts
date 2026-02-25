@@ -7,13 +7,17 @@ const VAULT_VERSION = 1;
 const VAULT_AAD = Buffer.from("t560-credentials-vault-v1", "utf-8");
 
 export type SetupService = string;
-export type CredentialAuthMode = "password" | "passwordless_mfa_code";
+export type CredentialAuthMode = "password" | "password_with_mfa" | "passwordless_mfa_code";
+export type CredentialMfaStrategy = "user_prompt" | "email_or_user";
 
 type StoredCredentialRecord = {
   service: SetupService;
   identifier: string;
   secret: string;
   authMode: CredentialAuthMode;
+  websiteUrl?: string | null;
+  mfaStrategy?: CredentialMfaStrategy;
+  mfaSourceService?: SetupService | null;
   mfaCode?: string | null;
   createdAt: number;
   updatedAt: number;
@@ -37,10 +41,69 @@ export type CredentialRecord = {
   identifier: string;
   secret: string;
   authMode: CredentialAuthMode;
+  websiteUrl?: string | null;
+  mfaStrategy?: CredentialMfaStrategy;
+  mfaSourceService?: SetupService | null;
   mfaCode?: string | null;
   createdAt: number;
   updatedAt: number;
 };
+
+function inferMailboxServiceCandidatesFromIdentifier(identifier: string): string[] {
+  const value = String(identifier ?? "").trim().toLowerCase();
+  const at = value.lastIndexOf("@");
+  if (at < 0 || at === value.length - 1) {
+    return [];
+  }
+  const domain = value.slice(at + 1).trim();
+  if (!domain) {
+    return [];
+  }
+  if (domain === "gmail.com" || domain === "googlemail.com") {
+    return ["mail.google.com", "email"];
+  }
+  if (
+    domain === "outlook.com" ||
+    domain === "hotmail.com" ||
+    domain === "live.com" ||
+    domain === "msn.com"
+  ) {
+    return ["outlook.office.com", "outlook.live.com", "email"];
+  }
+  if (domain === "yahoo.com" || domain.endsWith(".yahoo.com")) {
+    return ["mail.yahoo.com", "email"];
+  }
+  if (domain === "icloud.com" || domain === "me.com" || domain === "mac.com") {
+    return ["icloud.com", "email"];
+  }
+  return ["email"];
+}
+
+function inferMfaSourceServiceFromIdentifier(params: {
+  identifier: string;
+  records: Partial<Record<SetupService, StoredCredentialRecord>>;
+}): SetupService | null {
+  const targetIdentifier = String(params.identifier ?? "").trim().toLowerCase();
+  if (!targetIdentifier) {
+    return null;
+  }
+  const candidates = inferMailboxServiceCandidatesFromIdentifier(params.identifier);
+  for (const candidate of candidates) {
+    const normalized = normalizeSetupService(candidate);
+    if (!normalized) {
+      continue;
+    }
+    const mailbox = params.records[normalized];
+    if (!mailbox) {
+      continue;
+    }
+    const mailboxIdentifier = String(mailbox.identifier ?? "").trim().toLowerCase();
+    if (mailboxIdentifier === targetIdentifier) {
+      return normalized;
+    }
+  }
+  return null;
+}
 
 export function normalizeSetupService(input: string): SetupService | null {
   const value = String(input ?? "").trim().toLowerCase();
@@ -55,7 +118,7 @@ export function normalizeSetupService(input: string): SetupService | null {
   }
 
   // Allow generic site/service setup keys:
-  // - bare slugs: havenvaults2-0
+  // - bare slugs: my-service
   // - domains: amazon.ca
   // - full URLs: https://example.com/login
   let candidate = value;
@@ -114,7 +177,17 @@ function normalizeStore(raw: unknown): VaultStore {
       const secret = String(entry.secret ?? "");
       const authModeRaw = String(entry.authMode ?? "").trim().toLowerCase();
       const authMode: CredentialAuthMode =
-        authModeRaw === "passwordless_mfa_code" ? "passwordless_mfa_code" : "password";
+        authModeRaw === "passwordless_mfa_code" || authModeRaw === "passwordless"
+          ? "passwordless_mfa_code"
+          : authModeRaw === "password_with_mfa" || authModeRaw === "password+mfa" || authModeRaw === "mfa_password"
+            ? "password_with_mfa"
+            : "password";
+      const websiteUrlRaw = String(entry.websiteUrl ?? "").trim();
+      const websiteUrl = websiteUrlRaw.length > 0 ? websiteUrlRaw : null;
+      const mfaStrategyRaw = String(entry.mfaStrategy ?? "").trim().toLowerCase();
+      const mfaStrategy: CredentialMfaStrategy =
+        mfaStrategyRaw === "email_or_user" ? "email_or_user" : "user_prompt";
+      const mfaSourceService = normalizeSetupService(String(entry.mfaSourceService ?? ""));
       const mfaCodeRaw = entry.mfaCode;
       const mfaCode =
         typeof mfaCodeRaw === "string" && mfaCodeRaw.trim().length > 0 ? mfaCodeRaw.trim() : null;
@@ -129,6 +202,9 @@ function normalizeStore(raw: unknown): VaultStore {
         identifier,
         secret,
         authMode,
+        ...(websiteUrl ? { websiteUrl } : {}),
+        ...(authMode !== "password" ? { mfaStrategy } : {}),
+        ...(authMode !== "password" && mfaSourceService ? { mfaSourceService } : {}),
         ...(mfaCode ? { mfaCode } : {}),
         createdAt: Number.isFinite(createdAt) && createdAt > 0 ? Math.floor(createdAt) : Date.now(),
         updatedAt: Number.isFinite(updatedAt) && updatedAt > 0 ? Math.floor(updatedAt) : Date.now(),
@@ -290,6 +366,9 @@ export async function setCredential(params: {
   identifier: string;
   secret: string;
   authMode?: CredentialAuthMode;
+  websiteUrl?: string | null;
+  mfaStrategy?: CredentialMfaStrategy;
+  mfaSourceService?: string | null;
   mfaCode?: string | null;
 }): Promise<{ service: SetupService; created: boolean }> {
   const workspaceDir = path.resolve(params.workspaceDir ?? process.cwd());
@@ -299,10 +378,17 @@ export async function setCredential(params: {
   }
   const identifier = String(params.identifier ?? "").trim();
   const authMode: CredentialAuthMode =
-    params.authMode === "passwordless_mfa_code" ? "passwordless_mfa_code" : "password";
+    params.authMode === "passwordless_mfa_code"
+      ? "passwordless_mfa_code"
+      : params.authMode === "password_with_mfa"
+        ? "password_with_mfa"
+        : "password";
+  const websiteUrlRaw = String(params.websiteUrl ?? "").trim();
+  const websiteUrl = websiteUrlRaw.length > 0 ? websiteUrlRaw : "";
+  const mfaSourceService = normalizeSetupService(String(params.mfaSourceService ?? ""));
   const rawSecret = String(params.secret ?? "");
   const secret =
-    authMode === "password"
+    authMode === "password" || authMode === "password_with_mfa"
       ? rawSecret
       : rawSecret.trim().length > 0
         ? rawSecret
@@ -311,17 +397,38 @@ export async function setCredential(params: {
   if (!identifier) {
     throw new Error("Identifier is required.");
   }
-  if (authMode === "password" && !secret) {
+  if ((authMode === "password" || authMode === "password_with_mfa") && !secret) {
     throw new Error("Secret is required.");
   }
   const { key, store } = await readVaultStore(workspaceDir);
   const now = Date.now();
   const existing = store.records[service];
+  const existingWebsiteUrl = String(existing?.websiteUrl ?? "").trim();
+  const existingMfaSourceService = normalizeSetupService(String(existing?.mfaSourceService ?? ""));
+  const inferredMfaSourceService = inferMfaSourceServiceFromIdentifier({
+    identifier,
+    records: store.records,
+  });
+  const resolvedWebsiteUrl = websiteUrl || existingWebsiteUrl;
+  const resolvedMfaSourceService = mfaSourceService || existingMfaSourceService || inferredMfaSourceService;
+  const resolvedMfaStrategy: CredentialMfaStrategy =
+    authMode === "password"
+      ? "user_prompt"
+      : params.mfaStrategy === "email_or_user"
+        ? "email_or_user"
+        : resolvedMfaSourceService
+          ? "email_or_user"
+          : String(existing?.mfaStrategy ?? "").trim().toLowerCase() === "email_or_user"
+            ? "email_or_user"
+            : "user_prompt";
   store.records[service] = {
     service,
     identifier,
     secret,
     authMode,
+    ...(resolvedWebsiteUrl ? { websiteUrl: resolvedWebsiteUrl } : {}),
+    ...(authMode !== "password" ? { mfaStrategy: resolvedMfaStrategy } : {}),
+    ...(authMode !== "password" && resolvedMfaSourceService ? { mfaSourceService: resolvedMfaSourceService } : {}),
     ...(mfaCode ? { mfaCode } : {}),
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
@@ -352,6 +459,9 @@ export async function getCredential(params: {
     identifier: record.identifier,
     secret: record.secret,
     authMode: record.authMode,
+    ...(record.websiteUrl ? { websiteUrl: record.websiteUrl } : {}),
+    ...(record.mfaStrategy ? { mfaStrategy: record.mfaStrategy } : {}),
+    ...(record.mfaSourceService ? { mfaSourceService: record.mfaSourceService } : {}),
     ...(record.mfaCode ? { mfaCode: record.mfaCode } : {}),
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,

@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { cancel, confirm, isCancel } from "@clack/prompts";
 import { readOnboardingStatus } from "../config/state.js";
 import { runRuntimePreflight } from "../config/runtime-preflight.js";
+import { collectCpuSamples, stopProcesses } from "./cpu-preflight.js";
 import { printBanner } from "./banner.js";
 import { stylePromptMessage, stylePromptTitle } from "./prompt-style.js";
 import { isRich, theme } from "./theme.js";
@@ -134,6 +135,39 @@ async function runStartupPreflight(command: string): Promise<boolean> {
   return false;
 }
 
+async function runStartupCpuPreflight(command: string): Promise<void> {
+  if (command !== "tui") {
+    return;
+  }
+
+  const observed = collectCpuSamples(12);
+  const staleT560 = observed.filter((sample) => sample.isT560 && sample.pid !== process.pid);
+  if (staleT560.length === 0) {
+    return;
+  }
+
+  process.stderr.write(
+    `Detected running t560 process(es): ${staleT560.map((entry) => String(entry.pid)).join(", ")}\n`,
+  );
+
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    process.stderr.write("Cannot prompt in non-interactive mode; continuing without auto-stop.\n");
+    return;
+  }
+
+  const shouldStop = await promptYesNo("Stop existing t560 process(es) now?", true);
+  if (!shouldStop) {
+    return;
+  }
+
+  const stopped = await stopProcesses(staleT560.map((entry) => entry.pid));
+  if (stopped.length > 0) {
+    process.stdout.write(`Stopped t560 process(es): ${stopped.join(", ")}\n`);
+  } else {
+    process.stderr.write("Could not confirm t560 process stop; startup may remain unstable.\n");
+  }
+}
+
 export async function runCli(argv: string[]): Promise<void> {
   const command = argv[2] ?? "tui";
   const version = await resolveVersion();
@@ -141,6 +175,10 @@ export async function runCli(argv: string[]): Promise<void> {
 
   if (command === "help" || command === "--help" || command === "-h") {
     printHelp();
+    return;
+  }
+  if (command === "version" || command === "--version" || command === "-v") {
+    process.stdout.write(`${version}\n`);
     return;
   }
 
@@ -188,6 +226,8 @@ export async function runCli(argv: string[]): Promise<void> {
   if (!process.env.T560_WEB_HOST?.trim()) {
     process.env.T560_WEB_HOST = "0.0.0.0";
   }
+
+  await runStartupCpuPreflight(command);
 
   const onboardingReady = await maybeRunStartupOnboarding(command);
   if (!onboardingReady) {

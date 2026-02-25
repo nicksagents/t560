@@ -12,6 +12,8 @@ import { isHeartbeatCheckMessage } from "../gateway/heartbeat.js";
 import type { AgentEvent } from "../agents/agent-events.js";
 import { isPairingApproved, requestPairingCode } from "./pairing.js";
 import { clearSessionMessages } from "../provider/session.js";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 
 export type TelegramBridge = {
   enabled: boolean;
@@ -89,6 +91,86 @@ async function sendTelegramMessage(
   });
 }
 
+function imageMimeTypeFromPath(filePath: string): string {
+  const ext = path.extname(filePath).trim().toLowerCase();
+  if (ext === ".jpg" || ext === ".jpeg") {
+    return "image/jpeg";
+  }
+  if (ext === ".webp") {
+    return "image/webp";
+  }
+  return "image/png";
+}
+
+async function sendTelegramPhotoFromPath(params: {
+  token: string;
+  chatId: number;
+  filePath: string;
+  caption?: string;
+}): Promise<void> {
+  const bytes = await readFile(params.filePath);
+  const body = new FormData();
+  body.set("chat_id", String(params.chatId));
+  body.set(
+    "photo",
+    new Blob([bytes], { type: imageMimeTypeFromPath(params.filePath) }),
+    path.basename(params.filePath) || "captcha.png",
+  );
+  if (params.caption?.trim()) {
+    body.set("caption", params.caption.trim());
+  }
+  const url = `https://api.telegram.org/bot${params.token}/sendPhoto`;
+  const response = await fetch(url, {
+    method: "POST",
+    body,
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Telegram API sendPhoto failed: ${response.status} ${text}`);
+  }
+  const data = (await response.json()) as TelegramApiResponse<unknown>;
+  if (!data.ok) {
+    throw new Error("Telegram API sendPhoto returned ok=false");
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  return null;
+}
+
+function parseToolResultRecord(result: unknown): Record<string, unknown> | null {
+  const direct = asRecord(result);
+  if (direct) {
+    return direct;
+  }
+  if (typeof result !== "string") {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(result);
+    return asRecord(parsed);
+  } catch {
+    return null;
+  }
+}
+
+function extractScreenshotPathFromToolResult(result: unknown): string | null {
+  const parsed = parseToolResultRecord(result);
+  if (!parsed) {
+    return null;
+  }
+  const screenshot = asRecord(parsed.screenshot);
+  const fromScreenshot = String(screenshot?.path ?? "").trim();
+  if (fromScreenshot) {
+    return fromScreenshot;
+  }
+  const fromRoot = String(parsed.path ?? "").trim();
+  return fromRoot || null;
+}
+
 function progressTextFromAgentEvent(event: AgentEvent): string | null {
   if (event.stream === "assistant") {
     const text = event.data.text.trim();
@@ -121,6 +203,13 @@ function createTelegramProgressRelay(params: {
   let flushTimer: NodeJS.Timeout | null = null;
   let closed = false;
   let sendChain: Promise<void> = Promise.resolve();
+  const captchaScreenshotToolCalls = new Set<string>();
+
+  const enqueueSend = (fn: () => Promise<void>): void => {
+    sendChain = sendChain
+      .then(fn)
+      .catch(() => {});
+  };
 
   const flush = async (): Promise<void> => {
     if (queue.length === 0 || sentCount >= MAX_PROGRESS_MESSAGES) {
@@ -138,13 +227,10 @@ function createTelegramProgressRelay(params: {
     const body = lines.map((line) => `- ${line}`).join("\n");
     const text = `${heading}\n${body}`;
 
-    sendChain = sendChain
-      .then(async () => {
-        await sendTelegramMessage(params.token, params.chatId, text);
-        lastSentAt = Date.now();
-      })
-      .catch(() => {});
-
+    enqueueSend(async () => {
+      await sendTelegramMessage(params.token, params.chatId, text);
+      lastSentAt = Date.now();
+    });
     await sendChain;
 
     if (!closed && queue.length > 0 && sentCount < MAX_PROGRESS_MESSAGES) {
@@ -167,7 +253,73 @@ function createTelegramProgressRelay(params: {
   const unsubscribe = params.subscribeEvents({
     sessionId: params.sessionId,
     onEvent: (event) => {
-      if (closed || sentCount >= MAX_PROGRESS_MESSAGES) {
+      if (closed) {
+        return;
+      }
+      if (event.stream === "tool") {
+        const toolName = String(event.data.name ?? "").trim().toLowerCase();
+        const phase = event.data.phase;
+        if (toolName === "browser" && phase === "start") {
+          const args = asRecord(event.data.args) ?? {};
+          const action = String(args.action ?? "")
+            .trim()
+            .toLowerCase()
+            .replace(/-/g, "_");
+          const reason = String(args.reason ?? "").trim().toLowerCase();
+          const challengeReason = /\b(captcha|challenge|human[-_\s]?verification)\b/.test(reason);
+          if (action === "screenshot" && challengeReason) {
+            captchaScreenshotToolCalls.add(event.data.toolCallId);
+          }
+          return;
+        }
+        if (toolName !== "browser" || (phase !== "end" && phase !== "error")) {
+          return;
+        }
+        const tracked = captchaScreenshotToolCalls.has(event.data.toolCallId);
+        if (!tracked) {
+          return;
+        }
+        captchaScreenshotToolCalls.delete(event.data.toolCallId);
+        if (phase === "error") {
+          enqueueSend(async () => {
+            await sendTelegramMessage(
+              params.token,
+              params.chatId,
+              "Captcha challenge detected, but screenshot capture failed. Solve it on the site and send me any code shown.",
+            );
+          });
+          return;
+        }
+        const screenshotPath = extractScreenshotPathFromToolResult(event.data.result);
+        if (!screenshotPath) {
+          enqueueSend(async () => {
+            await sendTelegramMessage(
+              params.token,
+              params.chatId,
+              "Captcha challenge detected, but no screenshot file path was returned. Solve it on the site and send me any code shown.",
+            );
+          });
+          return;
+        }
+        enqueueSend(async () => {
+          try {
+            await sendTelegramPhotoFromPath({
+              token: params.token,
+              chatId: params.chatId,
+              filePath: screenshotPath,
+              caption: "Captcha challenge detected. Solve it and send me any visible code.",
+            });
+          } catch {
+            await sendTelegramMessage(
+              params.token,
+              params.chatId,
+              `Captcha challenge detected. I could not upload the image from ${screenshotPath}. Solve it on the site and send me any code shown.`,
+            );
+          }
+        });
+        return;
+      }
+      if (sentCount >= MAX_PROGRESS_MESSAGES) {
         return;
       }
       const text = progressTextFromAgentEvent(event);

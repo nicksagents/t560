@@ -23,7 +23,7 @@ const CHECKOUT_KEYWORDS =
   /\b(add to cart|buy now|checkout|place order|submit order|confirm order|purchase|pay now|payment|one[-\s]?click)\b/i;
 const CHECKOUT_URL_HINT =
   /(amazon\.[a-z.]+\/(gp\/buy|checkout|cart)|\/checkout|\/cart|\/buy-now|\/place-order|\/payment)/i;
-const CHECKOUT_ACTIONS = new Set(["click", "submit", "act"]);
+const CHECKOUT_ACTIONS = new Set(["click", "submit", "act", "press"]);
 const CONFIRM_REGEX =
   /\b(confirm|approved?|yes)\b.{0,20}\b(order|purchase|checkout|buy|payment)\b|\bt560\s+confirm\s+purchase\b/i;
 const CANCEL_REGEX = /\b(cancel|abort|stop)\b.{0,20}\b(order|purchase|checkout|buy|payment)\b/i;
@@ -70,6 +70,9 @@ function collectCheckoutHints(args: Record<string, unknown>): string[] {
   push(args.element);
   push(args.linkText);
   push(args.hrefContains);
+  push(args.currentUrl);
+  push(args.currentPageUrl);
+  push(args.tabUrl);
   push(args.ref);
   push(args.inputRef);
   const request = args.request;
@@ -82,6 +85,8 @@ function collectCheckoutHints(args: Record<string, unknown>): string[] {
     push(req.inputRef);
     push(req.url);
     push(req.targetUrl);
+    push(req.currentUrl);
+    push(req.currentPageUrl);
     push(req.text);
   }
   return out;
@@ -99,6 +104,12 @@ function detectCheckoutRisk(toolName: string, args: unknown): CheckoutRisk | nul
   const action = compact(record.action).toLowerCase();
   if (!CHECKOUT_ACTIONS.has(action)) {
     return null;
+  }
+  if (action === "press") {
+    const key = compact(record.key).toLowerCase();
+    if (key !== "enter" && key !== "return") {
+      return null;
+    }
   }
   const hints = collectCheckoutHints(record);
   const joined = hints.join(" | ");

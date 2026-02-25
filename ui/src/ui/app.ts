@@ -21,9 +21,9 @@ import {
 import type { SetupProviderCatalogEntry, SetupProviderState, SetupVaultEntry } from "./app-setup.js";
 import {
   assignSetupRouteModel,
-  assignSetupRouteFromProvider,
   deleteSetupProvider,
   deleteVaultCredential,
+  fetchSetupLocalProviderModels,
   loadSetupState,
   refreshVault,
   saveSetupProvider,
@@ -147,9 +147,15 @@ export class T560App extends LitElement {
   @state() setupTelegramAllowFrom = "";
   @state() setupTelegramAllowedChatIds = "";
   @state() setupVaultEntries: SetupVaultEntry[] = [];
+  @state() setupVaultAccountType: "email" | "site" = "site";
+  @state() setupVaultEmailProvider = "gmail";
+  @state() setupVaultEmailSecretKind: "password" | "app_password" = "app_password";
+  @state() setupVaultWebsiteUrl = "";
   @state() setupVaultService = "";
   @state() setupVaultIdentifier = "";
   @state() setupVaultAuthMode = "password";
+  @state() setupVaultMfaStrategy = "user_prompt";
+  @state() setupVaultMfaSourceService = "";
   @state() setupVaultSecret = "";
   @state() setupVaultMfaCode = "";
 
@@ -498,6 +504,9 @@ export class T560App extends LitElement {
         case "save-setup-provider":
           void saveSetupProvider(this);
           break;
+        case "fetch-setup-provider-models":
+          void fetchSetupLocalProviderModels(this);
+          break;
         case "start-setup-provider-draft":
           startSetupProviderDraft(this);
           break;
@@ -505,17 +514,6 @@ export class T560App extends LitElement {
           const provider = actionEl.getAttribute("data-provider");
           if (provider) {
             void deleteSetupProvider(this, provider);
-          }
-          break;
-        }
-        case "assign-setup-route-provider": {
-          const provider = actionEl.getAttribute("data-provider");
-          const slot = actionEl.getAttribute("data-slot");
-          if (
-            provider &&
-            (slot === "default" || slot === "planning" || slot === "coding")
-          ) {
-            void assignSetupRouteFromProvider(this, slot, provider);
           }
           break;
         }
@@ -614,6 +612,28 @@ export class T560App extends LitElement {
             }
           })();
           break;
+        case "fetch-cc-setup-token":
+          void (async () => {
+            if (this.setupLoading || this.setupSaving) return;
+            this.setupCcTokenStatus = "loading";
+            this.setupCcTokenMessage = "";
+            try {
+              const res = await fetch("/api/setup/cc-setup-token");
+              const data = await res.json() as { ok: boolean; token?: string; error?: string };
+              if (data.ok && data.token) {
+                this.setupProviderCredential = data.token;
+                this.setupCcTokenStatus = "ok";
+                this.setupCcTokenMessage = "Setup token generated. Click Save Provider to apply.";
+              } else {
+                this.setupCcTokenStatus = "error";
+                this.setupCcTokenMessage = data.error ?? "Could not generate setup token.";
+              }
+            } catch {
+              this.setupCcTokenStatus = "error";
+              this.setupCcTokenMessage = "Request failed — server may not be running.";
+            }
+          })();
+          break;
         case "select-setup-section": {
           const section = actionEl.getAttribute("data-section");
           if (
@@ -636,6 +656,58 @@ export class T560App extends LitElement {
           if (service) {
             void deleteVaultCredential(this, service);
           }
+          break;
+        }
+        case "edit-vault-credential": {
+          const service = (actionEl.getAttribute("data-service") ?? "").trim();
+          const websiteUrl = (actionEl.getAttribute("data-website-url") ?? "").trim();
+          const authMode = (actionEl.getAttribute("data-auth-mode") ?? "").trim();
+          const mfaStrategy = (actionEl.getAttribute("data-mfa-strategy") ?? "").trim();
+          const mfaSourceService = (actionEl.getAttribute("data-mfa-source-service") ?? "").trim();
+          if (!service) {
+            break;
+          }
+          this.setupVaultWebsiteUrl = websiteUrl;
+          this.setupVaultService = service;
+          const providerFromWebsite = (() => {
+            const url = websiteUrl.toLowerCase();
+            if (url.includes("mail.google.com") || url.includes("gmail.com")) return "gmail";
+            if (url.includes("outlook.live.com") || url.includes("outlook.office.com")) return "outlook";
+            if (url.includes("mail.yahoo.com")) return "yahoo";
+            if (url.includes("mail.proton.me") || url.includes("protonmail.com")) return "proton";
+            if (url.includes("icloud.com")) return "icloud";
+            return "custom";
+          })();
+          const looksLikeEmailAccount =
+            providerFromWebsite !== "custom" ||
+            service === "mail.google.com" ||
+            service === "outlook.live.com" ||
+            service === "outlook.office.com" ||
+            service === "mail.yahoo.com" ||
+            service === "mail.proton.me" ||
+            service === "icloud.com";
+          this.setupVaultAccountType = looksLikeEmailAccount ? "email" : "site";
+          this.setupVaultEmailProvider = providerFromWebsite;
+          if (looksLikeEmailAccount) {
+            this.setupVaultEmailSecretKind =
+              authMode === "password_with_mfa" ? "password" : "app_password";
+          }
+          this.setupVaultAuthMode =
+            authMode === "passwordless_mfa_code"
+              ? "passwordless_mfa_code"
+              : authMode === "password_with_mfa"
+                ? "password_with_mfa"
+                : "password";
+          this.setupVaultMfaStrategy = mfaStrategy === "email_or_user" ? "email_or_user" : "user_prompt";
+          this.setupVaultMfaSourceService = mfaSourceService;
+          this.setupVaultIdentifier = "";
+          this.setupVaultSecret = "";
+          this.setupVaultMfaCode = "";
+          this.setupNotice = {
+            kind: "info",
+            message:
+              `Editing ${service}. Leave Identifier blank to reuse the stored identifier, then save your updated credential/MFA settings.`,
+          };
           break;
         }
       }
@@ -822,24 +894,25 @@ export class T560App extends LitElement {
         return;
       }
       if (inputName === "setup-provider-models") {
-        this.setupProviderModels = textarea.value;
+        // Text input — do NOT update state on every keystroke; state update
+        // would cause a full re-render that destroys the input and closes the
+        // mobile keyboard.  Value is read from the DOM at save time instead.
         return;
       }
       if (inputName === "setup-provider-model-choice") {
+        // Select (no keyboard involved) — safe to update state so the text
+        // input above stays in sync when the user picks from the dropdown.
         this.setupProviderModels = textarea.value.trim();
         return;
       }
       if (inputName === "setup-provider-base-url") {
-        this.setupProviderBaseUrl = textarea.value;
-        return;
+        return; // read from DOM at save time
       }
       if (inputName === "setup-provider-api") {
-        this.setupProviderApi = textarea.value;
-        return;
+        return; // read from DOM at save time
       }
       if (inputName === "setup-provider-credential") {
-        this.setupProviderCredential = textarea.value;
-        return;
+        return; // read from DOM at save time
       }
       if (inputName === "setup-provider-enabled") {
         this.setupProviderEnabled = textarea.value === "true";
@@ -867,39 +940,63 @@ export class T560App extends LitElement {
         return;
       }
       if (inputName === "setup-telegram-token") {
-        this.setupTelegramToken = textarea.value;
-        return;
+        return; // read from DOM at save time
       }
       if (inputName === "setup-telegram-dm-policy") {
-        this.setupTelegramDmPolicy = textarea.value;
+        this.setupTelegramDmPolicy = textarea.value; // select — safe to update state
         return;
       }
       if (inputName === "setup-telegram-allow-from") {
-        this.setupTelegramAllowFrom = textarea.value;
-        return;
+        return; // read from DOM at save time
       }
       if (inputName === "setup-telegram-allowed-chat-ids") {
-        this.setupTelegramAllowedChatIds = textarea.value;
+        return; // read from DOM at save time
+      }
+      if (inputName === "setup-vault-website-url") {
         return;
       }
       if (inputName === "setup-vault-service") {
-        this.setupVaultService = textarea.value;
         return;
       }
       if (inputName === "setup-vault-identifier") {
-        this.setupVaultIdentifier = textarea.value;
+        return;
+      }
+      if (inputName === "setup-vault-account-type") {
+        this.setupVaultAccountType = textarea.value === "email" ? "email" : "site";
+        if (this.setupVaultAccountType === "email") {
+          this.setupVaultAuthMode = "password";
+          this.setupVaultMfaStrategy = "user_prompt";
+          this.setupVaultMfaSourceService = "";
+        }
+        return;
+      }
+      if (inputName === "setup-vault-email-provider") {
+        this.setupVaultEmailProvider = textarea.value.trim();
+        return;
+      }
+      if (inputName === "setup-vault-email-secret-kind") {
+        this.setupVaultEmailSecretKind =
+          textarea.value === "password" ? "password" : "app_password";
         return;
       }
       if (inputName === "setup-vault-auth-mode") {
         this.setupVaultAuthMode = textarea.value;
+        if (this.setupVaultAuthMode === "password" || this.setupVaultAuthMode === "password_with_mfa") {
+          this.setupVaultMfaStrategy = "user_prompt";
+        }
+        return;
+      }
+      if (inputName === "setup-vault-mfa-strategy") {
+        this.setupVaultMfaStrategy = textarea.value;
+        return;
+      }
+      if (inputName === "setup-vault-mfa-source-service") {
         return;
       }
       if (inputName === "setup-vault-secret") {
-        this.setupVaultSecret = textarea.value;
         return;
       }
       if (inputName === "setup-vault-mfa-code") {
-        this.setupVaultMfaCode = textarea.value;
         return;
       }
       if (inputName === "setup-oauth-redirect") {
@@ -908,6 +1005,39 @@ export class T560App extends LitElement {
       }
       if (inputName === "chat-inject-draft") {
         this.chatInjectDraft = textarea.value;
+      }
+    });
+
+    // Keep vault text fields in reactive state on blur/change without re-rendering on every keystroke.
+    this.addEventListener("change", (e: Event) => {
+      const target = e.target as HTMLElement;
+      const inputName = target.getAttribute("data-input");
+      if (!inputName) {
+        return;
+      }
+      const field = target as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+      if (inputName === "setup-vault-website-url") {
+        this.setupVaultWebsiteUrl = field.value;
+        return;
+      }
+      if (inputName === "setup-vault-service") {
+        this.setupVaultService = field.value;
+        return;
+      }
+      if (inputName === "setup-vault-identifier") {
+        this.setupVaultIdentifier = field.value;
+        return;
+      }
+      if (inputName === "setup-vault-secret") {
+        this.setupVaultSecret = field.value;
+        return;
+      }
+      if (inputName === "setup-vault-mfa-source-service") {
+        this.setupVaultMfaSourceService = field.value;
+        return;
+      }
+      if (inputName === "setup-vault-mfa-code") {
+        this.setupVaultMfaCode = field.value;
       }
     });
 

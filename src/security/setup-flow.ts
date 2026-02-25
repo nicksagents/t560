@@ -28,20 +28,17 @@ const pendingBySessionId = new Map<string, PendingSetupState>();
 function usageText(): string {
   return [
     "Secure setup commands:",
-    "- /setup <service-or-site>   (examples: /setup email, /setup x.com, /setup havenvaults2-0)",
+    "- /setup <service-or-site>   (example: /setup example.com or /setup https://example.com/login)",
     "- /setup list",
     "- /setup clear <service-or-site>",
     "- /setup cancel",
-    "- /setup mode password|mfa    (only during active setup flow)",
+    "- /setup mode password|password+mfa|mfa    (only during active setup flow)",
   ].join("\n");
 }
 
 function promptForIdentifier(service: SetupService): string {
-  if (service === "email") {
-    return "Setup email: enter the email address for this account.";
-  }
-  if (service === "x.com") {
-    return "Setup x.com: enter your X username or email.";
+  if (service === "email" || service.startsWith("mail.")) {
+    return `Setup ${service}: enter the email address for this mailbox account.`;
   }
   return `Setup ${service}: enter the login identifier (email/username).`;
 }
@@ -50,8 +47,9 @@ function promptForAuthMode(service: SetupService): string {
   return [
     `Setup ${service}: choose auth mode.`,
     "- Type: password",
+    "- Type: password+mfa (password plus one-time code)",
     "- Type: mfa (passwordless MFA code)",
-    "You can also use: /setup mode password  or  /setup mode mfa",
+    "You can also use: /setup mode password  or  /setup mode password+mfa  or  /setup mode mfa",
   ].join("\n");
 }
 
@@ -63,24 +61,15 @@ function promptForSecret(service: SetupService, authMode: CredentialAuthMode): s
       "You can provide fresh MFA codes later during login flows.",
     ].join("\n");
   }
-  if (service === "email") {
-    return "Setup email: enter the app password (preferred) or account password.";
+  if (service === "email" || service.startsWith("mail.")) {
+    return `Setup ${service}: enter the app password or mailbox secret. It is stored securely and never echoed back.`;
   }
-  if (service === "x.com") {
-    return "Setup x.com: enter your password.";
-  }
-  return `Setup ${service}: enter your password.`;
+  return `Setup ${service}: enter your password or secret. It is stored securely and never echoed back.`;
 }
 
 function completionText(service: SetupService, authMode: CredentialAuthMode): string {
   if (authMode === "passwordless_mfa_code") {
     return `Saved secure credentials for ${service}. Auth mode=passwordless MFA code.`;
-  }
-  if (service === "email") {
-    return "Saved secure credentials for email. The browser login action can now use service=email without exposing the password.";
-  }
-  if (service === "x.com") {
-    return "Saved secure credentials for x.com. The browser login action can now use service=x.com without exposing the password.";
   }
   return `Saved secure credentials for ${service}.`;
 }
@@ -96,6 +85,14 @@ function normalizeAuthMode(input: string): CredentialAuthMode | null {
   }
   if (value === "password" || value === "pass" || value === "pwd") {
     return "password";
+  }
+  if (
+    value === "password+mfa" ||
+    value === "password_with_mfa" ||
+    value === "password-and-mfa" ||
+    value === "mfa_required"
+  ) {
+    return "password_with_mfa";
   }
   if (
     value === "mfa" ||
@@ -195,7 +192,7 @@ async function handleSlashSetupCommand(params: {
     if (!authMode) {
       return {
         handled: true,
-        message: "Usage: /setup mode password|mfa",
+        message: "Usage: /setup mode password|password+mfa|mfa",
       };
     }
     pending.authMode = authMode;
@@ -266,7 +263,7 @@ async function handlePendingSetupInput(params: {
     if (!authMode) {
       return {
         handled: true,
-        message: "Invalid auth mode. Type password or mfa. (or /setup mode password|mfa)",
+        message: "Invalid auth mode. Type password, password+mfa, or mfa. (or /setup mode password|password+mfa|mfa)",
       };
     }
     pending.authMode = authMode;
@@ -289,16 +286,24 @@ async function handlePendingSetupInput(params: {
   const authMode = pending.authMode ?? "password";
   const mfaCode =
     authMode === "passwordless_mfa_code" && value.toLowerCase() !== "skip" ? value : "";
-  const secret = authMode === "password" ? raw : "";
+  const secret = authMode === "password" || authMode === "password_with_mfa" ? raw : "";
 
-  await setCredential({
-    workspaceDir: params.workspaceDir,
-    service: pending.service,
-    identifier,
-    secret,
-    authMode,
-    ...(mfaCode ? { mfaCode } : {}),
-  });
+  try {
+    await setCredential({
+      workspaceDir: params.workspaceDir,
+      service: pending.service,
+      identifier,
+      secret,
+      authMode,
+      ...(mfaCode ? { mfaCode } : {}),
+    });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      handled: true,
+      message: `Could not save secure credentials yet: ${message}`,
+    };
+  }
   pendingBySessionId.delete(params.sessionId);
   return {
     handled: true,

@@ -190,6 +190,70 @@ function normalizeWebFetchResult(result: unknown): unknown {
   };
 }
 
+function normalizeEmailMessage(entry: unknown): Record<string, unknown> | null {
+  if (!entry || typeof entry !== "object") {
+    return null;
+  }
+  const row = entry as Record<string, unknown>;
+  return {
+    sequence: toNumberValue(row.sequence, 0),
+    uid: toNumberValue(row.uid, 0),
+    subject: toStringValue(row.subject).trim(),
+    from: toStringValue(row.from).trim(),
+    to: toStringValue(row.to).trim(),
+    date: toStringValue(row.date).trim(),
+    snippet: toStringValue(row.snippet),
+    messageId: toStringValue(row.messageId).trim(),
+    inReplyTo: toStringValue(row.inReplyTo).trim(),
+    threadKey: toStringValue(row.threadKey).trim(),
+    references: Array.isArray(row.references)
+      ? row.references.map((value) => toStringValue(value).trim()).filter(Boolean)
+      : [],
+    flags: Array.isArray(row.flags)
+      ? row.flags.map((value) => toStringValue(value).trim()).filter(Boolean)
+      : [],
+    size: toNumberValue(row.size, 0),
+  };
+}
+
+function normalizeEmailResult(result: unknown): unknown {
+  if (!result || typeof result !== "object") {
+    return result;
+  }
+  const row = result as Record<string, unknown>;
+  const messages = Array.isArray(row.messages)
+    ? row.messages
+        .map((entry) => normalizeEmailMessage(entry))
+        .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
+    : [];
+  return {
+    ...row,
+    ok: toBooleanValue(row.ok, false),
+    action: toStringValue(row.action).trim(),
+    service: toStringValue(row.service).trim(),
+    provider: toStringValue(row.provider).trim(),
+    reason: toStringValue(row.reason).trim(),
+    nextStep: toStringValue(row.nextStep).trim(),
+    loginUrl: toStringValue(row.loginUrl).trim(),
+    requiresBrowserLogin: toBooleanValue(row.requiresBrowserLogin, false),
+    count: toNumberValue(row.count, messages.length),
+    acceptedCount: toNumberValue(row.acceptedCount, 0),
+    messages,
+    accepted: Array.isArray(row.accepted)
+      ? row.accepted.map((value) => toStringValue(value).trim()).filter(Boolean)
+      : [],
+    to: Array.isArray(row.to)
+      ? row.to.map((value) => toStringValue(value).trim()).filter(Boolean)
+      : [],
+    cc: Array.isArray(row.cc)
+      ? row.cc.map((value) => toStringValue(value).trim()).filter(Boolean)
+      : [],
+    bcc: Array.isArray(row.bcc)
+      ? row.bcc.map((value) => toStringValue(value).trim()).filter(Boolean)
+      : [],
+  };
+}
+
 export function applyToolResultContract(toolName: string, result: unknown): unknown {
   const normalizedName = String(toolName ?? "").trim().toLowerCase();
   if (normalizedName === "browser") {
@@ -200,6 +264,9 @@ export function applyToolResultContract(toolName: string, result: unknown): unkn
   }
   if (normalizedName === "web_fetch") {
     return normalizeWebFetchResult(result);
+  }
+  if (normalizedName === "email") {
+    return normalizeEmailResult(result);
   }
   return result;
 }

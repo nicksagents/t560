@@ -102,11 +102,11 @@ const CATALOG: ProviderCatalogEntry[] = [
   },
   {
     id: "local-openai",
-    label: "Local OpenAI",
-    description: "Self-hosted OpenAI-compatible model endpoint",
+    label: "Local Model",
+    description: "Local AI server: llama.cpp, exo, ollama, or any OpenAI-compatible endpoint on your machine",
     authModes: ["api_key"],
     authHint:
-      "Use any non-empty key if your local server ignores auth. You will be prompted for endpoint URL.",
+      "Enter your server URL (e.g. http://127.0.0.1:8080/v1 for llama.cpp, http://127.0.0.1:52415/v1 for exo, http://127.0.0.1:11434/v1 for ollama). API key is optional — most local servers don't require one.",
     models: ["local-model"],
     defaultModel: "local-model",
     planningModel: "local-model",
@@ -115,9 +115,10 @@ const CATALOG: ProviderCatalogEntry[] = [
   {
     id: "anthropic",
     label: "Anthropic",
-    description: "Claude models",
-    authModes: ["api_key", "oauth", "token"],
-    authHint: "Use API key, OAuth token, or setup token depending on your Anthropic account/workflow.",
+    description: "Claude models via Claude Code CLI auth token or API key",
+    authModes: ["token", "api_key", "oauth"],
+    authHint:
+      "Recommended: get a Claude Code auth token by running 'claude setup-token' in your terminal (requires Claude Code CLI installed and logged in via 'claude auth login'). Or use an API key from console.anthropic.com/settings/keys.",
     models: ["claude-sonnet-4-5", "claude-opus-4-6"],
     defaultModel: "claude-sonnet-4-5",
     planningModel: "claude-sonnet-4-5",

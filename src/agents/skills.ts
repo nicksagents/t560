@@ -53,7 +53,7 @@ export async function resolveSkillsPromptForRun(
   }
 
   const entries = await readdir(skillsRoot, { withFileTypes: true });
-  const summaries: Array<{ name: string; description: string }> = [];
+  const summaries: Array<{ name: string; description: string; location: string }> = [];
 
   for (const entry of entries) {
     if (!entry.isDirectory()) {
@@ -62,7 +62,11 @@ export async function resolveSkillsPromptForRun(
     const skillPath = path.join(skillsRoot, entry.name, "SKILL.md");
     try {
       const raw = await readFile(skillPath, "utf-8");
-      summaries.push(parseSkillSummary(raw, entry.name));
+      const parsed = parseSkillSummary(raw, entry.name);
+      summaries.push({
+        ...parsed,
+        location: skillPath,
+      });
     } catch {
       // Skip unreadable skills.
     }
@@ -74,7 +78,7 @@ export async function resolveSkillsPromptForRun(
 
   const lines = ["<available_skills>"];
   for (const summary of summaries.slice(0, 20)) {
-    lines.push(`- ${summary.name}: ${summary.description}`);
+    lines.push(`- ${summary.name}: ${summary.description} (file: ${summary.location})`);
   }
   lines.push("</available_skills>");
   return lines.join("\n");

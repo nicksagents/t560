@@ -28,15 +28,18 @@ if [[ ! -d "$ROOT_DIR/node_modules" ]]; then
   exit 1
 fi
 
-TSX_LOADER="$ROOT_DIR/node_modules/tsx/dist/loader.mjs"
-if [[ ! -f "$TSX_LOADER" ]]; then
-  echo "t560 error: tsx loader not found at: $TSX_LOADER" >&2
-  echo "Run: bash \"$ROOT_DIR/install.sh\"" >&2
-  exit 1
+ENTRY_JS="$ROOT_DIR/dist/bin/t560.js"
+if [[ ! -f "$ENTRY_JS" ]]; then
+  echo "[t560] Runtime bundle missing. Building server runtime..."
+  if ! (cd "$ROOT_DIR" && npm run build:server); then
+    echo "t560 error: failed to build runtime bundle." >&2
+    echo "Run: cd \"$ROOT_DIR\" && npm run build" >&2
+    exit 1
+  fi
 fi
 
 # Normalize cwd to a known-good directory so Node tooling does not fail
 # when invoked from a stale/deleted shell working directory.
 cd "$ROOT_DIR"
 
-exec node --import "$TSX_LOADER" "$ROOT_DIR/src/bin/t560.ts" "$@"
+exec node "$ENTRY_JS" "$@"

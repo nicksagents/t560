@@ -3,7 +3,7 @@ import type { AnyAgentTool } from "../pi-tools.types.js";
 import { duckDuckGoSearch } from "../../web/duckduckgo_search.js";
 import { chooseReadableText, decodeHtmlEntities } from "../../web/fetch.js";
 import { extractEcommerceCandidates, pickCheapestCandidate } from "../ecommerce.js";
-import { getCredential, normalizeSetupService } from "../../security/credentials-vault.js";
+import { getCredential, listConfiguredServices, normalizeSetupService } from "../../security/credentials-vault.js";
 import { mkdtemp, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -24,6 +24,7 @@ const LIVE_ENGINE_USER_AGENT =
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) t560-browser-live/1.0 Safari/537.36";
 const LIVE_CONSOLE_MAX_ENTRIES = 400;
 const LIVE_DIALOG_MAX_EVENTS = 80;
+const LIVE_DOWNLOAD_MAX_ENTRIES = 80;
 
 type BrowserEngineMode = "fetch" | "live";
 
@@ -53,6 +54,17 @@ type LiveDialogEvent = {
   message: string;
   defaultValue: string;
   handled: string;
+};
+
+type LiveDownloadEntry = {
+  time: number;
+  url: string;
+  suggestedFilename: string;
+  path: string;
+  bytes: number;
+  mimeType: string;
+  status: "saved" | "failed";
+  error?: string;
 };
 
 type ExternalLaunchResult = {
@@ -124,6 +136,10 @@ type BrowserTab = {
   forms: BrowserForm[];
   formValues: Record<number, Record<string, string>>;
   cookies: Record<string, string>;
+  /** Snapshot of the page's localStorage at last sync. */
+  localStorage: Record<string, string>;
+  /** Snapshot of the page's sessionStorage at last sync. */
+  sessionStorage: Record<string, string>;
 };
 
 type BrowserState = {
@@ -148,6 +164,7 @@ const liveMetaByTabId = new Map<string, LivePageMeta>();
 const liveConsoleByTabId = new Map<string, LiveConsoleEntry[]>();
 const liveDialogPlansByTabId = new Map<string, LiveDialogPlan>();
 const liveDialogEventsByTabId = new Map<string, LiveDialogEvent[]>();
+const liveDownloadsByTabId = new Map<string, LiveDownloadEntry[]>();
 
 function clampInt(value: unknown, min: number, max: number, fallback: number): number {
   const n = Number(value);
@@ -235,6 +252,48 @@ function pushLiveDialogEvent(tabId: string, entry: LiveDialogEvent): void {
   liveDialogEventsByTabId.set(tabId, boundedPush(rows, entry, LIVE_DIALOG_MAX_EVENTS));
 }
 
+function sanitizeDownloadFilename(value: string): string {
+  const raw = String(value ?? "").trim();
+  const fallback = `download-${Date.now()}`;
+  const candidate = raw || fallback;
+  const base = path.basename(candidate).replace(/[^\w.\-]+/g, "_");
+  return base || fallback;
+}
+
+function pushLiveDownload(tabId: string, entry: LiveDownloadEntry): void {
+  const rows = liveDownloadsByTabId.get(tabId) ?? [];
+  liveDownloadsByTabId.set(tabId, boundedPush(rows, entry, LIVE_DOWNLOAD_MAX_ENTRIES));
+}
+
+function serializeDownloadEntry(entry: LiveDownloadEntry): Record<string, unknown> {
+  return {
+    time: entry.time,
+    url: entry.url,
+    suggestedFilename: entry.suggestedFilename,
+    path: entry.path,
+    bytes: entry.bytes,
+    mimeType: entry.mimeType,
+    status: entry.status,
+    error: entry.error ?? "",
+  };
+}
+
+async function waitForNewDownloadEntries(params: {
+  tabId: string;
+  beforeCount: number;
+  timeoutMs: number;
+}): Promise<LiveDownloadEntry[]> {
+  const deadline = Date.now() + Math.max(0, params.timeoutMs);
+  while (Date.now() <= deadline) {
+    const rows = liveDownloadsByTabId.get(params.tabId) ?? [];
+    if (rows.length > params.beforeCount) {
+      return rows.slice(params.beforeCount);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 120));
+  }
+  return [];
+}
+
 function attachLivePage(tabId: string, page: any): void {
   livePagesByTabId.set(tabId, page);
   if (!liveConsoleByTabId.has(tabId)) {
@@ -242,6 +301,9 @@ function attachLivePage(tabId: string, page: any): void {
   }
   if (!liveDialogEventsByTabId.has(tabId)) {
     liveDialogEventsByTabId.set(tabId, []);
+  }
+  if (!liveDownloadsByTabId.has(tabId)) {
+    liveDownloadsByTabId.set(tabId, []);
   }
   if (typeof page?.on === "function") {
     page.on("console", (msg: any) => {
@@ -299,6 +361,49 @@ function attachLivePage(tabId: string, page: any): void {
         });
       }
     });
+    page.on("download", async (download: any) => {
+      const suggestedFilename = sanitizeDownloadFilename(String(download?.suggestedFilename?.() ?? ""));
+      const downloadUrl = String(download?.url?.() ?? "");
+      const tempDir = await mkdtemp(path.join(os.tmpdir(), "t560-browser-download-")).catch(() => null);
+      if (!tempDir) {
+        pushLiveDownload(tabId, {
+          time: Date.now(),
+          url: downloadUrl,
+          suggestedFilename,
+          path: "",
+          bytes: 0,
+          mimeType: "",
+          status: "failed",
+          error: "could not create temp directory for download",
+        });
+        return;
+      }
+      const targetPath = path.join(tempDir, suggestedFilename);
+      try {
+        await download.saveAs(targetPath);
+        const info = await stat(targetPath).catch(() => ({ size: 0 }));
+        pushLiveDownload(tabId, {
+          time: Date.now(),
+          url: downloadUrl,
+          suggestedFilename,
+          path: targetPath,
+          bytes: Number(info?.size ?? 0) || 0,
+          mimeType: "",
+          status: "saved",
+        });
+      } catch (error) {
+        pushLiveDownload(tabId, {
+          time: Date.now(),
+          url: downloadUrl,
+          suggestedFilename,
+          path: targetPath,
+          bytes: 0,
+          mimeType: "",
+          status: "failed",
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    });
     page.on("close", () => {
       if (livePagesByTabId.get(tabId) === page) {
         livePagesByTabId.delete(tabId);
@@ -307,6 +412,7 @@ function attachLivePage(tabId: string, page: any): void {
       liveConsoleByTabId.delete(tabId);
       liveDialogPlansByTabId.delete(tabId);
       liveDialogEventsByTabId.delete(tabId);
+      liveDownloadsByTabId.delete(tabId);
     });
   }
 }
@@ -331,6 +437,7 @@ async function closeLiveTab(tabId: string): Promise<void> {
   liveConsoleByTabId.delete(tabId);
   liveDialogPlansByTabId.delete(tabId);
   liveDialogEventsByTabId.delete(tabId);
+  liveDownloadsByTabId.delete(tabId);
   if (!page) {
     return;
   }
@@ -465,6 +572,19 @@ function normalizeBrowserActionParams(input: Record<string, unknown>): Record<st
     params.ref = inputRef;
   }
 
+  if (params.networkIdle === undefined && params.network_idle !== undefined) {
+    params.networkIdle = params.network_idle;
+  }
+  if (params.networkIdleTimeoutMs === undefined && params.network_idle_timeout_ms !== undefined) {
+    params.networkIdleTimeoutMs = params.network_idle_timeout_ms;
+  }
+  if (params.networkIdleTimeoutMs === undefined && params.networkIdleTimeout !== undefined) {
+    params.networkIdleTimeoutMs = params.networkIdleTimeout;
+  }
+  if (params.networkIdleTimeoutMs === undefined && params.network_idle_timeout !== undefined) {
+    params.networkIdleTimeoutMs = params.network_idle_timeout;
+  }
+
   const request = params.request;
   if (request && typeof request === "object" && !Array.isArray(request)) {
     const req = request as Record<string, unknown>;
@@ -596,6 +716,39 @@ function normalizeBrowserActionParams(input: Record<string, unknown>): Record<st
     }
     if (params.waitForSelector === undefined && req.waitForSelector !== undefined) {
       params.waitForSelector = req.waitForSelector;
+    }
+    if (params.networkIdle === undefined && req.networkIdle !== undefined) {
+      params.networkIdle = req.networkIdle;
+    }
+    if (params.networkIdle === undefined && req.network_idle !== undefined) {
+      params.networkIdle = req.network_idle;
+    }
+    if (params.networkIdleTimeoutMs === undefined && req.networkIdleTimeoutMs !== undefined) {
+      params.networkIdleTimeoutMs = req.networkIdleTimeoutMs;
+    }
+    if (params.networkIdleTimeoutMs === undefined && req.network_idle_timeout_ms !== undefined) {
+      params.networkIdleTimeoutMs = req.network_idle_timeout_ms;
+    }
+    if (params.networkIdleTimeoutMs === undefined && req.networkIdleTimeout !== undefined) {
+      params.networkIdleTimeoutMs = req.networkIdleTimeout;
+    }
+    if (params.networkIdleTimeoutMs === undefined && req.network_idle_timeout !== undefined) {
+      params.networkIdleTimeoutMs = req.network_idle_timeout;
+    }
+    if (params.waitForRequestUrl === undefined && req.waitForRequestUrl !== undefined) {
+      params.waitForRequestUrl = req.waitForRequestUrl;
+    }
+    if (params.waitForRequestMethod === undefined && req.waitForRequestMethod !== undefined) {
+      params.waitForRequestMethod = req.waitForRequestMethod;
+    }
+    if (params.waitForStatus === undefined && req.waitForStatus !== undefined) {
+      params.waitForStatus = req.waitForStatus;
+    }
+    if (params.waitForRequestBodyIncludes === undefined && req.waitForRequestBodyIncludes !== undefined) {
+      params.waitForRequestBodyIncludes = req.waitForRequestBodyIncludes;
+    }
+    if (params.waitForResponseBodyIncludes === undefined && req.waitForResponseBodyIncludes !== undefined) {
+      params.waitForResponseBodyIncludes = req.waitForResponseBodyIncludes;
     }
     if (params.urlContains === undefined && req.urlContains !== undefined) {
       params.urlContains = req.urlContains;
@@ -1105,6 +1258,8 @@ function buildTabRecord(url: string): BrowserTab {
     forms: [],
     formValues: {},
     cookies: {},
+    localStorage: {},
+    sessionStorage: {},
   };
 }
 
@@ -1211,6 +1366,7 @@ function serializeTab(tab: BrowserTab): Record<string, unknown> {
     formsCount: tab.forms.length,
     cookieCount: Object.keys(tab.cookies).length,
     consoleCount: (liveConsoleByTabId.get(tab.id) ?? []).length,
+    downloadCount: (liveDownloadsByTabId.get(tab.id) ?? []).length,
     dialogArmed: liveDialogPlansByTabId.has(tab.id),
   };
 }
@@ -1414,31 +1570,17 @@ async function buildLiveActionRefs(page: any): Promise<Array<{
       }
       return raw.replace(/[^a-zA-Z0-9_-]/g, "\\\\$&");
     };
-    const cssPath = (node) => {
-      const element = node;
-      const id = String(element.id ?? "").trim();
-      if (id) {
-        return "#" + cssEscape(id);
+    const refAttr = "data-t560-ref-id";
+    const sessionPrefix = "t560-" + Date.now().toString(36);
+    let refCounter = 1;
+    const ensureStableSelector = (element) => {
+      let refId = String(element.getAttribute(refAttr) || "").trim();
+      if (!refId) {
+        refId = sessionPrefix + "-" + String(refCounter++);
+        element.setAttribute(refAttr, refId);
       }
-      const parts = [];
-      let current = element;
-      let depth = 0;
-      while (current && current.tagName && current.tagName.toLowerCase() !== "html" && depth < 8) {
-        const tag = current.tagName.toLowerCase();
-        const parent = current.parentElement;
-        if (!parent) {
-          parts.unshift(tag);
-          break;
-        }
-        const siblings = Array.from(parent.children).filter((entry) => entry.tagName === current.tagName);
-        const index = siblings.indexOf(current) + 1;
-        parts.unshift(tag + ":nth-of-type(" + index + ")");
-        current = parent;
-        depth += 1;
-      }
-      return parts.join(" > ");
+      return "[" + refAttr + '="' + cssEscape(refId) + '"]';
     };
-
     const normalize = (value) => String(value ?? "").replace(/\\s+/g, " ").trim();
     const bySelector = new Set();
     const forms = Array.from(document.querySelectorAll("form"));
@@ -1456,11 +1598,31 @@ async function buildLiveActionRefs(page: any): Promise<Array<{
     }
 
     const rows = [];
-    const candidates = Array.from(
-      document.querySelectorAll(
-        'a[href],button,input,select,textarea,[role="button"],[role="link"],[role="textbox"],[role="combobox"],[contenteditable="true"]',
-      ),
-    );
+    const seenElements = new Set();
+    const candidateSelector =
+      'a[href],button,input,select,textarea,[role="button"],[role="link"],[role="textbox"],[role="combobox"],[contenteditable="true"]';
+    const roots = [document];
+    const seenRoots = new Set([document]);
+    const candidates = [];
+    while (roots.length > 0) {
+      const root = roots.shift();
+      if (!root || typeof root.querySelectorAll !== "function") {
+        continue;
+      }
+      const found = Array.from(root.querySelectorAll(candidateSelector));
+      for (const node of found) {
+        if (!node || seenElements.has(node)) {
+          continue;
+        }
+        seenElements.add(node);
+        candidates.push(node);
+        const shadow = node.shadowRoot;
+        if (shadow && !seenRoots.has(shadow)) {
+          seenRoots.add(shadow);
+          roots.push(shadow);
+        }
+      }
+    }
 
     for (const element of candidates) {
       const htmlEl = element;
@@ -1470,7 +1632,7 @@ async function buildLiveActionRefs(page: any): Promise<Array<{
         continue;
       }
 
-      const selector = cssPath(element);
+      const selector = ensureStableSelector(element);
       if (!selector || bySelector.has(selector)) {
         continue;
       }
@@ -1480,7 +1642,19 @@ async function buildLiveActionRefs(page: any): Promise<Array<{
       const inputType = tag === "input" ? String(element.type || "text").toLowerCase() : "";
       const explicitRole = String(element.getAttribute("role") || "").toLowerCase();
       const inForm = element.closest("form");
-      const meta = inForm ? formMeta.get(inForm) : null;
+      let meta = inForm ? formMeta.get(inForm) : null;
+      if (!meta && inForm) {
+        const methodRaw = String(inForm.method || "get").toLowerCase();
+        const method = methodRaw === "post" ? "post" : "get";
+        let action = location.href;
+        try {
+          action = new URL(inForm.getAttribute("action") || location.href, location.href).toString();
+        } catch {
+          action = location.href;
+        }
+        meta = { formIndex: formMeta.size + 1, method, action };
+        formMeta.set(inForm, meta);
+      }
       const name = normalize(
         element.getAttribute("aria-label") ||
           (tag === "input" ? element.value : "") ||
@@ -1567,6 +1741,23 @@ async function buildLiveActionRefs(page: any): Promise<Array<{
   }>>(page, script);
 }
 
+/**
+ * Parses a selector that may be prefixed with a frame index ("frame:N:realSelector").
+ * Returns the appropriate Playwright context (page or a specific child frame) and the actual selector.
+ * When no prefix is present, the original page and selector are returned unchanged.
+ */
+function resolveFrameSelector(page: any, selector: string): { context: any; selector: string } {
+  const m = /^frame:(\d+):(.+)$/.exec(selector);
+  if (m) {
+    const idx = parseInt(m[1], 10);
+    const frames: any[] = (page.frames?.() as any[]) ?? [];
+    if (idx >= 0 && idx < frames.length) {
+      return { context: frames[idx], selector: m[2] };
+    }
+  }
+  return { context: page, selector };
+}
+
 function resolveSnapshotRef(tab: BrowserTab, refRaw: unknown): BrowserElementRef | null {
   const wanted = String(refRaw ?? "").trim().toLowerCase();
   if (!wanted) {
@@ -1603,6 +1794,33 @@ async function syncTabCookiesFromLiveContext(tab: BrowserTab, pageUrl: string): 
   }
 }
 
+async function syncTabStorageFromLiveContext(tab: BrowserTab): Promise<void> {
+  const page = getLivePage(tab.id);
+  if (!page) return;
+  try {
+    const storage = await evalPageScript<{ local: Record<string, string>; session: Record<string, string> }>(
+      page,
+      `
+        const snap = (store) => {
+          const out = {};
+          try {
+            for (let i = 0; i < store.length; i++) {
+              const k = store.key(i);
+              if (k !== null) out[k] = store.getItem(k) ?? "";
+            }
+          } catch {}
+          return out;
+        };
+        return { local: snap(localStorage), session: snap(sessionStorage) };
+      `,
+    );
+    tab.localStorage = storage.local ?? {};
+    tab.sessionStorage = storage.session ?? {};
+  } catch {
+    // Best-effort — some pages restrict storage access (e.g. sandboxed iframes).
+  }
+}
+
 async function captureLiveTabSnapshot(tab: BrowserTab, params: Record<string, unknown>): Promise<BrowserSnapshot> {
   const page = getLivePage(tab.id);
   if (!page) {
@@ -1618,6 +1836,15 @@ async function captureLiveTabSnapshot(tab: BrowserTab, params: Record<string, un
     await page.waitForLoadState("domcontentloaded", { timeout: timeoutMs });
   } catch {
     // Continue with best-effort page state for SPA pages that never reach a stable network state.
+  }
+  // If networkIdle is requested (useful for SPAs that fetch data after domcontentloaded),
+  // additionally wait until there are no in-flight network requests for 500 ms.
+  if (params.networkIdle === true) {
+    try {
+      await page.waitForLoadState("networkidle", { timeout: Math.min(Number(params.networkIdleTimeoutMs ?? 0) || 8000, 20000) });
+    } catch {
+      // Best-effort — long-polling or websocket sites never reach networkidle.
+    }
   }
 
   const finalUrl = normalizeHttpUrl(page.url() || tab.url);
@@ -1652,7 +1879,12 @@ async function captureLiveTabSnapshot(tab: BrowserTab, params: Record<string, un
     refs: [],
   };
   const fallbackRefs = buildSnapshotRefs(snapshot, forms);
-  const liveRows = await buildLiveActionRefs(page);
+  const liveRowsRaw = await buildLiveActionRefs(page);
+  // Strip social/OAuth auth buttons from refs so agents cannot accidentally click them.
+  // Only buttons and links are filtered; form fields and submit inputs are kept.
+  const liveRows = liveRowsRaw.filter(
+    (row) => !(row.kind === "button" && isSocialAuthLabel(row.name)),
+  );
   if (liveRows.length > 0) {
     snapshot.refs = liveRows.map((row, idx) => ({
       ref: `e${idx + 1}`,
@@ -1669,6 +1901,54 @@ async function captureLiveTabSnapshot(tab: BrowserTab, params: Record<string, un
     snapshot.refs = fallbackRefs;
   }
 
+  // Detect auth-related iframes (e.g. Privy, Auth0, Clerk) and include their content.
+  // This prevents agents from URL-guessing when the login form lives inside an embedded frame.
+  try {
+    const allFrames = (page.frames?.() as any[]) ?? [];
+    let frameRefBase = snapshot.refs.length;
+    for (let fi = 0; fi < allFrames.length; fi++) {
+      const frame = allFrames[fi];
+      if (!frame || frame === page.mainFrame?.()) continue;
+      const frameUrl = String(frame.url?.() ?? "");
+      if (!frameUrl || frameUrl === "about:blank" || frameUrl.startsWith("data:")) continue;
+      try {
+        const hasAuthInputs = await evalPageScript<boolean>(
+          frame,
+          `
+            const inputs = document.querySelectorAll(
+              'input[type="email"],input[type="password"],input[autocomplete="one-time-code"],' +
+              'input[name*="identifier" i],input[name*="email" i],input[name*="otp" i],input[name*="code" i]'
+            );
+            return inputs.length > 0;
+          `,
+        ).catch(() => false);
+        if (!hasAuthInputs) continue;
+        const frameHtml = String(await frame.content().catch(() => ""));
+        if (!frameHtml) continue;
+        const frameText = trimText(chooseReadableText("text/html", frameHtml), 3000);
+        const frameRows = await buildLiveActionRefs(frame).catch(() => []);
+        const frameRefs = frameRows.map((row, idx) => ({
+          ref: `e${frameRefBase + idx + 1}`,
+          kind: row.kind,
+          role: row.role,
+          name: row.name,
+          selector: `frame:${fi}:${row.selector}`,
+          url: row.url,
+          formIndex: row.formIndex,
+          fieldName: row.fieldName,
+          method: row.method,
+        }));
+        snapshot.text += `\n\n## Embedded Auth Frame (${frameUrl})\n${frameText}`;
+        snapshot.refs = [...snapshot.refs, ...frameRefs];
+        frameRefBase += frameRefs.length;
+      } catch {
+        // Skip inaccessible or broken frames.
+      }
+    }
+  } catch {
+    // page.frames() unavailable — skip iframe detection.
+  }
+
   tab.lastHtml = html;
   tab.forms = forms;
   tab.formValues = buildDefaultFormValues(forms);
@@ -1680,6 +1960,7 @@ async function captureLiveTabSnapshot(tab: BrowserTab, params: Record<string, un
   tab.lastSnapshot = snapshot;
   tab.updatedAt = Date.now();
   await syncTabCookiesFromLiveContext(tab, finalUrl);
+  await syncTabStorageFromLiveContext(tab);
   return snapshot;
 }
 
@@ -1730,12 +2011,127 @@ function escapeCssAttributeValue(value: string): string {
     .replace(/"/g, '\\"');
 }
 
+function normalizeDateInputValue(value: string): string {
+  const raw = String(value ?? "").trim();
+  if (!raw) {
+    return "";
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    return raw;
+  }
+  const parsed = new Date(raw);
+  if (!Number.isFinite(parsed.getTime())) {
+    return raw;
+  }
+  const yyyy = String(parsed.getUTCFullYear()).padStart(4, "0");
+  const mm = String(parsed.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(parsed.getUTCDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+async function fillLiveLocatorWithDateFallback(params: {
+  locator: any;
+  value: string;
+  timeoutMs: number;
+  typeMode: "type" | "fill";
+  slowly: boolean;
+  submit: boolean;
+}): Promise<void> {
+  const normalized = normalizeDateInputValue(params.value);
+  if (params.typeMode === "type") {
+    try {
+      await params.locator.fill("", { timeout: params.timeoutMs });
+    } catch {
+      // continue to fallback typing path
+    }
+  }
+  try {
+    await params.locator.fill(normalized, { timeout: params.timeoutMs });
+    if (params.typeMode === "type" && params.submit) {
+      const submitted = await submitNearestFormFromInput(params.locator, params.timeoutMs);
+      if (!submitted) {
+        throw new Error(
+          "Unable to submit typed form without triggering social/OAuth controls. Use browser action=submit or browser action=login.",
+        );
+      }
+    }
+    return;
+  } catch {
+    // Continue to keyboard and script-based fallback.
+  }
+
+  try {
+    await params.locator.click({ timeout: Math.min(params.timeoutMs, 4000) });
+  } catch {
+    // no-op
+  }
+  try {
+    await params.locator.press("Control+A", { timeout: Math.min(params.timeoutMs, 3000) });
+    await params.locator.type(normalized, {
+      timeout: params.timeoutMs,
+      ...(params.slowly ? { delay: 35 } : {}),
+    });
+    await params.locator.press("Enter", { timeout: Math.min(params.timeoutMs, 3000) });
+  } catch {
+    // Fall through to DOM-level value assignment.
+  }
+  await params.locator.evaluate(
+    (el: any, args: { value: string }) => {
+      const node = el as any;
+      if (!node) {
+        return;
+      }
+      const asInput = node as any;
+      const asDate = String(args.value ?? "");
+      if (typeof asInput.showPicker === "function") {
+        try {
+          asInput.showPicker();
+        } catch {
+          // Some browsers block picker open without user gesture.
+        }
+      }
+      try {
+        asInput.value = asDate;
+      } catch {
+        // Keep best effort behavior.
+      }
+      node.dispatchEvent(new Event("input", { bubbles: true }));
+      node.dispatchEvent(new Event("change", { bubbles: true }));
+      node.dispatchEvent(new Event("blur", { bubbles: true }));
+    },
+    { value: normalized },
+  );
+  if (params.typeMode === "type" && params.submit) {
+    const submitted = await submitNearestFormFromInput(params.locator, params.timeoutMs);
+    if (!submitted) {
+      throw new Error(
+        "Unable to submit typed form without triggering social/OAuth controls. Use browser action=submit or browser action=login.",
+      );
+    }
+  }
+}
+
 async function liveFillFormField(tab: BrowserTab, form: BrowserForm, field: BrowserFormField, value: string): Promise<void> {
   const page = getLivePage(tab.id);
   if (!page) {
     return;
   }
   const selector = `form:nth-of-type(${form.index}) [name="${escapeCssAttributeValue(field.name)}"]`;
+  if (String(field.type ?? "").toLowerCase() === "date") {
+    try {
+      await fillLiveLocatorWithDateFallback({
+        locator: page.locator(selector).first(),
+        value,
+        timeoutMs: DEFAULT_TIMEOUT_MS,
+        typeMode: "fill",
+        slowly: false,
+        submit: false,
+      });
+      return;
+    } catch {
+      // Fall through to generic fill path.
+    }
+  }
   try {
     await page.locator(selector).first().fill(value);
     return;
@@ -1776,14 +2172,20 @@ async function liveSubmitForm(tab: BrowserTab, form: BrowserForm, timeoutMs: num
   if (!page) {
     throw new Error(`live browser page missing for tab ${tab.id}.`);
   }
+  assertNotSocialAuthTarget({
+    label: "",
+    href: form.action,
+    context: "",
+    action: "form submission",
+  });
   const values = tab.formValues[form.index] ?? {};
-  await evalPageScript(
+  const outcome = await evalPageScript<{ submitted: boolean; blockedBySocialSubmit: boolean }>(
     page,
     `
       const forms = Array.from(document.querySelectorAll("form"));
       const formEl = forms[args.formIndex - 1];
       if (!formEl) {
-        return;
+        return { submitted: false, blockedBySocialSubmit: false };
       }
       const entries = Object.entries(args.values || {});
       for (const [name, value] of entries) {
@@ -1796,18 +2198,88 @@ async function liveSubmitForm(tab: BrowserTab, form: BrowserForm, timeoutMs: num
         target.dispatchEvent(new Event("input", { bubbles: true }));
         target.dispatchEvent(new Event("change", { bubbles: true }));
       }
+      const controls = Array.from(formEl.querySelectorAll("button, input[type='submit'], input[type='image']"));
+      let sawSubmitControl = false;
+      for (const control of controls) {
+        if (!control || typeof control !== "object") {
+          continue;
+        }
+        const tagName = String(control.tagName ?? "").trim().toLowerCase();
+        const rawType = String(control.getAttribute?.("type") ?? "").trim().toLowerCase();
+        if (tagName === "button" && rawType && rawType !== "submit") {
+          continue;
+        }
+        sawSubmitControl = true;
+        const label = String(
+          control.getAttribute?.("aria-label") ??
+            control.getAttribute?.("title") ??
+            control.getAttribute?.("name") ??
+            (typeof control.value === "string" ? control.value : "") ??
+            control.textContent ??
+            "",
+        )
+          .replace(/\\s+/g, " ")
+          .trim()
+          .toLowerCase();
+        const href = String(
+          control.getAttribute?.("formaction") ??
+            (typeof control.href === "string" ? control.href : "") ??
+            "",
+        )
+          .trim()
+          .toLowerCase();
+        const context = String(
+          \`\${control.getAttribute?.("id") ?? ""} \${control.getAttribute?.("class") ?? ""} \${control.getAttribute?.("data-testid") ?? ""} \${control.getAttribute?.("data-provider") ?? ""}\`,
+        )
+          .replace(/\\s+/g, " ")
+          .trim()
+          .toLowerCase();
+        const providerSignal = /\\b(google|apple|microsoft|github|facebook|linkedin|twitter|x)\\b/.test(
+          \`\${label} \${context} \${href}\`,
+        );
+        const authSignal = /\\b(sign in|log in|login|oauth|sso|single sign[-\\s]?on|auth)\\b/.test(
+          \`\${label} \${context} \${href}\`,
+        );
+        const social =
+          /\\b(continue|sign in|log in)\\s+with\\b/.test(label) ||
+          /\\b(accounts\\.google\\.com|appleid\\.apple\\.com|microsoftonline\\.com|oauth|sso)\\b/.test(href) ||
+          /\\/auth\\/(google|apple|microsoft|github|facebook|linkedin|twitter|x)\\b/.test(href) ||
+          (providerSignal && authSignal);
+        if (social) {
+          continue;
+        }
+        control.click();
+        return { submitted: true, blockedBySocialSubmit: false };
+      }
+      if (sawSubmitControl) {
+        return { submitted: false, blockedBySocialSubmit: true };
+      }
       if (typeof formEl.requestSubmit === "function") {
         formEl.requestSubmit();
-      } else {
-        formEl.submit();
+        return { submitted: true, blockedBySocialSubmit: false };
       }
+      if (typeof formEl.submit === "function") {
+        formEl.submit();
+        return { submitted: true, blockedBySocialSubmit: false };
+      }
+      return {
+        submitted: formEl.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })),
+        blockedBySocialSubmit: false,
+      };
     `,
     {
       formIndex: form.index,
       values,
     },
   );
-
+  if (outcome?.blockedBySocialSubmit) {
+    throw new Error(
+      "Blocked form submission because only social/OAuth submit controls were detected. Use browser action=login with vault credentials.",
+    );
+  }
+  if (!outcome?.submitted) {
+    throw new Error("Failed to submit live form.");
+  }
   try {
     await page.waitForLoadState("domcontentloaded", { timeout: Math.min(timeoutMs, 5000) });
   } catch {
@@ -2058,12 +2530,6 @@ function resolveSetupServiceFromBrowserInput(serviceRaw: unknown, currentUrl: st
   if (!url) {
     return null;
   }
-  if (/\b(x\.com|twitter\.com)\b/.test(url)) {
-    return "x.com";
-  }
-  if (/\b(mail\.google\.com|gmail\.com|outlook\.live\.com|outlook\.office\.com|mail\.yahoo\.com)\b/.test(url)) {
-    return "email";
-  }
   try {
     const parsed = new URL(url);
     return normalizeSetupService(parsed.hostname) ?? null;
@@ -2108,6 +2574,73 @@ function deriveServiceCandidates(params: {
   return Array.from(new Set(candidates.filter(Boolean)));
 }
 
+function normalizeHostFromValue(value: string): string | null {
+  const raw = String(value ?? "").trim().toLowerCase();
+  if (!raw) {
+    return null;
+  }
+  if (raw.includes("://")) {
+    try {
+      const host = new URL(raw).hostname.trim().toLowerCase().replace(/^www\./, "");
+      return host || null;
+    } catch {
+      // fallback to normalized service parser below
+    }
+  }
+  return normalizeSetupService(raw);
+}
+
+function hostsLikelyMatch(a: string | null, b: string | null): boolean {
+  const left = String(a ?? "").trim().toLowerCase().replace(/^www\./, "");
+  const right = String(b ?? "").trim().toLowerCase().replace(/^www\./, "");
+  if (!left || !right) {
+    return false;
+  }
+  return left === right || left.endsWith(`.${right}`) || right.endsWith(`.${left}`);
+}
+
+async function resolveCredentialForCandidates(params: {
+  workspaceDir: string;
+  serviceCandidates: string[];
+  currentUrl: string;
+}): Promise<{ service: string; credential: NonNullable<Awaited<ReturnType<typeof getCredential>>> } | null> {
+  for (const candidate of params.serviceCandidates) {
+    const found = await getCredential({
+      workspaceDir: params.workspaceDir,
+      service: candidate,
+    });
+    if (found) {
+      return {
+        service: candidate,
+        credential: found,
+      };
+    }
+  }
+
+  const currentHost = normalizeHostFromValue(params.currentUrl);
+  if (!currentHost) {
+    return null;
+  }
+  const configured = await listConfiguredServices(params.workspaceDir);
+  for (const service of configured) {
+    const credential = await getCredential({
+      workspaceDir: params.workspaceDir,
+      service,
+    });
+    if (!credential) {
+      continue;
+    }
+    const websiteHost = normalizeHostFromValue(String(credential.websiteUrl ?? ""));
+    if (hostsLikelyMatch(currentHost, service) || hostsLikelyMatch(currentHost, websiteHost)) {
+      return {
+        service,
+        credential,
+      };
+    }
+  }
+  return null;
+}
+
 function maskCredentialIdentifier(identifier: string): string {
   const value = String(identifier ?? "").trim();
   if (!value) {
@@ -2123,6 +2656,466 @@ function maskCredentialIdentifier(identifier: string): string {
   return `${value.slice(0, 2)}***${value.slice(-1)}`;
 }
 
+function isSocialAuthUrl(value: string): boolean {
+  const text = String(value ?? "").trim().toLowerCase();
+  if (!text) {
+    return false;
+  }
+  return (
+    /\b(accounts\.google\.com|appleid\.apple\.com|microsoftonline\.com|oauth|sso)\b/.test(text) ||
+    /\/auth\/(google|apple|microsoft|github|facebook|linkedin|twitter|x)\b/.test(text)
+  );
+}
+
+function isSocialAuthLabel(value: string): boolean {
+  const text = String(value ?? "").trim().toLowerCase();
+  if (!text) {
+    return false;
+  }
+  return (
+    /\b(google|apple|microsoft|github|facebook|linkedin|twitter|x|oauth|sso|single sign[-\s]?on)\b/.test(
+      text,
+    ) ||
+    /\b(continue|sign in|log in)\s+with\b/.test(text)
+  );
+}
+
+function isLikelySocialAuthTarget(params: {
+  label?: string;
+  href?: string;
+  context?: string;
+}): boolean {
+  const label = String(params.label ?? "").trim().toLowerCase();
+  const href = String(params.href ?? "").trim().toLowerCase();
+  const context = String(params.context ?? "").trim().toLowerCase();
+  if (isSocialAuthUrl(href)) {
+    return true;
+  }
+  if (/\b(continue|sign in|log in)\s+with\b/.test(label)) {
+    return true;
+  }
+  const providerSignal = /\b(google|apple|microsoft|github|facebook|linkedin|twitter|x)\b/.test(
+    `${label} ${context} ${href}`,
+  );
+  const authSignal = /\b(sign in|log in|login|oauth|sso|single sign[-\s]?on|auth)\b/.test(
+    `${label} ${context} ${href}`,
+  );
+  return providerSignal && authSignal;
+}
+
+function assertNotSocialAuthTarget(params: {
+  label?: string;
+  href?: string;
+  context?: string;
+  action: string;
+}): void {
+  if (!isLikelySocialAuthTarget(params)) {
+    return;
+  }
+  throw new Error(
+    `Blocked ${params.action} because the target appears to be social/OAuth sign-in. Use browser action=login with vault credentials.`,
+  );
+}
+
+async function readLocatorAuthMetadata(locator: any): Promise<{
+  label: string;
+  href: string;
+  context: string;
+}> {
+  try {
+    const meta = await locator.evaluate((el: any) => {
+      const node = el && typeof el === "object" ? el : null;
+      const attr = (name: string) =>
+        String((node && typeof node.getAttribute === "function" ? node.getAttribute(name) : "") ?? "");
+      const textParts = [
+        attr("aria-label"),
+        attr("title"),
+        attr("name"),
+        typeof node?.value === "string" ? node.value : "",
+        typeof node?.innerText === "string" ? node.innerText : "",
+        typeof node?.textContent === "string" ? node.textContent : "",
+      ]
+        .map((part) => String(part ?? "").trim())
+        .filter(Boolean);
+      const anchor = node?.closest?.("a");
+      const href =
+        String(
+          (typeof node?.href === "string" ? node.href : "") ||
+            (typeof anchor?.href === "string" ? anchor.href : "") ||
+            attr("formaction"),
+        ) || "";
+      const contextParts = [
+        attr("id"),
+        attr("class"),
+        attr("data-testid"),
+        attr("data-test"),
+        attr("data-provider"),
+        attr("role"),
+        attr("type"),
+      ]
+        .map((part) => String(part ?? "").trim())
+        .filter(Boolean);
+      return {
+        label: textParts.join(" ").slice(0, 600),
+        href: href.slice(0, 600),
+        context: contextParts.join(" ").slice(0, 600),
+      };
+    });
+    return {
+      label: String(meta?.label ?? ""),
+      href: String(meta?.href ?? ""),
+      context: String(meta?.context ?? ""),
+    };
+  } catch {
+    return { label: "", href: "", context: "" };
+  }
+}
+
+async function assertLocatorNotSocialAuth(locator: any, action: string): Promise<void> {
+  const metadata = await readLocatorAuthMetadata(locator);
+  assertNotSocialAuthTarget({
+    ...metadata,
+    action,
+  });
+}
+
+async function submitNearestFormFromInput(inputLocator: any, timeoutMs: number): Promise<boolean> {
+  let blockedBySocialSubmit = false;
+  try {
+    const outcome = await inputLocator.evaluate((el: any) => {
+      const input = el;
+      const form = input?.form ?? input?.closest?.("form");
+      if (!form) {
+        return { submitted: false, blockedBySocialSubmit: false };
+      }
+
+      const controls = Array.from(form.querySelectorAll("button, input[type='submit'], input[type='image']"));
+      let sawSubmitControl = false;
+      for (const control of controls) {
+        if (!control || typeof control !== "object") {
+          continue;
+        }
+        const element = control as any;
+        const tagName = String(element.tagName ?? "").trim().toLowerCase();
+        const rawType = String(element.getAttribute?.("type") ?? "").trim().toLowerCase();
+        if (tagName === "button" && rawType && rawType !== "submit") {
+          continue;
+        }
+        sawSubmitControl = true;
+        const label = String(
+          element.getAttribute?.("aria-label") ??
+            element.getAttribute?.("title") ??
+            element.getAttribute?.("name") ??
+            (typeof element.value === "string" ? element.value : "") ??
+            element.textContent ??
+            "",
+        )
+          .replace(/\s+/g, " ")
+          .trim()
+          .toLowerCase();
+        const href = String(
+          element.getAttribute?.("formaction") ??
+            (typeof element.href === "string" ? element.href : "") ??
+            "",
+        )
+          .trim()
+          .toLowerCase();
+        const context = String(
+          `${element.getAttribute?.("id") ?? ""} ${element.getAttribute?.("class") ?? ""} ${
+            element.getAttribute?.("data-testid") ?? ""
+          } ${element.getAttribute?.("data-provider") ?? ""}`,
+        )
+          .replace(/\s+/g, " ")
+          .trim()
+          .toLowerCase();
+        const providerSignal = /\b(google|apple|microsoft|github|facebook|linkedin|twitter|x)\b/.test(
+          `${label} ${context} ${href}`,
+        );
+        const authSignal = /\b(sign in|log in|login|oauth|sso|single sign[-\s]?on|auth)\b/.test(
+          `${label} ${context} ${href}`,
+        );
+        const social =
+          /\b(continue|sign in|log in)\s+with\b/.test(label) ||
+          /\b(accounts\.google\.com|appleid\.apple\.com|microsoftonline\.com|oauth|sso)\b/.test(href) ||
+          /\/auth\/(google|apple|microsoft|github|facebook|linkedin|twitter|x)\b/.test(href) ||
+          (providerSignal && authSignal);
+        if (social) {
+          continue;
+        }
+        element.click();
+        return { submitted: true, blockedBySocialSubmit: false };
+      }
+      if (sawSubmitControl) {
+        return { submitted: false, blockedBySocialSubmit: true };
+      }
+      if (typeof form.requestSubmit === "function") {
+        form.requestSubmit();
+        return { submitted: true, blockedBySocialSubmit: false };
+      }
+      return {
+        submitted: form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })),
+        blockedBySocialSubmit: false,
+      };
+    });
+    if (outcome?.submitted) {
+      return true;
+    }
+    blockedBySocialSubmit = Boolean(outcome?.blockedBySocialSubmit);
+  } catch {
+    // no-op
+  }
+  if (blockedBySocialSubmit) {
+    return false;
+  }
+  try {
+    await inputLocator.press("Enter", { timeout: Math.min(timeoutMs, 5000) });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function clickRoleButtonExcludingSocial(params: {
+  page: any;
+  namePattern: RegExp;
+  timeoutMs: number;
+}): Promise<boolean> {
+  const locator = params.page.getByRole("button", { name: params.namePattern });
+  const count = Number(await locator.count().catch(() => 0));
+  if (!Number.isFinite(count) || count < 1) {
+    return false;
+  }
+  const limit = Math.min(count, 10);
+  for (let index = 0; index < limit; index += 1) {
+    const button = locator.nth(index);
+    const label = String(
+      (await button.getAttribute("aria-label").catch(() => "")) ||
+        (await button.innerText().catch(() => "")) ||
+        (await button.textContent().catch(() => "")),
+    )
+      .trim()
+      .toLowerCase();
+    if (isSocialAuthLabel(label)) {
+      continue;
+    }
+    try {
+      await button.click({ timeout: Math.min(params.timeoutMs, 5000) });
+      return true;
+    } catch {
+      // try next candidate
+    }
+  }
+  return false;
+}
+
+async function clickFirstNonSocialSelector(params: {
+  page: any;
+  selectors: string[];
+  timeoutMs: number;
+}): Promise<boolean> {
+  for (const selector of params.selectors) {
+    const target = await selectFirstUsableLocator(params.page, [selector], Math.min(params.timeoutMs, 5000));
+    if (!target) {
+      continue;
+    }
+    const metadata = await readLocatorAuthMetadata(target.locator);
+    if (isLikelySocialAuthTarget(metadata)) {
+      continue;
+    }
+    try {
+      await target.locator.click({ timeout: Math.min(params.timeoutMs, 5000) });
+      return true;
+    } catch {
+      // try next selector
+    }
+  }
+  return false;
+}
+
+async function loginPageLooksStuckPreparing(page: any): Promise<boolean> {
+  try {
+    return await evalPageScript<boolean>(
+      page,
+      `
+        const bodyText = String((document && document.body && document.body.innerText) || "").toLowerCase();
+        const preparing =
+          bodyText.includes("preparing your account") && bodyText.includes("please wait");
+        if (!preparing) {
+          return false;
+        }
+        const hasCredentialSurface = Boolean(
+          document.querySelector(
+            'input[type="email"],input[name="identifier"],input[autocomplete="username"],input[type="password"],input[autocomplete="one-time-code"],input[name*="otp" i],input[id*="otp" i],input[name*="code" i],input[id*="code" i],button[type="submit"],input[type="submit"]',
+          ),
+        );
+        return !hasCredentialSurface;
+      `,
+    );
+  } catch {
+    return false;
+  }
+}
+
+function classifyChallengeSignals(params: {
+  text: string;
+  url: string;
+  hasRecaptcha: boolean;
+  hasHcaptcha: boolean;
+  hasTurnstile: boolean;
+  hasCaptchaSelector: boolean;
+}): {
+  detected: boolean;
+  provider: string | null;
+  confidence: "none" | "low" | "medium" | "high";
+  signals: string[];
+} {
+  const text = String(params.text ?? "").toLowerCase();
+  const url = String(params.url ?? "").toLowerCase();
+  const signals: string[] = [];
+  let provider: string | null = null;
+
+  if (params.hasRecaptcha || /recaptcha/.test(text) || /google\.com\/recaptcha/.test(url)) {
+    provider = "recaptcha";
+    signals.push("recaptcha");
+  }
+  if (!provider && (params.hasHcaptcha || /\bhcaptcha\b/.test(text) || /hcaptcha\.com/.test(url))) {
+    provider = "hcaptcha";
+    signals.push("hcaptcha");
+  }
+  if (
+    !provider &&
+    (params.hasTurnstile || /\bturnstile\b/.test(text) || /challenges\.cloudflare\.com/.test(url))
+  ) {
+    provider = "cloudflare-turnstile";
+    signals.push("turnstile");
+  }
+  if (!provider && /\barkose\b|\bfuncaptcha\b/.test(text)) {
+    provider = "arkose";
+    signals.push("arkose");
+  }
+
+  if (params.hasCaptchaSelector) {
+    signals.push("captcha-selector");
+  }
+  if (/\b(verify you are human|are you human|i['’]?m not a robot|security check|prove you are human)\b/.test(text)) {
+    signals.push("human-verification-copy");
+  }
+  if (/\b(checking your browser|just a moment|ddos protection)\b/.test(text) || /cdn-cgi\/challenge/.test(url)) {
+    signals.push("challenge-page-copy");
+  }
+
+  const detected = signals.length > 0;
+  let confidence: "none" | "low" | "medium" | "high" = "none";
+  if (detected) {
+    const hardSignals =
+      params.hasRecaptcha ||
+      params.hasHcaptcha ||
+      params.hasTurnstile ||
+      /cdn-cgi\/challenge/.test(url) ||
+      /google\.com\/recaptcha|hcaptcha\.com|challenges\.cloudflare\.com/.test(url);
+    confidence = hardSignals ? "high" : signals.length >= 2 ? "medium" : "low";
+  }
+  return {
+    detected,
+    provider,
+    confidence,
+    signals,
+  };
+}
+
+async function detectInteractiveChallengeLive(page: any): Promise<{
+  detected: boolean;
+  provider: string | null;
+  confidence: "none" | "low" | "medium" | "high";
+  signals: string[];
+  url: string;
+}> {
+  try {
+    const probe = await evalPageScript<{
+      text: string;
+      url: string;
+      hasRecaptcha: boolean;
+      hasHcaptcha: boolean;
+      hasTurnstile: boolean;
+      hasCaptchaSelector: boolean;
+    }>(
+      page,
+      `
+        const bodyText = String((document && document.body && document.body.innerText) || "");
+        const hasRecaptcha = Boolean(
+          document.querySelector('iframe[src*="recaptcha"], .g-recaptcha, [data-sitekey][class*="recaptcha" i]'),
+        );
+        const hasHcaptcha = Boolean(
+          document.querySelector('iframe[src*="hcaptcha"], [data-sitekey][class*="hcaptcha" i]'),
+        );
+        const hasTurnstile = Boolean(
+          document.querySelector('iframe[src*="challenges.cloudflare.com"], .cf-turnstile, [data-sitekey][class*="turnstile" i]'),
+        );
+        const hasCaptchaSelector = Boolean(
+          document.querySelector('[id*="captcha" i],[class*="captcha" i],[name*="captcha" i]'),
+        );
+        return {
+          text: bodyText.slice(0, 12000),
+          url: String(location?.href ?? ""),
+          hasRecaptcha,
+          hasHcaptcha,
+          hasTurnstile,
+          hasCaptchaSelector,
+        };
+      `,
+    );
+    const classified = classifyChallengeSignals({
+      text: probe.text,
+      url: probe.url,
+      hasRecaptcha: probe.hasRecaptcha,
+      hasHcaptcha: probe.hasHcaptcha,
+      hasTurnstile: probe.hasTurnstile,
+      hasCaptchaSelector: probe.hasCaptchaSelector,
+    });
+    return {
+      ...classified,
+      url: String(probe.url ?? ""),
+    };
+  } catch {
+    return {
+      detected: false,
+      provider: null,
+      confidence: "none",
+      signals: [],
+      url: "",
+    };
+  }
+}
+
+function detectInteractiveChallengeFromFetchSnapshot(tab: BrowserTab): {
+  detected: boolean;
+  provider: string | null;
+  confidence: "none" | "low" | "medium" | "high";
+  signals: string[];
+  url: string;
+} {
+  const text = [String(tab.lastSnapshot?.text ?? ""), String(tab.lastHtml ?? "")]
+    .filter(Boolean)
+    .join("\n")
+    .slice(0, 20000);
+  const url = String(tab.lastSnapshot?.url ?? tab.url ?? "");
+  const hasRecaptcha = /g-recaptcha|recaptcha/i.test(text);
+  const hasHcaptcha = /\bhcaptcha\b/i.test(text);
+  const hasTurnstile = /\bturnstile\b|challenges\.cloudflare\.com/i.test(text);
+  const hasCaptchaSelector = /\bcaptcha\b/i.test(text);
+  return {
+    ...classifyChallengeSignals({
+      text,
+      url,
+      hasRecaptcha,
+      hasHcaptcha,
+      hasTurnstile,
+      hasCaptchaSelector,
+    }),
+    url,
+  };
+}
+
 async function selectFirstUsableLocator(page: any, selectors: string[], timeoutMs: number): Promise<{
   selector: string;
   locator: any;
@@ -2133,17 +3126,53 @@ async function selectFirstUsableLocator(page: any, selectors: string[], timeoutM
       continue;
     }
     try {
-      const locator = page.locator(normalized).first();
+      const locator = page.locator(normalized);
       const count = Number(await locator.count());
       if (!Number.isFinite(count) || count < 1) {
         continue;
       }
-      try {
-        await locator.waitFor({ state: "visible", timeout: Math.min(timeoutMs, 1500) });
-      } catch {
-        // Continue even if visibility wait fails; fill/click can still succeed.
+      const limit = Math.min(count, 12);
+      let fallbackCandidate: any = null;
+      for (let index = 0; index < limit; index += 1) {
+        const candidate = locator.nth(index);
+        if (!fallbackCandidate) {
+          fallbackCandidate = candidate;
+        }
+        const visible = await candidate.isVisible().catch(() => false);
+        if (!visible) {
+          continue;
+        }
+        const enabled = await candidate
+          .evaluate((el: any) => {
+            const node = el as any;
+            if (!node || typeof node !== "object") {
+              return true;
+            }
+            if (Boolean(node.disabled)) {
+              return false;
+            }
+            const ariaDisabled = String(node.getAttribute?.("aria-disabled") ?? "")
+              .trim()
+              .toLowerCase();
+            if (ariaDisabled === "true") {
+              return false;
+            }
+            return true;
+          })
+          .catch(() => true);
+        if (!enabled) {
+          continue;
+        }
+        try {
+          await candidate.waitFor({ state: "visible", timeout: Math.min(timeoutMs, 700) });
+        } catch {
+          // best effort; candidate may still be actionable
+        }
+        return { selector: normalized, locator: candidate };
       }
-      return { selector: normalized, locator };
+      if (fallbackCandidate) {
+        return { selector: normalized, locator: fallbackCandidate };
+      }
     } catch {
       // Keep trying next selector.
     }
@@ -2156,19 +3185,22 @@ async function performLiveCredentialLogin(params: {
   service: string;
   identifier: string;
   secret: string;
-  authMode: "password" | "passwordless_mfa_code";
+  authMode: "password" | "password_with_mfa" | "passwordless_mfa_code";
   timeoutMs: number;
 }): Promise<{
   service: string;
+  identifier: string;
   identifierMasked: string;
   identifierSelector: string;
   passwordSelector: string | null;
   submitted: boolean;
   requiresMfa: boolean;
-  authMode: "password" | "passwordless_mfa_code";
+  mfaExpected: boolean;
+  authMode: "password" | "password_with_mfa" | "passwordless_mfa_code";
 }> {
   const page = requireLivePage(params.tab);
   const timeoutMs = Math.max(1000, params.timeoutMs);
+  const isPasswordless = params.authMode === "passwordless_mfa_code";
 
   const identifierSelectors =
     params.service === "x.com"
@@ -2203,66 +3235,113 @@ async function performLiveCredentialLogin(params: {
     'input[name*="code" i]',
     'input[id*="code" i]',
   ];
-  const mfaHintRegex = /\b(verification code|one[-\s]?time code|otp|2fa|mfa|authenticator app|passcode)\b/i;
+  // Avoid false positives from pre-submit labels like "Send one-time code".
+  const mfaHintRegex =
+    /\b(enter (?:the )?(?:verification|one[-\s]?time|authentication|security) code|code (?:sent|was sent)|we sent (?:you )?(?:a )?code|check (?:your )?(?:email|inbox)|two[-\s]?factor|2fa|authenticator app|passcode)\b/i;
 
-  const identifierTarget = await selectFirstUsableLocator(page, identifierSelectors, timeoutMs);
+  try {
+    await page.waitForLoadState("domcontentloaded", { timeout: Math.min(timeoutMs, 5000) });
+  } catch {
+    // Continue even if SPA lifecycle does not emit a full load signal.
+  }
+
+  // activePage tracks where the login form actually lives — either the main page or a child frame
+  // (e.g. an embedded Privy / Auth0 / Clerk iframe). All selector-based interactions after the
+  // identifier is found use activePage so that cross-origin auth iframes work correctly.
+  let activePage: any = page;
+
+  let identifierTarget = await selectFirstUsableLocator(page, identifierSelectors, Math.min(timeoutMs, 4000));
   if (!identifierTarget) {
+    const deadline = Date.now() + Math.min(timeoutMs, 12000);
+    while (!identifierTarget && Date.now() < deadline) {
+      const stuckPreparing = await loginPageLooksStuckPreparing(page);
+      try {
+        await page.waitForTimeout(stuckPreparing ? 700 : 300);
+      } catch {
+        // no-op
+      }
+      identifierTarget = await selectFirstUsableLocator(page, identifierSelectors, Math.min(timeoutMs, 2500));
+      if (identifierTarget) {
+        break;
+      }
+    }
+  }
+  // If identifier still not found, some sites (e.g. Clerk-based) hide the form behind an
+  // entry button like "Get started" or "Sign in". Try clicking one to reveal the form.
+  if (!identifierTarget) {
+    const entryClicked = await clickRoleButtonExcludingSocial({
+      page,
+      namePattern: /\b(get started|sign in|log in|login|continue(?: with email)?|use email|enter)\b/i,
+      timeoutMs: Math.min(timeoutMs, 4000),
+    });
+    if (entryClicked) {
+      // Give the SPA a moment to render the form after the click.
+      try {
+        await page.waitForLoadState("domcontentloaded", { timeout: Math.min(timeoutMs, 4000) });
+      } catch {
+        // no-op
+      }
+      identifierTarget = await selectFirstUsableLocator(page, identifierSelectors, Math.min(timeoutMs, 5000));
+    }
+  }
+  // Last resort: check child frames. Auth providers like Privy, Auth0, and Clerk often
+  // embed their sign-in form in a cross-origin iframe rather than the main document.
+  if (!identifierTarget) {
+    try {
+      const allFrames = (page.frames?.() as any[]) ?? [];
+      for (let fi = 0; fi < allFrames.length; fi++) {
+        const frame = allFrames[fi];
+        if (!frame || frame === page.mainFrame?.()) continue;
+        const frameUrl = String(frame.url?.() ?? "");
+        if (!frameUrl || frameUrl === "about:blank" || frameUrl.startsWith("data:")) continue;
+        const found = await selectFirstUsableLocator(frame, identifierSelectors, Math.min(timeoutMs, 3000));
+        if (found) {
+          identifierTarget = found;
+          activePage = frame;
+          break;
+        }
+      }
+    } catch {
+      // Frame access failed — continue without iframe support.
+    }
+  }
+  if (!identifierTarget) {
+    const stuckPreparing = await loginPageLooksStuckPreparing(page);
+    if (stuckPreparing) {
+      throw new Error(
+        "Login page is stuck on 'Preparing your account' and did not render credential fields yet.",
+      );
+    }
+    const challenge = await detectInteractiveChallengeLive(page);
+    if (challenge.detected) {
+      const provider = challenge.provider ? `${challenge.provider}` : "interactive challenge";
+      const signalText = challenge.signals.slice(0, 3).join(", ");
+      throw new Error(
+        `Login is blocked by ${provider}; human verification is required before credentials can be entered.` +
+          (signalText ? ` Signals: ${signalText}.` : ""),
+      );
+    }
     throw new Error(`No login identifier input was found for service=${params.service}.`);
   }
   await identifierTarget.locator.fill(params.identifier, { timeout: timeoutMs });
 
   let passwordTarget: { selector: string; locator: any } | null = null;
-  if (params.authMode === "password") {
-    passwordTarget = await selectFirstUsableLocator(page, passwordSelectors, timeoutMs);
+  if (!isPasswordless) {
+    passwordTarget = await selectFirstUsableLocator(activePage, passwordSelectors, timeoutMs);
     if (!passwordTarget && params.service === "x.com") {
       try {
-        await page.getByRole("button", { name: /next/i }).first().click({ timeout: Math.min(timeoutMs, 5000) });
+        await activePage.getByRole("button", { name: /next/i }).first().click({ timeout: Math.min(timeoutMs, 5000) });
       } catch {
         // no-op
       }
-      passwordTarget = await selectFirstUsableLocator(page, passwordSelectors, timeoutMs);
+      passwordTarget = await selectFirstUsableLocator(activePage, passwordSelectors, timeoutMs);
     }
     if (!passwordTarget) {
       throw new Error(`No password input was found for service=${params.service}.`);
     }
     await passwordTarget.locator.fill(params.secret, { timeout: timeoutMs });
   } else {
-    // Passwordless flow: continue from identifier screen to the MFA challenge screen.
-    const passwordlessContinueSelectors = [
-      'button[type="submit"]',
-      'input[type="submit"]',
-      'button:has-text("Next")',
-      'button:has-text("Continue")',
-      'button:has-text("Sign in")',
-      'button:has-text("Log in")',
-      'button:has-text("Get one-time code")',
-      'button:has-text("Get one time code")',
-      'button:has-text("Send code")',
-      'button:has-text("Verify")',
-    ];
-    const continueTarget = await selectFirstUsableLocator(
-      page,
-      passwordlessContinueSelectors,
-      Math.min(timeoutMs, 3500),
-    );
-    if (continueTarget) {
-      try {
-        await continueTarget.locator.click({ timeout: Math.min(timeoutMs, 4000) });
-      } catch {
-        // continue with fallback below
-      }
-    }
-    try {
-      await page.getByRole("button", { name: /next|continue|sign in|log in/i }).first().click({
-        timeout: Math.min(timeoutMs, 5000),
-      });
-    } catch {
-      try {
-        await identifierTarget.locator.press("Enter", { timeout: Math.min(timeoutMs, 4000) });
-      } catch {
-        // no-op
-      }
-    }
+    // Passwordless submission is handled in the unified submit block below.
   }
 
   let submitted = false;
@@ -2274,27 +3353,57 @@ async function performLiveCredentialLogin(params: {
           'button[type="submit"]',
         ]
       : ['button[type="submit"]', 'input[type="submit"]'];
-  if (params.authMode === "password") {
-    const submitTarget = await selectFirstUsableLocator(page, submitSelectors, timeoutMs);
-    if (submitTarget) {
-      try {
-        await submitTarget.locator.click({ timeout: timeoutMs });
-        submitted = true;
-      } catch {
-        submitted = false;
-      }
+  if (!isPasswordless) {
+    if (passwordTarget) {
+      submitted = await submitNearestFormFromInput(passwordTarget.locator, timeoutMs);
     }
-
-    if (!submitted && passwordTarget) {
-      try {
-        await passwordTarget.locator.press("Enter", { timeout: Math.min(timeoutMs, 5000) });
-        submitted = true;
-      } catch {
-        submitted = false;
+    if (!submitted) {
+      const submitTarget = await selectFirstUsableLocator(activePage, submitSelectors, timeoutMs);
+      if (submitTarget) {
+        const submitLabel = String(
+          (await submitTarget.locator.getAttribute("aria-label").catch(() => "")) ||
+            (await submitTarget.locator.innerText().catch(() => "")) ||
+            (await submitTarget.locator.textContent().catch(() => "")),
+        )
+          .trim()
+          .toLowerCase();
+        if (!isSocialAuthLabel(submitLabel)) {
+          try {
+            await submitTarget.locator.click({ timeout: timeoutMs });
+            submitted = true;
+          } catch {
+            submitted = false;
+          }
+        }
       }
     }
   } else {
-    submitted = true;
+    submitted = await submitNearestFormFromInput(identifierTarget.locator, timeoutMs);
+    if (!submitted) {
+      submitted = await clickRoleButtonExcludingSocial({
+        page: activePage,
+        namePattern: /\b(next|continue|send code|get one[-\s]?time code|verify|sign in|log in)\b/i,
+        timeoutMs,
+      });
+    }
+    if (!submitted) {
+      submitted = await clickFirstNonSocialSelector({
+        page: activePage,
+        selectors: [
+          'button:has-text("Send one-time code")',
+          'button:has-text("Send one time code")',
+          'button:has-text("Send code")',
+          'button:has-text("Get one-time code")',
+          'button:has-text("Get one time code")',
+          'button:has-text("Email me a code")',
+          'button:has-text("Continue with email")',
+          'button:has-text("Continue")',
+          'input[type="submit"][value*="code" i]',
+          'input[type="submit"][value*="continue" i]',
+        ],
+        timeoutMs,
+      });
+    }
   }
 
   try {
@@ -2303,37 +3412,64 @@ async function performLiveCredentialLogin(params: {
     // SPA auth flows frequently avoid a full load event.
   }
 
-  let requiresMfa = false;
-  const mfaInput = await selectFirstUsableLocator(page, mfaInputSelectors, Math.min(timeoutMs, 2500));
-  if (mfaInput) {
-    requiresMfa = true;
-  } else {
-    try {
-      const hasMfaPrompt = await evalPageScript<boolean>(
-        page,
-        `
-          const bodyText = String(
-            (typeof document !== "undefined" && document && document.body && document.body.innerText) || ""
-          );
-          const re = new RegExp(String(args?.regexSource ?? ""), "i");
-          return re.test(bodyText);
-        `,
-        { regexSource: mfaHintRegex.source },
-      );
-      requiresMfa = Boolean(hasMfaPrompt);
-    } catch {
-      requiresMfa = false;
+  const detectMfaChallenge = async (probeTimeoutMs: number): Promise<boolean> => {
+    const deadline = Date.now() + Math.max(0, probeTimeoutMs);
+    while (true) {
+      // Search in activePage (may be a frame) so that iframe-hosted OTP inputs are detected.
+      const mfaInput = await selectFirstUsableLocator(activePage, mfaInputSelectors, Math.min(timeoutMs, 1400));
+      if (mfaInput) {
+        return true;
+      }
+      try {
+        const hasMfaPrompt = await evalPageScript<boolean>(
+          activePage,
+          `
+            const bodyText = String(
+              (typeof document !== "undefined" && document && document.body && document.body.innerText) || ""
+            );
+            const re = new RegExp(String(args?.regexSource ?? ""), "i");
+            return re.test(bodyText);
+          `,
+          { regexSource: mfaHintRegex.source },
+        );
+        if (hasMfaPrompt) {
+          return true;
+        }
+      } catch {
+        // ignore and continue probing within timeout
+      }
+      if (Date.now() >= deadline) {
+        return false;
+      }
+      try {
+        await page.waitForTimeout(350);
+      } catch {
+        return false;
+      }
     }
+  };
+
+  const mfaProbeTimeoutMs = isPasswordless ? Math.min(timeoutMs, 8000) : Math.min(timeoutMs, 3000);
+  let detectedMfaChallenge = await detectMfaChallenge(mfaProbeTimeoutMs);
+  if (isPasswordless && submitted && !detectedMfaChallenge) {
+    // Passwordless submit click happened, but challenge never appeared; treat as unconfirmed.
+    submitted = false;
+    detectedMfaChallenge = await detectMfaChallenge(Math.min(timeoutMs, 1500));
   }
+  const mfaExpected = params.authMode === "password_with_mfa" || params.authMode === "passwordless_mfa_code";
+  const requiresMfa =
+    detectedMfaChallenge || (params.authMode === "passwordless_mfa_code" && submitted);
 
   params.tab.updatedAt = Date.now();
   return {
     service: params.service,
+    identifier: params.identifier,
     identifierMasked: maskCredentialIdentifier(params.identifier),
     identifierSelector: identifierTarget.selector,
     passwordSelector: passwordTarget?.selector ?? null,
     submitted,
     requiresMfa,
+    mfaExpected,
     authMode: params.authMode,
   };
 }
@@ -2346,12 +3482,41 @@ async function submitMfaCode(params: {
   submitted: boolean;
   selector: string;
   multiField: boolean;
+  submissionError?: string;
 }> {
   const page = requireLivePage(params.tab);
   const timeoutMs = Math.max(1000, params.timeoutMs);
   const code = String(params.code ?? "").trim();
   if (!code) {
     throw new Error("MFA code is required.");
+  }
+
+  // Detect the page context where the OTP form lives: main page or an embedded auth iframe.
+  let mfaPage: any = page;
+  try {
+    const allFrames = (page.frames?.() as any[]) ?? [];
+    for (let fi = 0; fi < allFrames.length; fi++) {
+      const frame = allFrames[fi];
+      if (!frame || frame === page.mainFrame?.()) continue;
+      const frameUrl = String(frame.url?.() ?? "");
+      if (!frameUrl || frameUrl === "about:blank" || frameUrl.startsWith("data:")) continue;
+      const hasOtp = await evalPageScript<boolean>(
+        frame,
+        `
+          const inputs = document.querySelectorAll(
+            'input[autocomplete="one-time-code"],input[name*="otp" i],input[id*="otp" i],' +
+            'input[name*="code" i],input[id*="code" i],input[name*="mfa" i],input[maxlength="1"]'
+          );
+          return inputs.length > 0;
+        `,
+      ).catch(() => false);
+      if (hasOtp) {
+        mfaPage = frame;
+        break;
+      }
+    }
+  } catch {
+    // Frame access failed — use main page.
   }
 
   const singleDigitSelectors = [
@@ -2361,7 +3526,7 @@ async function submitMfaCode(params: {
     'input[maxlength="1"][id*="code" i]',
   ];
   for (const selector of singleDigitSelectors) {
-    const locator = page.locator(selector);
+    const locator = mfaPage.locator(selector);
     const count = Number(await locator.count().catch(() => 0));
     if (!Number.isFinite(count) || count < 4) {
       continue;
@@ -2387,10 +3552,35 @@ async function submitMfaCode(params: {
       } catch {
         // no-op
       }
+      // Wait for navigation/SPA state change after submission.
+      try {
+        await page.waitForLoadState("domcontentloaded", { timeout: Math.min(timeoutMs, 8000) });
+      } catch {
+        // SPA auth flows may not emit a full load event — continue.
+      }
+      let multiFieldError = "";
+      try {
+        multiFieldError = await evalPageScript<string>(
+          mfaPage,
+          `
+            const selectors = ['[class*="error" i]','[role="alert"]','[aria-live="polite"]','[aria-live="assertive"]','[data-error]'];
+            for (const sel of selectors) {
+              for (const el of document.querySelectorAll(sel)) {
+                const text = (el.textContent || "").replace(/\\s+/g, " ").trim();
+                if (text && text.length > 3) return text.slice(0, 400);
+              }
+            }
+            return "";
+          `,
+        );
+      } catch {
+        multiFieldError = "";
+      }
       return {
         submitted: true,
         selector,
         multiField: true,
+        ...(multiFieldError ? { submissionError: multiFieldError } : {}),
       };
     }
   }
@@ -2407,16 +3597,28 @@ async function submitMfaCode(params: {
     'input[id*="code" i]',
     'input[inputmode="numeric"]',
   ];
-  const target = await selectFirstUsableLocator(page, mfaInputSelectors, timeoutMs);
+  const target = await selectFirstUsableLocator(mfaPage, mfaInputSelectors, timeoutMs);
   if (!target) {
-    throw new Error("Could not find an MFA code input on the current page.");
+    throw new Error(
+      "Could not find an OTP/MFA code input on the current page — the session likely expired while waiting for the code. " +
+        "Do NOT use the user's previous code. Re-do action=login to trigger a fresh code send, then ask the user for the new code.",
+    );
   }
 
   await target.locator.fill(code, { timeout: timeoutMs });
   let submitted = false;
   const submitTarget = await selectFirstUsableLocator(
-    page,
-    ['button[type="submit"]', 'input[type="submit"]', 'button:has-text("Verify")', 'button:has-text("Continue")'],
+    mfaPage,
+    [
+      'button[type="submit"]',
+      'input[type="submit"]',
+      'button:has-text("Verify")',
+      'button:has-text("Continue")',
+      'button:has-text("Sign in")',
+      'button:has-text("Confirm")',
+      'button:has-text("Submit")',
+      'button:has-text("Next")',
+    ],
     Math.min(timeoutMs, 3000),
   );
   if (submitTarget) {
@@ -2435,10 +3637,45 @@ async function submitMfaCode(params: {
       submitted = false;
     }
   }
+
+  // Wait for navigation/SPA state change after submission.
+  if (submitted) {
+    try {
+      await page.waitForLoadState("domcontentloaded", { timeout: Math.min(timeoutMs, 8000) });
+    } catch {
+      // SPA auth flows may not emit a full load event — continue.
+    }
+  }
+
+  // Probe for visible error messages so the caller can surface them.
+  let submissionError = "";
+  try {
+    submissionError = await evalPageScript<string>(
+      mfaPage,
+      `
+        const selectors = [
+          '[class*="error" i]', '[class*="alert" i]', '[role="alert"]',
+          '[aria-live="polite"]', '[aria-live="assertive"]',
+          '[data-error]', '[class*="invalid" i]',
+        ];
+        for (const sel of selectors) {
+          for (const el of document.querySelectorAll(sel)) {
+            const text = (el.textContent || "").replace(/\\s+/g, " ").trim();
+            if (text && text.length > 3) return text.slice(0, 400);
+          }
+        }
+        return "";
+      `,
+    );
+  } catch {
+    submissionError = "";
+  }
+
   return {
     submitted,
     selector: target.selector,
     multiField: false,
+    ...(submissionError ? { submissionError } : {}),
   };
 }
 
@@ -2456,11 +3693,11 @@ export function createBrowserTool(_opts?: {
   const tool: AnyAgentTool = {
     name: "browser",
     description:
-      "Stateful web browser tool with t560-compatible actions/aliases (status/diagnostics/start/stop/profiles/tabs/open/focus/close/snapshot/screenshot/navigate/console/pdf/upload/dialog/login/mfa/act/products/launch). `open` manages internal tool tabs; `launch` opens the OS-visible default browser. Supports engine=live (Playwright) with resilient fetch fallback. Snapshot returns refs (e1,e2,...) for follow-up actions.",
+      "Stateful web browser tool with t560-compatible actions/aliases (status/diagnostics/start/stop/profiles/tabs/open/focus/close/snapshot/screenshot/navigate/console/downloads/pdf/upload/dialog/login/mfa/challenge/act/products/launch/wait_for_request). For secure auth, call open -> login -> mfa: login pulls identifier/secret from vault and injects secret without exposing it in outputs. Social/OAuth provider sign-ins are blocked. `open` manages internal tool tabs; `launch` opens the OS-visible default browser. Supports engine=live (Playwright) with resilient fetch fallback. Snapshot returns refs (e1,e2,...) for follow-up actions.",
     parameters: Type.Object({
       action: Type.String({
         description:
-          "status|diagnostics|start|stop|profiles|tabs|open|navigate|focus|close|snapshot|search|forms|products|launch|login|mfa|click|type|fill|submit|hover|press|select|drag|evaluate|upload|dialog|console|pdf|scroll|resize|wait|act|back|forward|reload|screenshot|reset",
+          "status|diagnostics|start|stop|profiles|tabs|open|navigate|focus|close|snapshot|search|forms|products|launch|login|mfa|challenge|click|type|fill|submit|hover|press|select|drag|evaluate|upload|dialog|console|downloads|pdf|scroll|resize|wait|wait_for_request|act|back|forward|reload|screenshot|reset",
       }),
       target: Type.Optional(Type.String({ description: "Compatibility target hint (host|sandbox|node)." })),
       node: Type.Optional(Type.String({ description: "Compatibility node id/name hint." })),
@@ -2475,7 +3712,12 @@ export function createBrowserTool(_opts?: {
       url: Type.Optional(Type.String({ description: "HTTP/HTTPS URL." })),
       targetUrl: Type.Optional(Type.String({ description: "t560 compatibility alias for url." })),
       query: Type.Optional(Type.String({ description: "Search query (for action=search)." })),
-      service: Type.Optional(Type.String({ description: "Credential service id for action=login (email|x.com)." })),
+      service: Type.Optional(
+        Type.String({
+          description:
+            "Credential service key for action=login (typically normalized host, e.g. example.com). login reads identifier/secret from vault; do not pass passwords in browser tool args.",
+        }),
+      ),
       region: Type.Optional(Type.String({ description: "DuckDuckGo region code (for action=search)." })),
       count: Type.Optional(Type.Number({ minimum: 1, maximum: 20 })),
       openFirstResult: Type.Optional(Type.Boolean({ description: "When true, open first search result in a tab." })),
@@ -2507,7 +3749,11 @@ export function createBrowserTool(_opts?: {
       formIndex: Type.Optional(Type.Number({ minimum: 1 })),
       fieldName: Type.Optional(Type.String({ description: "Form field name (for type/fill actions)." })),
       value: Type.Optional(Type.String({ description: "Field value (for type/fill actions)." })),
-      code: Type.Optional(Type.String({ description: "One-time MFA/OTP code for action=mfa." })),
+      code: Type.Optional(
+        Type.String({
+          description: "One-time MFA/OTP code for action=mfa. Use only after login indicates MFA is required.",
+        }),
+      ),
       values: Type.Optional(Type.Array(Type.String({ description: "Values for select action." }))),
       fields: Type.Optional(
         Type.Array(Type.Object({}, { additionalProperties: true }), {
@@ -2540,11 +3786,52 @@ export function createBrowserTool(_opts?: {
       waitForText: Type.Optional(Type.String({ description: "For action=wait: text to appear in page content." })),
       textGone: Type.Optional(Type.String({ description: "For action=wait: text that should disappear." })),
       urlContains: Type.Optional(Type.String({ description: "For action=wait: URL substring to wait for." })),
+      waitForRequestUrl: Type.Optional(
+        Type.String({
+          description:
+            "For action=wait_for_request: URL substring that the network request/response must include.",
+        }),
+      ),
+      waitForRequestMethod: Type.Optional(
+        Type.String({
+          description: "For action=wait_for_request: HTTP method filter (GET|POST|PUT|PATCH|DELETE).",
+        }),
+      ),
+      waitForStatus: Type.Optional(
+        Type.Number({
+          minimum: 100,
+          maximum: 599,
+          description: "For action=wait_for_request: optional HTTP response status filter.",
+        }),
+      ),
+      waitForRequestBodyIncludes: Type.Optional(
+        Type.String({
+          description: "For action=wait_for_request: optional request body substring filter.",
+        }),
+      ),
+      waitForResponseBodyIncludes: Type.Optional(
+        Type.String({
+          description: "For action=wait_for_request: optional response body substring filter.",
+        }),
+      ),
       state: Type.Optional(Type.String({ description: "For waitForSelector: attached|visible|hidden|detached." })),
+      networkIdle: Type.Optional(
+        Type.Boolean({
+          description:
+            "When true on snapshot-like actions, wait for network idle after DOM load (best effort for SPA/data-heavy pages).",
+        }),
+      ),
+      networkIdleTimeoutMs: Type.Optional(
+        Type.Number({
+          minimum: 1000,
+          maximum: 20000,
+          description: "Timeout for networkIdle waits in milliseconds.",
+        }),
+      ),
       kind: Type.Optional(
         Type.String({
           description:
-            "Sub-action for act: click|type|fill|submit|navigate|wait|hover|press|select|drag|evaluate|upload|dialog|console|pdf|scroll|resize|login|mfa|close",
+            "Sub-action for act: click|type|fill|submit|navigate|wait|wait_for_request|hover|press|select|drag|evaluate|upload|dialog|console|downloads|pdf|scroll|resize|login|mfa|challenge|close",
         }),
       ),
       timeMs: Type.Optional(Type.Number({ minimum: 0, maximum: 120000 })),
@@ -2563,7 +3850,17 @@ export function createBrowserTool(_opts?: {
     }),
     execute: async (_toolCallId, rawParams) => {
       const params = normalizeBrowserActionParams(rawParams);
-      const action = String(params.action ?? "").trim().toLowerCase();
+      const actionRaw = String(params.action ?? "").trim().toLowerCase();
+      const actionAliases: Record<string, string> = {
+        "wait-for-request": "wait_for_request",
+        waitforrequest: "wait_for_request",
+        "wait-for-network": "wait_for_request",
+        captcha: "challenge",
+        "human-check": "challenge",
+        human_check: "challenge",
+        "human-verification": "challenge",
+      };
+      const action = actionAliases[actionRaw] ?? actionRaw;
       if (!action) {
         throw new Error("action is required.");
       }
@@ -2605,9 +3902,7 @@ export function createBrowserTool(_opts?: {
           }
           return "live";
         }
-        if (tab) {
-          return "fetch";
-        }
+        // Auto mode: prefer live when available, regardless of whether a tab already exists.
         return liveAvailable ? "live" : "fetch";
       };
 
@@ -2647,6 +3942,7 @@ export function createBrowserTool(_opts?: {
             "launch",
             "login",
             "mfa",
+            "challenge",
             "fill",
             "submit",
             "hover",
@@ -2657,10 +3953,12 @@ export function createBrowserTool(_opts?: {
             "upload",
             "dialog",
             "console",
+            "downloads",
             "pdf",
             "scroll",
             "resize",
             "wait",
+            "wait_for_request",
             "screenshot",
             "diagnostics",
           ],
@@ -3219,28 +4517,22 @@ export function createBrowserTool(_opts?: {
         });
         if (serviceCandidates.length === 0) {
           throw new Error(
-            "Could not infer setup service for this page. Pass service=<site> (example: service=havenvaults2-0).",
+            "Could not infer setup service for this page. Pass service=<site> (example: service=example.com).",
           );
         }
 
-        let resolvedService = serviceCandidates[0];
-        let credential = null;
-        for (const candidate of serviceCandidates) {
-          const found = await getCredential({
-            workspaceDir: process.cwd(),
-            service: candidate,
-          });
-          if (found) {
-            credential = found;
-            resolvedService = candidate;
-            break;
-          }
-        }
-        if (!credential) {
+        const resolved = await resolveCredentialForCandidates({
+          workspaceDir: process.cwd(),
+          serviceCandidates,
+          currentUrl: liveUrl,
+        });
+        if (!resolved) {
           throw new Error(
-            `No credential is configured for services=[${serviceCandidates.join(", ")}]. Run /setup <service-or-site> first.`,
+            `No credential is configured for services=[${serviceCandidates.join(", ")}]. Add account credentials in Setup -> Vault (or run /setup <service-or-site>).`,
           );
         }
+        const resolvedService = resolved.service;
+        const credential = resolved.credential;
 
         const loginResult = await performLiveCredentialLogin({
           tab,
@@ -3250,6 +4542,32 @@ export function createBrowserTool(_opts?: {
           authMode: credential.authMode,
           timeoutMs,
         });
+        const mfaSourceService = String(credential.mfaSourceService ?? "").trim();
+        const mfaStrategy =
+          String(credential.mfaStrategy ?? "").trim().toLowerCase() === "email_or_user"
+            ? "email_or_user"
+            : "user_prompt";
+        const mfaSourceCredentialAvailable = mfaSourceService
+          ? Boolean(
+              await getCredential({
+                workspaceDir: process.cwd(),
+                service: mfaSourceService,
+              }),
+            )
+          : false;
+        const nextStep = loginResult.requiresMfa
+          ? mfaStrategy === "email_or_user" && mfaSourceService && mfaSourceCredentialAvailable
+            ? `MFA challenge detected. First try fetching the code from ${mfaSourceService}; if unavailable, ask the user and call browser action=mfa with that code.`
+            : mfaStrategy === "email_or_user" && mfaSourceService
+              ? `MFA challenge detected. ${mfaSourceService} is configured as source but credentials for it are missing; ask the user for the one-time code and call browser action=mfa.`
+            : "MFA challenge detected. Ask user for one-time code, then call browser action=mfa with that code."
+          : loginResult.mfaExpected
+            ? mfaStrategy === "email_or_user" && mfaSourceService && mfaSourceCredentialAvailable
+              ? `Account is configured with MFA (${mfaSourceService} preferred source). Continue flow and, if prompted, retrieve code from that source or ask the user.`
+              : mfaStrategy === "email_or_user" && mfaSourceService
+                ? `Account is configured with MFA. ${mfaSourceService} is configured as preferred source but credentials are missing, so ask the user for codes when prompted.`
+              : "Account is configured with MFA. Continue flow and, if prompted, ask the user for the one-time code."
+            : "Continue with the next authenticated step.";
 
         const snapshotAfter = params.snapshotAfter !== false;
         const snapshot = snapshotAfter ? await captureLiveTabSnapshot(tab, params) : null;
@@ -3258,14 +4576,26 @@ export function createBrowserTool(_opts?: {
           engine: "live",
           activeTabId: tab.id,
           service: loginResult.service,
-          identifier: loginResult.identifierMasked,
+          identifier: loginResult.identifier,
+          identifierMasked: loginResult.identifierMasked,
+          secretInjectedFromVault: true,
+          secretVisibleToAgent: false,
           credentialService: resolvedService,
           submitted: loginResult.submitted,
           requiresMfa: loginResult.requiresMfa,
+          mfaExpected: loginResult.mfaExpected,
           authMode: loginResult.authMode,
-          nextStep: loginResult.requiresMfa
-            ? "Ask user for one-time code, then call browser action=mfa with that code."
-            : "Continue with the next authenticated step.",
+          mfaStrategy,
+          mfaSourceCredentialAvailable,
+          ...(mfaSourceService ? { mfaSourceService } : {}),
+          nextStep,
+          mfa: {
+            required: loginResult.requiresMfa,
+            expected: loginResult.mfaExpected,
+            strategy: mfaStrategy,
+            sourceCredentialAvailable: mfaSourceCredentialAvailable,
+            ...(mfaSourceService ? { sourceService: mfaSourceService } : {}),
+          },
           selectors: {
             identifier: loginResult.identifierSelector,
             password: loginResult.passwordSelector,
@@ -3282,10 +4612,13 @@ export function createBrowserTool(_opts?: {
 
         let page = getLivePage(tab.id);
         if (!page) {
+          // Use the most recently visited URL (lastSnapshot) so we land on the OTP page,
+          // not the original login URL.
+          const gotoUrl = tab.lastSnapshot?.url ?? tab.url;
           const { context } = await ensureLiveRuntime();
           const created = await context.newPage();
           attachLivePage(tab.id, created);
-          const response = await created.goto(tab.url, {
+          const response = await created.goto(gotoUrl, {
             waitUntil: "domcontentloaded",
             timeout: timeoutMs,
           });
@@ -3307,16 +4640,14 @@ export function createBrowserTool(_opts?: {
         const providedCode = String(params.code ?? params.value ?? "").trim();
         let code = providedCode;
         if (!code && serviceCandidates.length > 0) {
-          for (const candidate of serviceCandidates) {
-            const credential = await getCredential({
-              workspaceDir: process.cwd(),
-              service: candidate,
-            });
-            const fallbackCode = String(credential?.mfaCode ?? "").trim();
-            if (fallbackCode) {
-              code = fallbackCode;
-              break;
-            }
+          const resolved = await resolveCredentialForCandidates({
+            workspaceDir: process.cwd(),
+            serviceCandidates,
+            currentUrl: liveUrl,
+          });
+          const fallbackCode = String(resolved?.credential?.mfaCode ?? "").trim();
+          if (fallbackCode) {
+            code = fallbackCode;
           }
         }
         if (!code) {
@@ -3340,6 +4671,71 @@ export function createBrowserTool(_opts?: {
           selector: mfaResult.selector,
           multiField: mfaResult.multiField,
           codeMasked: `***${code.slice(-2)}`,
+          ...(mfaResult.submissionError ? { submissionError: mfaResult.submissionError } : {}),
+          tab: serializeTab(tab),
+          snapshot,
+        };
+      }
+
+      if (action === "challenge") {
+        const tab = resolveTab(params.tabId);
+        setActiveTab(tab);
+        const engine = resolveEngine(tab, params);
+        const timeoutMs = clampInt(params.timeoutMs, 1000, 120000, DEFAULT_TIMEOUT_MS);
+        let challenge: {
+          detected: boolean;
+          provider: string | null;
+          confidence: "none" | "low" | "medium" | "high";
+          signals: string[];
+          url: string;
+        } = {
+          detected: false,
+          provider: null,
+          confidence: "none",
+          signals: [],
+          url: "",
+        };
+
+        if (engine === "live") {
+          let page = getLivePage(tab.id);
+          if (!page) {
+            const { context } = await ensureLiveRuntime();
+            const created = await context.newPage();
+            attachLivePage(tab.id, created);
+            const response = await created.goto(tab.url, {
+              waitUntil: "domcontentloaded",
+              timeout: timeoutMs,
+            });
+            setLiveMeta(tab.id, response);
+            page = created;
+          }
+          const liveUrl = normalizeHttpUrlOrFallback(String(page.url?.() ?? tab.url), tab.url);
+          if (liveUrl !== tab.url) {
+            appendHistoryEntry(tab, liveUrl);
+          }
+          tab.url = liveUrl;
+          tab.updatedAt = Date.now();
+          challenge = await detectInteractiveChallengeLive(page);
+        } else {
+          if (!tab.lastSnapshot) {
+            const captured = await captureTabSnapshotWithRetries(tab, params);
+            tab.lastSnapshot = captured.snapshot;
+          }
+          challenge = detectInteractiveChallengeFromFetchSnapshot(tab);
+        }
+
+        const snapshotAfter = params.snapshotAfter === true;
+        const snapshot = snapshotAfter
+          ? engine === "live"
+            ? await captureLiveTabSnapshot(tab, params)
+            : await captureTabSnapshot(tab, params)
+          : null;
+        return {
+          ok: true,
+          engine,
+          activeTabId: tab.id,
+          humanVerificationRequired: challenge.detected,
+          challenge,
           tab: serializeTab(tab),
           snapshot,
         };
@@ -3360,17 +4756,53 @@ export function createBrowserTool(_opts?: {
           const value = String(params.value ?? "");
           const slowly = params.slowly === true;
           const submit = params.submit === true;
-          if (action === "type") {
-            await page.locator(explicitSelector).first().fill("", { timeout: timeoutMs });
-            await page
-              .locator(explicitSelector)
+          // Resolve frame context for selectors prefixed with "frame:N:" (from snapshot iframe refs).
+          const { context: fillCtx, selector: fillSel } = resolveFrameSelector(page, explicitSelector);
+
+          // Detect input type so checkboxes and radio buttons are handled correctly.
+          // Playwright's .fill() does not toggle checked state — we need .setChecked()/.click().
+          const inputType = await fillCtx
+            .locator(fillSel)
+            .first()
+            .evaluate((el: any) => {
+              const tag = String(el?.tagName ?? "").toLowerCase();
+              return tag === "input" ? String(el.type ?? "text").toLowerCase() : tag;
+            })
+            .catch(() => "text");
+
+          if (inputType === "checkbox") {
+            const checked = !["false", "0", "no", "off", "unchecked", ""].includes(value.toLowerCase());
+            await fillCtx.locator(fillSel).first().setChecked(checked, { timeout: timeoutMs });
+          } else if (inputType === "radio") {
+            // Radio buttons are selected by clicking; only click if value is truthy.
+            if (!["false", "0", "no", "off"].includes(value.toLowerCase())) {
+              await fillCtx.locator(fillSel).first().click({ timeout: timeoutMs });
+            }
+          } else if (inputType === "date") {
+            await fillLiveLocatorWithDateFallback({
+              locator: fillCtx.locator(fillSel).first(),
+              value,
+              timeoutMs,
+              typeMode: action === "type" ? "type" : "fill",
+              slowly,
+              submit,
+            });
+          } else if (action === "type") {
+            await fillCtx.locator(fillSel).first().fill("", { timeout: timeoutMs });
+            await fillCtx
+              .locator(fillSel)
               .first()
               .type(value, { timeout: timeoutMs, ...(slowly ? { delay: 35 } : {}) });
             if (submit) {
-              await page.locator(explicitSelector).first().press("Enter", { timeout: timeoutMs });
+              const submitted = await submitNearestFormFromInput(fillCtx.locator(fillSel).first(), timeoutMs);
+              if (!submitted) {
+                throw new Error(
+                  "Unable to submit typed form without triggering social/OAuth controls. Use browser action=submit or browser action=login.",
+                );
+              }
             }
           } else {
-            await page.locator(explicitSelector).first().fill(value, { timeout: timeoutMs });
+            await fillCtx.locator(fillSel).first().fill(value, { timeout: timeoutMs });
           }
           tab.updatedAt = Date.now();
           const snapshotAfter = params.snapshotAfter === true;
@@ -3434,6 +4866,11 @@ export function createBrowserTool(_opts?: {
           }
         }
         const form = resolveForm(tab, params.formIndex, params.ref);
+        assertNotSocialAuthTarget({
+          label: "",
+          href: form.action,
+          action: "submit",
+        });
         const payload = collectFormPayload(tab, form);
         const payloadText = payload.toString();
         const engine = resolveEngine(tab);
@@ -3595,6 +5032,130 @@ export function createBrowserTool(_opts?: {
           activeTabId: tab.id,
           waitedMs: delayMs,
           textGone: textGone || undefined,
+          tab: serializeTab(tab),
+          snapshot,
+        };
+      }
+
+      if (action === "wait_for_request" || action === "wait-for-request") {
+        const tab = resolveTab(params.tabId);
+        setActiveTab(tab);
+        const engine = resolveEngine(tab);
+        if (engine !== "live") {
+          throw new Error("wait_for_request requires engine=live.");
+        }
+        const page = requireLivePage(tab);
+        const timeoutMs = clampInt(params.timeoutMs, 1000, 120000, DEFAULT_TIMEOUT_MS);
+        const urlFilter = String(params.waitForRequestUrl ?? params.urlContains ?? "").trim();
+        const methodFilter = String(params.waitForRequestMethod ?? "")
+          .trim()
+          .toUpperCase();
+        const statusRaw = Number(params.waitForStatus);
+        const statusFilter = Number.isFinite(statusRaw) ? clampInt(statusRaw, 100, 599, 0) : 0;
+        const requestBodyFilter = String(params.waitForRequestBodyIncludes ?? "")
+          .trim()
+          .toLowerCase();
+        const responseBodyFilter = String(params.waitForResponseBodyIncludes ?? "")
+          .trim()
+          .toLowerCase();
+        if (!urlFilter && !methodFilter && !statusFilter && !requestBodyFilter && !responseBodyFilter) {
+          throw new Error(
+            "wait_for_request requires at least one filter (waitForRequestUrl, waitForRequestMethod, waitForStatus, waitForRequestBodyIncludes, waitForResponseBodyIncludes).",
+          );
+        }
+
+        const matchesRequest = (request: any): boolean => {
+          const reqUrl = String(request?.url?.() ?? "");
+          if (urlFilter && !reqUrl.includes(urlFilter)) {
+            return false;
+          }
+          if (methodFilter) {
+            const method = String(request?.method?.() ?? "")
+              .trim()
+              .toUpperCase();
+            if (method !== methodFilter) {
+              return false;
+            }
+          }
+          if (requestBodyFilter) {
+            const postData = String(request?.postData?.() ?? "").toLowerCase();
+            if (!postData.includes(requestBodyFilter)) {
+              return false;
+            }
+          }
+          return true;
+        };
+
+        let matchedRequest: any = null;
+        let matchedResponse: any = null;
+        if (statusFilter || responseBodyFilter) {
+          matchedResponse = await page.waitForResponse(
+            async (response: any) => {
+              const request = response?.request?.();
+              if (!request || !matchesRequest(request)) {
+                return false;
+              }
+              if (statusFilter) {
+                const status = Number(response?.status?.() ?? 0);
+                if (status !== statusFilter) {
+                  return false;
+                }
+              }
+              if (responseBodyFilter) {
+                try {
+                  const body = String(await response.text()).toLowerCase();
+                  if (!body.includes(responseBodyFilter)) {
+                    return false;
+                  }
+                } catch {
+                  return false;
+                }
+              }
+              return true;
+            },
+            { timeout: timeoutMs },
+          );
+          matchedRequest = matchedResponse?.request?.() ?? null;
+        } else {
+          matchedRequest = await page.waitForRequest((request: any) => matchesRequest(request), {
+            timeout: timeoutMs,
+          });
+          matchedResponse = await matchedRequest?.response?.().catch(() => null);
+        }
+
+        const requestUrl = String(matchedRequest?.url?.() ?? "");
+        const requestMethod = String(matchedRequest?.method?.() ?? "");
+        const requestHeaders = (matchedRequest?.headers?.() as Record<string, string>) ?? {};
+        const requestBody = String(matchedRequest?.postData?.() ?? "");
+        const responseStatus = Number(matchedResponse?.status?.() ?? 0) || null;
+        const responseUrl = String(matchedResponse?.url?.() ?? requestUrl);
+        const responseHeaders = (matchedResponse?.headers?.() as Record<string, string>) ?? {};
+        const responseOk = typeof matchedResponse?.ok === "function" ? Boolean(matchedResponse.ok()) : null;
+        const snapshotAfter = params.snapshotAfter === true;
+        const snapshot = snapshotAfter ? await captureLiveTabSnapshot(tab, params) : null;
+        return {
+          ok: true,
+          engine,
+          activeTabId: tab.id,
+          matched: true,
+          wait: {
+            timeoutMs,
+            urlFilter: urlFilter || null,
+            methodFilter: methodFilter || null,
+            statusFilter: statusFilter || null,
+          },
+          request: {
+            url: requestUrl,
+            method: requestMethod || null,
+            headers: requestHeaders,
+            bodySnippet: requestBody ? requestBody.slice(0, 1000) : "",
+          },
+          response: {
+            url: responseUrl || null,
+            status: responseStatus,
+            ok: responseOk,
+            headers: responseHeaders,
+          },
           tab: serializeTab(tab),
           snapshot,
         };
@@ -3809,7 +5370,42 @@ export function createBrowserTool(_opts?: {
           selector = `form:nth-of-type(${form.index}) [name="${escapeCssAttributeValue(field.name)}"]`;
         }
 
-        await page.locator(selector).first().selectOption(values, { timeout: timeoutMs });
+        // Try native <select> first. Fall back to custom combobox (role=combobox / role=listbox)
+        // which is used by Material UI, Radix, Ant Design, shadcn, etc.
+        let selectOk = false;
+        try {
+          await page.locator(selector).first().selectOption(values, { timeout: Math.min(timeoutMs, 5000) });
+          selectOk = true;
+        } catch {
+          // Not a native select — try combobox pattern.
+        }
+        if (!selectOk) {
+          // Click the trigger to open the dropdown.
+          await page.locator(selector).first().click({ timeout: Math.min(timeoutMs, 5000) });
+          try {
+            await page.waitForLoadState("domcontentloaded", { timeout: Math.min(timeoutMs, 2000) });
+          } catch {}
+          const searchValue = values[0] ?? "";
+          // Type into the combobox input if it has one (type-to-filter pattern).
+          const comboInput = page.locator(`${selector} input, [role="combobox"] input`).first();
+          const hasInput = await comboInput.isVisible().catch(() => false);
+          if (hasInput) {
+            await comboInput.fill(searchValue, { timeout: Math.min(timeoutMs, 3000) });
+            try { await page.waitForTimeout(400); } catch {}
+          }
+          // Click the matching option in the dropdown.
+          const optionClicked = await clickRoleButtonExcludingSocial({
+            page,
+            namePattern: new RegExp(searchValue.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"),
+            timeoutMs: Math.min(timeoutMs, 5000),
+          });
+          if (!optionClicked) {
+            // Fallback: click any [role=option] whose text matches.
+            const optionLocator = page.locator(`[role="option"]`).filter({ hasText: searchValue }).first();
+            await optionLocator.click({ timeout: Math.min(timeoutMs, 4000) });
+          }
+          selectOk = true;
+        }
         if (resolvedRef?.formIndex && resolvedRef.fieldName) {
           const formIndex = resolvedRef.formIndex;
           if (!tab.formValues[formIndex]) {
@@ -4035,6 +5631,38 @@ export function createBrowserTool(_opts?: {
         };
       }
 
+      if (action === "downloads") {
+        const tab = resolveTab(params.tabId);
+        setActiveTab(tab);
+        const engine = resolveEngine(tab);
+        if (engine !== "live") {
+          return {
+            ok: true,
+            engine,
+            activeTabId: tab.id,
+            downloads: [],
+            count: 0,
+            total: 0,
+          };
+        }
+        const clear = params.clear === true;
+        const rows = liveDownloadsByTabId.get(tab.id) ?? [];
+        const limit = clampInt(params.limit, 1, 500, 50);
+        const items = rows.slice(-limit).map((row) => serializeDownloadEntry(row));
+        if (clear) {
+          liveDownloadsByTabId.set(tab.id, []);
+        }
+        return {
+          ok: true,
+          engine,
+          activeTabId: tab.id,
+          count: items.length,
+          total: rows.length,
+          clear,
+          downloads: items,
+        };
+      }
+
       if (action === "pdf") {
         const tab = resolveTab(params.tabId);
         setActiveTab(tab);
@@ -4086,13 +5714,14 @@ export function createBrowserTool(_opts?: {
         const engine = resolveEngine(tab);
         const byRef = resolveSnapshotRef(tab, params.ref);
         const explicitSelector = getExplicitSelector(params, "selector");
-        const snapshotAfter = params.snapshotAfter !== false;
+        const requestedSnapshotAfter = params.snapshotAfter !== false;
 
         if (engine === "live") {
           const timeoutMs = clampInt(params.timeoutMs, 1000, 120000, DEFAULT_TIMEOUT_MS);
-          const popupWaitMs = clampInt(params.popupWaitMs, 100, 10000, 1200);
+          const popupWaitMs = clampInt(params.popupWaitMs, 100, 10000, 3000);
           const page = requireLivePage(tab);
           const button = normalizeClickButton(params.button);
+          const snapshotAfter = requestedSnapshotAfter || button === "right";
           const clickCount = params.doubleClick === true ? 2 : clampInt(params.clickCount, 1, 5, 1);
           const modifiers = normalizeClickModifiers(params.modifiers);
           const clickOptions: Record<string, unknown> = {
@@ -4137,9 +5766,13 @@ export function createBrowserTool(_opts?: {
           let clicked: Record<string, unknown> = {};
           let popupTab: BrowserTab | null = null;
           let popupSnapshot: BrowserSnapshot | null = null;
+          const downloadCountBefore = (liveDownloadsByTabId.get(tab.id) ?? []).length;
           const beforeUrl = normalizeHttpUrlOrFallback(page.url(), tab.url);
           if (selector) {
-            const locator = page.locator(selector).first();
+            // Resolve frame context for "frame:N:selector" refs produced by iframe snapshot detection.
+            const { context: clickCtx, selector: clickSel } = resolveFrameSelector(page, selector);
+            const locator = clickCtx.locator(clickSel).first();
+            await assertLocatorNotSocialAuth(locator, "click");
             const popupPromise = page.waitForEvent("popup", { timeout: popupWaitMs }).catch(() => null);
             const urlChangedPromise = page
               .waitForURL((url: URL) => url.toString() !== beforeUrl, { timeout: Math.min(timeoutMs, 10_000) })
@@ -4147,13 +5780,20 @@ export function createBrowserTool(_opts?: {
               .catch(() => false);
             await locator.click(clickOptions as any);
             const popup = await popupPromise;
-            const changed = await urlChangedPromise;
-            if (!changed) {
+            await urlChangedPromise;
+            if (button === "right") {
               try {
-                await page.waitForLoadState("domcontentloaded", { timeout: Math.min(timeoutMs, 1200) });
+                await page.waitForTimeout(260);
               } catch {
-                // no-op for SPA interactions without full load.
+                // no-op
               }
+            }
+            // Always wait for page to settle after click (handles both SPA state changes
+            // and full navigations, including Clerk / OTP multi-step auth flows).
+            try {
+              await page.waitForLoadState("domcontentloaded", { timeout: Math.min(timeoutMs, 3000) });
+            } catch {
+              // no-op for SPA interactions without a full load event.
             }
             if (popup) {
               const popupResult = await registerPopupTabFromLivePage(tab, popup, params);
@@ -4171,6 +5811,11 @@ export function createBrowserTool(_opts?: {
             };
           } else {
             fallbackTarget = fallbackTarget ?? findClickTarget(tab, params);
+            assertNotSocialAuthTarget({
+              label: fallbackTarget.text,
+              href: fallbackTarget.url,
+              action: "click",
+            });
             navigateTab(tab, fallbackTarget.url);
             const response = await page.goto(fallbackTarget.url, {
               waitUntil: "domcontentloaded",
@@ -4179,6 +5824,12 @@ export function createBrowserTool(_opts?: {
             setLiveMeta(tab.id, response);
             clicked = fallbackTarget;
           }
+          const downloadTimeoutMs = Math.min(timeoutMs, 5000);
+          const newDownloads = await waitForNewDownloadEntries({
+            tabId: tab.id,
+            beforeCount: downloadCountBefore,
+            timeoutMs: downloadTimeoutMs,
+          });
 
           let activeTab = tab;
           let snapshot: BrowserSnapshot | null = null;
@@ -4220,6 +5871,8 @@ export function createBrowserTool(_opts?: {
             ok: true,
             engine,
             clicked,
+            downloads: newDownloads.map((row) => serializeDownloadEntry(row)),
+            downloadCount: (liveDownloadsByTabId.get(tab.id) ?? []).length,
             activeTabId: browserState.activeTabId,
             tab: serializeTab(activeTab),
             snapshot,
@@ -4234,6 +5887,11 @@ export function createBrowserTool(_opts?: {
 
         if (byRef?.kind === "submit") {
           const form = resolveForm(tab, byRef.formIndex, byRef.ref);
+          assertNotSocialAuthTarget({
+            label: byRef.name,
+            href: form.action,
+            action: "click submission",
+          });
           const payload = collectFormPayload(tab, form);
           const payloadText = payload.toString();
           if (form.method === "get") {
@@ -4242,7 +5900,7 @@ export function createBrowserTool(_opts?: {
               target.searchParams.append(key, value);
             }
             navigateTab(tab, target.toString());
-            const snapshot = snapshotAfter ? await captureTabSnapshot(tab, params) : null;
+            const snapshot = requestedSnapshotAfter ? await captureTabSnapshot(tab, params) : null;
             return {
               ok: true,
               engine,
@@ -4254,7 +5912,7 @@ export function createBrowserTool(_opts?: {
             };
           }
           navigateTab(tab, form.action);
-          const snapshot = snapshotAfter
+          const snapshot = requestedSnapshotAfter
             ? await captureTabSnapshot(tab, params, {
                 method: "POST",
                 url: form.action,
@@ -4273,8 +5931,13 @@ export function createBrowserTool(_opts?: {
         }
 
         const target = byRef?.kind === "link" && byRef.url ? { index: -1, text: byRef.name, url: byRef.url } : findClickTarget(tab, params);
+        assertNotSocialAuthTarget({
+          label: target.text,
+          href: target.url,
+          action: "click",
+        });
         navigateTab(tab, target.url);
-        const snapshot = snapshotAfter ? await captureTabSnapshot(tab, params) : null;
+        const snapshot = requestedSnapshotAfter ? await captureTabSnapshot(tab, params) : null;
         return {
           ok: true,
           engine,
@@ -4286,7 +5949,8 @@ export function createBrowserTool(_opts?: {
       }
 
       if (action === "act") {
-        const kind = String(params.kind ?? "click").trim().toLowerCase();
+        const kindRaw = String(params.kind ?? "click").trim().toLowerCase();
+        const kind = kindRaw.replace(/-/g, "_");
         const requestFields = Array.isArray(params.fields)
           ? params.fields.filter((entry) => entry && typeof entry === "object")
           : [];
@@ -4322,6 +5986,7 @@ export function createBrowserTool(_opts?: {
           kind === "submit" ||
           kind === "navigate" ||
           kind === "wait" ||
+          kind === "wait_for_request" ||
           kind === "hover" ||
           kind === "press" ||
           kind === "select" ||
@@ -4330,11 +5995,13 @@ export function createBrowserTool(_opts?: {
           kind === "upload" ||
           kind === "dialog" ||
           kind === "console" ||
+          kind === "downloads" ||
           kind === "pdf" ||
           kind === "scroll" ||
           kind === "resize" ||
           kind === "login" ||
           kind === "mfa" ||
+          kind === "challenge" ||
           kind === "close"
             ? kind
             : null;

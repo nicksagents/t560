@@ -43,6 +43,8 @@ export function buildAgentSystemPrompt(params: {
       exists: "Check whether a file or directory exists.",
       browser:
         "Stateful browser navigation with tabs/history/snapshot/search/click/forms/fill/submit/login/mfa/hover/press/select/drag/evaluate/upload/dialog/console/pdf/scroll/resize/back/forward; use engine=live for SPA/reactive sites.",
+      email:
+        "Mailbox access using vault credentials: status/list_unread/read_unread/read_recent/send. Uses IMAP/SMTP for app-password style credentials and returns browser-login fallback steps for MFA/password flows.",
       web_search:
         "Search the web for up-to-date info (Brave when configured, DuckDuckGo fallback) and optionally fetch top results for grounded excerpts.",
       web_fetch: "Fetch a URL and return a readable text snapshot.",
@@ -65,6 +67,7 @@ export function buildAgentSystemPrompt(params: {
       "find",
       "exists",
       "browser",
+      "email",
       "web_search",
       "web_fetch",
       "memory_search",
@@ -122,12 +125,16 @@ export function buildAgentSystemPrompt(params: {
       "If you are blocked on user input (for example MFA), say exactly what is needed in one short sentence.",
       "Never invent observations; only report what is directly supported by current tool outputs.",
       "Never claim completion unless tool results confirm success.",
+      "For any state-changing request (create/update/delete/send/submit/install/uninstall), enforce a two-step completion protocol: 1) perform the action, 2) run an explicit verification step and confirm postconditions.",
+      "Use concrete postcondition checks: for file ops use existence/listing checks, for web/app ops use snapshot/readback/status evidence that reflects the requested end state.",
+      "If verification was not completed or is inconclusive, say the task is not verified yet and state what verification is still needed.",
       ""
     );
 
     const hasWebSearch = availableTools.has("web_search");
     const hasWebFetch = availableTools.has("web_fetch");
     const hasBrowser = availableTools.has("browser");
+    const hasEmail = availableTools.has("email");
     if (hasWebSearch || hasWebFetch || hasBrowser) {
       lines.push(
         "## Web Grounding",
@@ -156,15 +163,39 @@ export function buildAgentSystemPrompt(params: {
           "If the user asks to open a browser/window for them on their machine, use `browser` action=`launch` with the target URL.",
           "When a site is JS-heavy (React/Vue/SPA), use `browser` with `engine=live`.",
           "For complex pages, call `browser` snapshot first and use returned element refs (`e1`, `e2`, ...) with `click`/`fill`/`submit`/`hover`/`press`/`select`/`drag`/`act`.",
-          "For login pages with stored credentials, use `browser` action=`login` with `service=<site>` (examples: email, x.com, havenvaults2-0) to avoid requesting or exposing secrets.",
-          "If `browser` login returns `requiresMfa: true`, ask the user for the one-time code in one short line, then immediately call `browser` action=`mfa` with `code` once they provide it.",
+          "For checkboxes: use `browser` action=`fill` with value=`true`/`false` — the tool auto-detects checkbox type and uses the correct API. For radio buttons: value=`true` clicks to select.",
+        "For custom dropdowns (combobox / Radix / Material UI / shadcn): use `browser` action=`select` with value=<option text> — it falls back from native <select> to click-open + type-filter + click-option automatically.",
+        "For SPAs that load data after the page shell: add `networkIdle: true` to `snapshot` params to wait for API calls to finish before reading the page.",
+        "For login pages with stored credentials, use `browser` action=`login` with `service=<site>` (typically the account website host). This injects secret from vault without exposing password text.",
+          "Always open the root URL of a site first (e.g. https://example.com), NEVER guess subpaths like /login, /sign-in, /auth, or /signin — navigate to the login form via the actual UI.",
+          "If a snapshot shows an embedded auth frame (e.g. from Privy, Auth0, Clerk), use the refs listed under 'Embedded Auth Frame' in the snapshot — do NOT open the auth provider URL directly or navigate to it.",
+          "Preferred auth sequence: 1) open target page, 2) run login, 3) if login returns requiresMfa=true then ask user for code, 4) run mfa with that code.",
+          "If login returns submitted=false for passwordless flows, continue by clicking a non-social email/code submit button before checking inbox.",
+          "When vault credentials exist for a site, do not choose social/OAuth provider buttons (Google/Apple/Microsoft/GitHub); use the identifier/password or passwordless one-time-code form path instead.",
+          "If `browser` login returns `requiresMfa: true`, stop all browser actions immediately and ask for the one-time code in one short sentence. Only say the code was sent when login result also confirms `submitted: true`.",
+          "For manual OTP/passwordless flows (user-directed, without vault credentials): after filling the email and clicking send-code, tell the user the code was sent and wait. Do NOT snapshot the page, do NOT navigate, do NOT take any browser action.",
+          "CRITICAL — When the user's message contains a numeric one-time code (4–10 digits) after a login/OTP flow: your ABSOLUTE FIRST action must be `browser` action=`mfa` with code=<their code> and tabId=<tabId from the previous browser result>. Do NOT take a snapshot first. Do NOT open the site. Do NOT call login again. Call mfa immediately — the browser session is preserved and the OTP input is waiting.",
+          "If `action=mfa` returns an error about the OTP input not being found: the session expired while waiting. Do NOT reuse the user's old code. Re-do action=login to get a fresh code sent, then ask the user for the new code.",
+          "The browser session (Playwright tab) persists across chat turns. The OTP input is still on the screen from the previous turn — do NOT navigate away or the session is destroyed.",
+          "Never claim the one-time code was sent unless browser login result confirms submission (`submitted: true`); otherwise the submission is not confirmed, retry the send-code step.",
           "When the user sends a likely one-time code (4-10 digits), do not ask them to repeat it; use it directly via `browser` action=`mfa`.",
-          "If credentials are missing, tell the user to run `/setup <service-or-site>` in chat rather than asking them to paste passwords directly.",
-          "Use `console` to inspect browser logs, `dialog` to arm confirm/prompt handling, `upload` for file inputs, `scroll`/`resize` for viewport control, and `pdf` to export current page.",
+          "If login or page progression appears blocked by captcha/verification, run `browser` action=`challenge` first and ask the user to complete the human check before retrying.",
+          "If credentials are missing, tell the user to add them in Setup -> Vault (or run `/setup <service-or-site>` in chat) rather than asking them to paste passwords directly.",
+          "Use `console` to inspect browser logs, `dialog` to arm confirm/prompt handling, `upload` for file inputs, `downloads` to inspect captured downloads, `wait_for_request` for network-level waits, `scroll`/`resize` for viewport control, and `pdf` to export current page.",
           'Before purchase/checkout actions (for example "buy now", "place order", payment submit), ask for explicit user confirmation phrase: "confirm purchase".',
         );
       }
       lines.push("");
+    }
+
+    if (hasEmail) {
+      lines.push(
+        "## Email Ops",
+        "When the user asks to check inbox/unread/send/reply over email, use `email` first instead of asking them to manually open an inbox.",
+        "Prefer vault-backed mailbox credentials; if email returns browser-login fallback, continue with `browser` action=`open` + `browser` action=`login` for that mailbox service.",
+        "For ongoing email conversations, preserve thread context using message-id headers (`inReplyTo`/`references`) returned by prior email reads.",
+        ""
+      );
     }
 
     const hasMemorySearch = availableTools.has("memory_search");

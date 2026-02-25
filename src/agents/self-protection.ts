@@ -405,6 +405,50 @@ function assertSegmentAllowed(segment: string, cwd: string, policy: SelfProtecti
   }
 
   const commandName = path.basename(tokens[commandIndex]).toLowerCase();
+  const nextToken = String(tokens[commandIndex + 1] ?? "").toLowerCase();
+  const joinedLower = tokens.slice(commandIndex + 1).join(" ").toLowerCase();
+  const blockPowerControl = (): never => {
+    throw new Error(
+      [
+        "Command blocked by safety policy.",
+        "Power-control commands (shutdown/reboot/poweroff/halt) are not allowed via exec tool.",
+      ].join(" ")
+    );
+  };
+  if (commandName === "shutdown" || commandName === "reboot" || commandName === "poweroff" || commandName === "halt") {
+    blockPowerControl();
+  }
+  if (commandName === "init" || commandName === "telinit") {
+    if (nextToken === "0" || nextToken === "6") {
+      blockPowerControl();
+    }
+  }
+  if (commandName === "systemctl" || commandName === "loginctl") {
+    if (
+      nextToken === "poweroff" ||
+      nextToken === "reboot" ||
+      nextToken === "halt" ||
+      nextToken === "suspend" ||
+      nextToken === "hibernate" ||
+      nextToken === "kexec"
+    ) {
+      blockPowerControl();
+    }
+  }
+  if (commandName === "cmd" || commandName === "cmd.exe") {
+    if (/\bshutdown\b/.test(joinedLower)) {
+      blockPowerControl();
+    }
+  }
+  if (commandName === "powershell" || commandName === "pwsh") {
+    if (
+      /\bstop-computer\b/.test(joinedLower) ||
+      /\brestart-computer\b/.test(joinedLower) ||
+      /\bshutdown\b/.test(joinedLower)
+    ) {
+      blockPowerControl();
+    }
+  }
   if (commandName === "bash" || commandName === "sh" || commandName === "zsh") {
     for (let i = commandIndex + 1; i < tokens.length; i += 1) {
       const token = tokens[i];

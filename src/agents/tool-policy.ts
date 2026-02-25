@@ -10,7 +10,8 @@ const TOOL_NAME_ALIASES: Record<string, string> = {
 export const TOOL_GROUPS: Record<string, string[]> = {
   "group:fs": ["read", "write", "edit", "ls", "find", "exists"],
   "group:runtime": ["exec", "process"],
-  "group:messaging": ["message", "sessions_send"],
+  "group:email": ["email"],
+  "group:messaging": ["message", "sessions_send", "email"],
   "group:web": ["web_search", "web_fetch"],
   "group:memory": ["memory_search", "memory_get", "memory_save", "memory_delete", "memory_list", "memory_prune", "memory_feedback", "memory_stats", "memory_compact"],
   "group:ui": ["browser"],
@@ -18,6 +19,7 @@ export const TOOL_GROUPS: Record<string, string[]> = {
     "exec",
     "process",
     "browser",
+    "email",
     "web_search",
     "web_fetch",
     "memory_search",
@@ -37,7 +39,7 @@ const TOOL_PROFILES: Record<ToolProfileId, ToolPolicyLike> = {
     allow: ["process"]
   },
   coding: {
-    allow: ["group:runtime", "group:fs", "group:web", "group:memory", "group:ui"]
+    allow: ["group:runtime", "group:fs", "group:web", "group:memory", "group:ui", "group:email"]
   },
   messaging: {
     allow: ["group:messaging", "process"]

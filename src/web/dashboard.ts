@@ -38,6 +38,7 @@ import {
   normalizeSetupService,
   setCredential,
   type CredentialAuthMode,
+  type CredentialMfaStrategy,
 } from "../security/credentials-vault.js";
 
 export type DashboardServer = {
@@ -662,6 +663,14 @@ function parseTelegramDmPolicy(raw: unknown): "pairing" | "allowlist" | "open" |
 function parseCredentialAuthMode(raw: unknown): CredentialAuthMode {
   const value = String(raw ?? "").trim().toLowerCase();
   if (
+    value === "password_with_mfa" ||
+    value === "password+mfa" ||
+    value === "password_and_mfa" ||
+    value === "mfa_required"
+  ) {
+    return "password_with_mfa";
+  }
+  if (
     value === "mfa" ||
     value === "passwordless" ||
     value === "passwordless_mfa_code" ||
@@ -670,6 +679,35 @@ function parseCredentialAuthMode(raw: unknown): CredentialAuthMode {
     return "passwordless_mfa_code";
   }
   return "password";
+}
+
+function parseCredentialMfaStrategy(raw: unknown): CredentialMfaStrategy {
+  const value = String(raw ?? "").trim().toLowerCase();
+  if (value === "email_or_user" || value === "email") {
+    return "email_or_user";
+  }
+  return "user_prompt";
+}
+
+function normalizeWebsiteUrlInput(raw: unknown): string {
+  const input = String(raw ?? "").trim();
+  if (!input) {
+    return "";
+  }
+  const candidates = input.includes("://") ? [input] : [`https://${input}`, input];
+  for (const candidate of candidates) {
+    try {
+      const parsed = new URL(candidate);
+      if (!/^https?:$/i.test(parsed.protocol)) {
+        continue;
+      }
+      const normalized = parsed.toString();
+      return normalized.endsWith("/") ? normalized.slice(0, -1) : normalized;
+    } catch {
+      // try next candidate
+    }
+  }
+  throw new Error("websiteUrl must be a valid http(s) URL or domain.");
 }
 
 function parseStringArray(raw: unknown): string[] {
@@ -706,6 +744,95 @@ function uniq(values: string[]): string[] {
   return [...new Set(values)];
 }
 
+function normalizeOpenAICompatibleBaseUrl(value: string): string {
+  const trimmed = String(value ?? "").trim();
+  if (!trimmed) {
+    return "";
+  }
+  let normalized = trimmed;
+  if (!/^https?:\/\//i.test(normalized)) {
+    normalized = `http://${normalized}`;
+  }
+  normalized = normalized.replace(/\/+$/g, "");
+  normalized = normalized.replace(/\/chat\/completions$/i, "");
+  normalized = normalized.replace(/\/v1\/chat$/i, "/v1");
+  if (!/\/v1$/i.test(normalized)) {
+    normalized = `${normalized}/v1`;
+  }
+  return normalized;
+}
+
+function isLikelyHttpUrl(value: string): boolean {
+  const trimmed = String(value ?? "").trim();
+  if (!trimmed) {
+    return false;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+async function fetchOpenAICompatibleModels(params: {
+  baseUrl: string;
+  apiKey?: string;
+}): Promise<{ ok: true; models: string[] } | { ok: false; error: string }> {
+  const normalizedBaseUrl = normalizeOpenAICompatibleBaseUrl(params.baseUrl);
+  if (!isLikelyHttpUrl(normalizedBaseUrl)) {
+    return { ok: false, error: "Invalid local model server URL. Use http://host:port/v1." };
+  }
+
+  const headers: Record<string, string> = {
+    accept: "application/json",
+  };
+  if (params.apiKey && params.apiKey.trim()) {
+    headers.authorization = `Bearer ${params.apiKey.trim()}`;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 7000);
+  timeout.unref?.();
+  try {
+    const response = await fetch(`${normalizedBaseUrl}/models`, {
+      method: "GET",
+      headers,
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      let detail = "";
+      try {
+        const text = (await response.text()).trim();
+        if (text) {
+          detail = text.replace(/\s+/g, " ").slice(0, 220);
+        }
+      } catch {
+        // ignore response body parse failure
+      }
+      return {
+        ok: false,
+        error: `Model discovery failed (${response.status})${detail ? `: ${detail}` : ""}`,
+      };
+    }
+    const payload = (await response.json()) as { data?: Array<{ id?: unknown }> };
+    const models = Array.isArray(payload?.data)
+      ? payload.data
+          .map((entry) => String(entry?.id ?? "").trim())
+          .filter(Boolean)
+      : [];
+    if (models.length === 0) {
+      return { ok: false, error: "Connected, but /v1/models returned no model ids." };
+    }
+    return { ok: true, models: uniq(models) };
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { ok: false, error: `Could not connect to local model server: ${message}` };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function hasProviderCredential(profile: unknown): boolean {
   if (!profile || typeof profile !== "object") {
     return false;
@@ -716,6 +843,14 @@ function hasProviderCredential(profile: unknown): boolean {
     String(obj.oauthToken ?? "").trim().length > 0 ||
     String(obj.token ?? "").trim().length > 0
   );
+}
+
+function isLocalModelReady(providerId: string, profile: unknown): boolean {
+  if (providerId !== "local-openai") {
+    return false;
+  }
+  const obj = profile as Record<string, unknown> | null;
+  return Boolean(String(obj?.baseUrl ?? "").trim());
 }
 
 function redactIdentifier(identifier: string): string {
@@ -752,7 +887,7 @@ async function buildSetupPayload(config: T560Config): Promise<Record<string, unk
         ),
         baseUrl: profile.baseUrl ?? "",
         api: profile.api ?? "",
-        hasCredential: hasProviderCredential(profile),
+        hasCredential: hasProviderCredential(profile) || isLocalModelReady(providerId, profile),
       },
     ]),
   );
@@ -772,6 +907,38 @@ async function buildSetupPayload(config: T560Config): Promise<Record<string, unk
       services: vaultServices,
     },
   };
+}
+
+async function handleGetCcSetupToken(res: ServerResponse): Promise<void> {
+  try {
+    const result = spawnSync("claude", ["setup-token"], {
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    if (result.error || result.status !== 0) {
+      const errDetail = result.error?.message ?? String(result.stderr ?? "").trim() ?? "non-zero exit";
+      sendJson(res, 200, {
+        ok: false,
+        error: `claude setup-token failed: ${errDetail}. Make sure Claude Code CLI is installed and you are logged in (run: claude auth login).`,
+      });
+      return;
+    }
+    const output = String(result.stdout ?? "").trim();
+    const match = output.match(/sk-ant-oat01-[\w-]+/);
+    if (!match) {
+      sendJson(res, 200, {
+        ok: false,
+        error: "No setup token found in output. Make sure you are logged in to Claude Code (run: claude auth login).",
+      });
+      return;
+    }
+    sendJson(res, 200, { ok: true, token: match[0] });
+  } catch (err: unknown) {
+    sendJson(res, 200, {
+      ok: false,
+      error: `Error running claude setup-token: ${err instanceof Error ? err.message : String(err)}`,
+    });
+  }
 }
 
 async function handleGetCcToken(res: ServerResponse): Promise<void> {
@@ -795,6 +962,64 @@ async function handleGetCcToken(res: ServerResponse): Promise<void> {
 async function handleGetSetup(res: ServerResponse): Promise<void> {
   const config = await readConfig();
   sendJson(res, 200, await buildSetupPayload(config));
+}
+
+async function handlePostSetupProviderModels(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const raw = await readBody(req);
+  let body: unknown = null;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    sendJson(res, 400, { ok: false, error: "invalid_json", message: "Request body must be valid JSON." });
+    return;
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    sendJson(res, 400, { ok: false, error: "invalid_body", message: "Body must be an object." });
+    return;
+  }
+
+  const obj = body as Record<string, unknown>;
+  const providerId = sanitizeProviderId(obj.providerId ?? "local-openai") || "local-openai";
+  if (providerId !== "local-openai") {
+    sendJson(res, 400, {
+      ok: false,
+      error: "invalid_provider",
+      message: "Model discovery endpoint currently supports local-openai only.",
+    });
+    return;
+  }
+
+  const baseUrlRaw = String(obj.baseUrl ?? "").trim();
+  const apiKey = typeof obj.apiKey === "string" ? obj.apiKey.trim() : "";
+  const normalizedBaseUrl = normalizeOpenAICompatibleBaseUrl(baseUrlRaw);
+  if (!normalizedBaseUrl || !isLikelyHttpUrl(normalizedBaseUrl)) {
+    sendJson(res, 400, {
+      ok: false,
+      error: "invalid_base_url",
+      message: "baseUrl is required and must be a valid http(s) URL.",
+    });
+    return;
+  }
+
+  const result = await fetchOpenAICompatibleModels({
+    baseUrl: normalizedBaseUrl,
+    ...(apiKey ? { apiKey } : {}),
+  });
+
+  if (!result.ok) {
+    sendJson(res, 200, {
+      ok: false,
+      normalizedBaseUrl,
+      error: result.error,
+    });
+    return;
+  }
+
+  sendJson(res, 200, {
+    ok: true,
+    normalizedBaseUrl,
+    models: result.models,
+  });
 }
 
 async function handlePutSetupProvider(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -1082,8 +1307,15 @@ async function buildVaultEntries(workspaceDir: string): Promise<Array<Record<str
     }
     rows.push({
       service: record.service,
+      websiteUrl: record.websiteUrl ?? "",
+      identifier: record.identifier,
       identifierMasked: redactIdentifier(record.identifier),
+      identifierVisibleToAgent: true,
+      secretStored: true,
+      secretVisibleToAgent: false,
       authMode: record.authMode,
+      mfaStrategy: record.mfaStrategy ?? "user_prompt",
+      mfaSourceService: record.mfaSourceService ?? "",
       hasMfaCode: Boolean(record.mfaCode),
       createdAt: record.createdAt,
       updatedAt: record.updatedAt,
@@ -1112,37 +1344,73 @@ async function handlePutVaultCredential(req: IncomingMessage, res: ServerRespons
     return;
   }
   const obj = body as Record<string, unknown>;
-  const service = normalizeSetupService(String(obj.service ?? ""));
-  if (!service) {
-    sendJson(res, 400, { error: "invalid_service", message: "service is required." });
+  let websiteUrl = "";
+  try {
+    websiteUrl = normalizeWebsiteUrlInput(obj.websiteUrl);
+  } catch (error: unknown) {
+    sendJson(res, 400, {
+      error: "invalid_website_url",
+      message: error instanceof Error ? error.message : "Invalid websiteUrl.",
+    });
     return;
   }
-  const identifier = String(obj.identifier ?? "").trim();
-  if (!identifier) {
-    sendJson(res, 400, { error: "invalid_identifier", message: "identifier is required." });
+  const service =
+    normalizeSetupService(String(obj.service ?? "")) ||
+    normalizeSetupService(websiteUrl);
+  if (!service) {
+    sendJson(res, 400, {
+      error: "invalid_service",
+      message: "service or websiteUrl is required.",
+    });
     return;
+  }
+  const workspaceDir = process.cwd();
+  const identifierInput = String(obj.identifier ?? "").trim();
+  let identifier = identifierInput;
+  let identifierReused = false;
+  if (!identifier) {
+    const existing = await getCredential({ workspaceDir, service });
+    const existingIdentifier = String(existing?.identifier ?? "").trim();
+    if (!existingIdentifier) {
+      sendJson(res, 400, {
+        error: "invalid_identifier",
+        message: "identifier is required for new services. For existing services you may leave it blank.",
+      });
+      return;
+    }
+    identifier = existingIdentifier;
+    identifierReused = true;
   }
   const authMode = parseCredentialAuthMode(obj.authMode);
+  const mfaStrategy = parseCredentialMfaStrategy(obj.mfaStrategy);
+  const mfaSourceService =
+    normalizeSetupService(String(obj.mfaSourceService ?? "")) || undefined;
   const secretRaw = String(obj.secret ?? "");
-  const secret = authMode === "password" ? secretRaw : "";
-  if (authMode === "password" && !secret) {
-    sendJson(res, 400, { error: "invalid_secret", message: "secret is required for password mode." });
+  const secret = authMode === "passwordless_mfa_code" ? "" : secretRaw;
+  if ((authMode === "password" || authMode === "password_with_mfa") && !secret) {
+    sendJson(res, 400, {
+      error: "invalid_secret",
+      message: "secret is required for password and password_with_mfa modes.",
+    });
     return;
   }
   const mfaCode = typeof obj.mfaCode === "string" ? obj.mfaCode.trim() : "";
-  const workspaceDir = process.cwd();
   const result = await setCredential({
     workspaceDir,
     service,
     identifier,
     secret,
     authMode,
+    ...(websiteUrl ? { websiteUrl } : {}),
+    ...(mfaSourceService ? { mfaSourceService } : {}),
+    ...(authMode !== "password" ? { mfaStrategy } : {}),
     ...(mfaCode ? { mfaCode } : {}),
   });
   sendJson(res, 200, {
     ok: true,
     service: result.service,
     created: result.created,
+    identifierReused,
     entries: await buildVaultEntries(workspaceDir),
   });
 }
@@ -1662,12 +1930,20 @@ async function routeRequest(
     await handleGetCcToken(res);
     return;
   }
+  if (method === "GET" && pathname === "/api/setup/cc-setup-token") {
+    await handleGetCcSetupToken(res);
+    return;
+  }
   if (method === "GET" && pathname === "/api/setup") {
     await handleGetSetup(res);
     return;
   }
   if (method === "PUT" && pathname === "/api/setup/provider") {
     await handlePutSetupProvider(req, res);
+    return;
+  }
+  if (method === "POST" && pathname === "/api/setup/provider/models") {
+    await handlePostSetupProviderModels(req, res);
     return;
   }
   if (method === "DELETE" && pathname === "/api/setup/provider") {

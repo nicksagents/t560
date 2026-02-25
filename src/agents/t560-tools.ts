@@ -1,6 +1,7 @@
 import type { T560Config } from "../config/state.js";
 import type { AnyAgentTool } from "./pi-tools.types.js";
 import { createBrowserTool } from "./tools/browser-tool.js";
+import { createEmailTool } from "./tools/email-tool.js";
 import {
   createMemoryCompactTool,
   createMemoryDeleteTool,
@@ -64,8 +65,12 @@ export function createT560Tools(options?: {
     workspaceDir,
     env: options?.env ?? process.env,
   });
+  const email = createEmailTool({
+    workspaceDir,
+  });
   return [
     createBrowserTool(),
+    email,
     ...(webSearch ? [webSearch] : []),
     ...(webFetch ? [webFetch] : []),
     memorySearch,

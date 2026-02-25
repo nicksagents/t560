@@ -92,7 +92,7 @@ test("secure setup supports listing and clearing configured services", async () 
     const start = await handleSecureSetupFlow({
       workspaceDir,
       sessionId,
-      message: "/setup havenvaults2-0",
+      message: "/setup securebank.example.com",
     });
     assert.equal(start.handled, true);
     assert.match(start.message, /enter the login identifier/i);
@@ -127,14 +127,14 @@ test("secure setup supports listing and clearing configured services", async () 
       message: "/setup list",
     });
     assert.equal(listed.handled, true);
-    assert.match(listed.message, /havenvaults2-0/);
+    assert.match(listed.message, /securebank\.example\.com/);
 
     const configured = await listConfiguredServices(workspaceDir);
-    assert.deepEqual(configured, ["havenvaults2-0"]);
+    assert.deepEqual(configured, ["securebank.example.com"]);
 
     const stored = await getCredential({
       workspaceDir,
-      service: "havenvaults2-0",
+      service: "securebank.example.com",
     });
     assert.ok(stored);
     assert.equal(stored.authMode, "passwordless_mfa_code");
@@ -143,7 +143,7 @@ test("secure setup supports listing and clearing configured services", async () 
     const cleared = await handleSecureSetupFlow({
       workspaceDir,
       sessionId,
-      message: "/setup clear havenvaults2-0",
+      message: "/setup clear securebank.example.com",
     });
     assert.equal(cleared.handled, true);
     assert.match(cleared.message, /removed secure credentials/i);

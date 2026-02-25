@@ -29,13 +29,13 @@ function renderSettingsNotice(host: T560App): string {
 }
 
 
-function renderTemplateOptions(host: T560App): string {
+function renderTemplateOptions(host: T560App, selectedTemplateId = host.setupNewProviderTemplate): string {
   if (host.setupCatalog.length === 0) {
     return `<option value="">No templates</option>`;
   }
   return host.setupCatalog
     .map((entry) => {
-      const selected = entry.id === host.setupNewProviderTemplate ? "selected" : "";
+      const selected = entry.id === selectedTemplateId ? "selected" : "";
       return `<option value="${escapeHtml(entry.id)}" ${selected}>${escapeHtml(entry.label)} (${escapeHtml(entry.id)})</option>`;
     })
     .join("");
@@ -52,9 +52,9 @@ function renderAuthModeOptions(host: T560App): string {
       if (mode === "api_key") {
         label = "API Key";
       } else if (mode === "oauth") {
-        label = isAnthropic ? "Claude Code OAuth" : "OAuth token";
+        label = isAnthropic ? "Claude Code OAuth (advanced)" : "OAuth token";
       } else if (mode === "token") {
-        label = isAnthropic ? "Setup Token (claude setup-token)" : "Provider token";
+        label = isAnthropic ? "Claude Code Auth Token (recommended)" : "Provider token";
       } else {
         label = mode;
       }
@@ -160,6 +160,38 @@ function formatDateTime(value: number): string {
   }
 }
 
+function providerAssignedSlots(host: T560App, providerId: string): string[] {
+  const slots: string[] = [];
+  if (host.setupRoutingDefaultProvider === providerId) {
+    slots.push("default");
+  }
+  if (host.setupRoutingPlanningProvider === providerId) {
+    slots.push("planning");
+  }
+  if (host.setupRoutingCodingProvider === providerId) {
+    slots.push("coding");
+  }
+  return slots;
+}
+
+function normalizeLocalBasePreview(value: string): string {
+  const fallback = "http://127.0.0.1:8080/v1";
+  const raw = String(value ?? "").trim();
+  if (!raw) {
+    return fallback;
+  }
+  let normalized = raw.replace(/\/+$/g, "");
+  if (!/^https?:\/\//i.test(normalized)) {
+    normalized = `http://${normalized}`;
+  }
+  normalized = normalized.replace(/\/chat\/completions$/i, "");
+  normalized = normalized.replace(/\/v1\/chat$/i, "/v1");
+  if (!/\/v1$/i.test(normalized)) {
+    normalized = `${normalized}/v1`;
+  }
+  return normalized;
+}
+
 function renderSectionNav(host: T560App, busy: boolean): string {
   const sections: Array<{ id: T560App["setupSection"]; label: string; icon: string }> = [
     { id: "provider", label: "Providers", icon: icons.checkCircle },
@@ -225,11 +257,13 @@ function renderProvidersCard(host: T560App, busy: boolean): string {
         profile.authMode === "oauth" ? "OAuth" : profile.authMode === "token" ? "Token" : "API Key";
       const statusChip =
         profile.enabled && profile.hasCredential
-          ? `<span class="chip chip-ok" style="font-size:11px;padding:2px 8px">✓</span>`
+          ? `<span class="chip chip-ok" style="font-size:11px;padding:2px 8px">ready</span>`
           : profile.hasCredential
-            ? `<span class="chip chip-warn" style="font-size:11px;padding:2px 8px">off</span>`
-            : `<span class="chip chip-warn" style="font-size:11px;padding:2px 8px">no key</span>`;
+            ? `<span class="chip chip-warn" style="font-size:11px;padding:2px 8px">disabled</span>`
+            : `<span class="chip chip-warn" style="font-size:11px;padding:2px 8px">needs credential</span>`;
 
+      const isLocalProvider = providerId === "local-openai";
+      const assignedSlots = providerAssignedSlots(host, providerId);
       const models = [
         ...new Set(
           [
@@ -240,18 +274,28 @@ function renderProvidersCard(host: T560App, busy: boolean): string {
             .filter(Boolean)
         ),
       ];
-      const modelsText = models.length > 0 ? models.join(", ") : "—";
+      const modelsText = isLocalProvider && profile.baseUrl
+        ? `${profile.baseUrl}${models.length > 0 ? ` · ${models.join(", ")}` : ""}`
+        : models.length > 0 ? models.join(", ") : "—";
 
-      return `<div style="border-top:1px solid var(--border);padding:10px 0;display:flex;align-items:flex-start;gap:10px;justify-content:space-between">
-        <div style="min-width:0;flex:1">
-          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      return `<div class="setup-provider-row">
+        <div class="setup-provider-row__main">
+          <div class="setup-provider-row__head">
             <span class="mono" style="font-size:13px;font-weight:600">${escapeHtml(providerId)}</span>
             <span class="muted" style="font-size:11px">${escapeHtml(authLabel)}</span>
             ${statusChip}
+            ${assignedSlots.length > 0
+              ? assignedSlots
+                  .map(
+                    (slot) =>
+                      `<span class="chip" style="font-size:10px;padding:2px 7px">${escapeHtml(slot)}</span>`
+                  )
+                  .join("")
+              : `<span class="chip" style="font-size:10px;padding:2px 7px">not assigned</span>`}
           </div>
-          <div class="muted" style="font-size:11px;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(modelsText)}</div>
+          <div class="setup-provider-row__models muted mono mono-break">${escapeHtml(modelsText)}</div>
         </div>
-        <div style="display:flex;gap:6px;flex-shrink:0">
+        <div class="setup-provider-row__actions">
           <button class="btn btn--sm" data-action="select-setup-provider" data-provider="${escapeHtml(providerId)}" ${busy ? "disabled" : ""}>Edit</button>
           <button class="btn btn--sm danger" data-action="delete-setup-provider" data-provider="${escapeHtml(providerId)}" ${busy ? "disabled" : ""}>×</button>
         </div>
@@ -323,33 +367,42 @@ function renderCodexOAuthInline(host: T560App, busy: boolean): string {
 function renderProviderForm(host: T560App, busy: boolean): string {
   const isNew = host.setupSelectedProvider === "__new__" || !host.setupProviders[host.setupSelectedProvider];
   const title = isNew ? "Add Provider" : `Edit: ${host.setupSelectedProvider}`;
-  const selectedCatalog = host.setupCatalog.find((entry) => entry.id === host.setupNewProviderTemplate);
+  const selectedProviderId =
+    host.setupSelectedProvider !== "__new__" ? host.setupSelectedProvider.trim() : "";
+  const effectiveTemplateId = (host.setupNewProviderTemplate.trim() || selectedProviderId).trim();
+  const assignedSlots = selectedProviderId ? providerAssignedSlots(host, selectedProviderId) : [];
+  const selectedCatalog = host.setupCatalog.find((entry) => entry.id === effectiveTemplateId);
   const selectedProviderState = host.setupProviders[host.setupSelectedProvider];
-  const isCodexOAuth = host.setupNewProviderTemplate === "openai-codex";
-  const isAnthropicOAuth = host.setupNewProviderTemplate === "anthropic" && host.setupProviderAuthMode === "oauth";
-  const isAnthropicToken = host.setupNewProviderTemplate === "anthropic" && host.setupProviderAuthMode === "token";
-  const credentialLabel = isAnthropicOAuth
-    ? "Claude Code OAuth token"
-    : isAnthropicToken
-      ? "Setup token (from claude setup-token)"
-      : host.setupProviderAuthMode === "oauth"
-        ? "OAuth token"
-        : host.setupProviderAuthMode === "token"
-          ? "Provider token"
-          : "API key";
-  const credentialPlaceholder = isAnthropicOAuth
-    ? "Paste token or use 'Load from Claude Code' below…"
-    : isAnthropicToken
-      ? "sk-ant-oat01-…"
-      : host.setupProviderAuthMode === "oauth"
-        ? "Paste your OAuth token…"
-        : host.setupProviderAuthMode === "token"
-          ? "Paste your provider token…"
-          : "Paste your API key…";
+  const isCodexOAuth = effectiveTemplateId === "openai-codex";
+  const isAnthropic = effectiveTemplateId === "anthropic";
+  const isLocalModel = effectiveTemplateId === "local-openai";
+  const localBasePreview = normalizeLocalBasePreview(host.setupProviderBaseUrl || "http://127.0.0.1:8080/v1");
+  const isAnthropicOAuth = isAnthropic && host.setupProviderAuthMode === "oauth";
+  const isAnthropicToken = isAnthropic && host.setupProviderAuthMode === "token";
+  const credentialLabel = isLocalModel
+    ? "API key (optional — most local servers don't require one)"
+    : isAnthropicOAuth
+      ? "Claude Code OAuth token"
+      : isAnthropicToken
+        ? "Claude Code auth token (from claude setup-token)"
+        : host.setupProviderAuthMode === "oauth"
+          ? "OAuth token"
+          : host.setupProviderAuthMode === "token"
+            ? "Provider token"
+            : "API key";
+  const credentialPlaceholder = isLocalModel
+    ? "Leave blank to skip, or enter your server's API key…"
+    : isAnthropicOAuth
+      ? "Paste token or use 'Load from Claude Code' below…"
+      : isAnthropicToken
+        ? "sk-ant-oat01-… (run: claude setup-token)"
+        : host.setupProviderAuthMode === "oauth"
+          ? "Paste your OAuth token…"
+          : host.setupProviderAuthMode === "token"
+            ? "Paste your provider token…"
+            : "Paste your API key…";
 
-  const isAnthropic = host.setupNewProviderTemplate === "anthropic";
-
-  const templateOpts = `<option value="" ${!host.setupNewProviderTemplate ? "selected" : ""}>— Select a provider —</option>${renderTemplateOptions(host)}`;
+  const templateOpts = `<option value="" ${!effectiveTemplateId ? "selected" : ""}>— Select a provider —</option>${renderTemplateOptions(host, effectiveTemplateId)}`;
 
   // Anthropic: show auth method selector + contextual instructions prominently
   const anthropicAuthBlock = isAnthropic ? `
@@ -358,12 +411,15 @@ function renderProviderForm(host: T560App, busy: boolean): string {
       <select data-input="setup-provider-auth" ${busy ? "disabled" : ""}>${renderAuthModeOptions(host)}</select>
     </label>
     ${isAnthropicOAuth ? `<div class="callout info" style="margin-top:8px;font-size:13px">
-        Uses your <strong>Claude Code CLI</strong> session. Click <strong>Load from Claude Code</strong> to auto-fill your token.<br/>
-        <span style="margin-top:4px;display:block">Don't have one? Switch to <strong>API Key</strong> above and get a key at <strong>console.anthropic.com/settings/keys</strong>.</span>
+        Uses your <strong>Claude Code CLI</strong> OAuth session. Click <strong>Load from Claude Code</strong> to auto-fill your token.<br/>
+        <span style="margin-top:4px;display:block">Recommended instead: switch to <strong>Claude Code Auth Token</strong> above and run <span class="mono">claude setup-token</span>.</span>
       </div>` : ""}
     ${isAnthropicToken ? `<div class="callout info" style="margin-top:8px;font-size:13px">
-        In your terminal, run: <span class="mono" style="user-select:all">claude setup-token</span><br/>
-        Copy the token that starts with <span class="mono">sk-ant-oat01-</span> and paste it below.
+        <strong>Get your Claude Code auth token:</strong><br/>
+        <span style="margin-top:4px;display:block">1. Install Claude Code CLI: <strong>https://claude.ai/code</strong></span>
+        <span>2. Login: <span class="mono" style="user-select:all">claude auth login</span></span>
+        <span>3. Get token: <span class="mono" style="user-select:all">claude setup-token</span></span>
+        <span style="margin-top:4px;display:block">Copy the <span class="mono">sk-ant-oat01-</span> token and paste it below, or click <strong>Load from Claude Code</strong>.</span>
       </div>` : ""}
     ${!isAnthropicOAuth && !isAnthropicToken ? `<div class="callout info" style="margin-top:8px;font-size:13px">
         Get your API key from <strong>console.anthropic.com/settings/keys</strong>.
@@ -381,26 +437,91 @@ function renderProviderForm(host: T560App, busy: boolean): string {
           ${ccStatus === "error" ? `<span style="color:var(--danger);font-size:12px">${escapeHtml(ccMsg)}</span>` : ""}
         </div>
         ${ccStatus === "error" ? `<div class="callout danger" style="margin-top:8px;font-size:12px">
-          <strong>Could not auto-load.</strong> To get your token manually:<br/>
-          Open a terminal and run: <span class="mono">claude auth status</span> — or switch to <strong>API Key</strong> mode above and get a key from <strong>console.anthropic.com/settings/keys</strong>.
+          <strong>Could not auto-load.</strong> Make sure Claude Code CLI is installed and logged in:<br/>
+          Run <span class="mono">claude auth login</span>, then try again.<br/>
+          Or switch to <strong>Claude Code Auth Token</strong> mode above and run <span class="mono">claude setup-token</span>.
         </div>` : ""}
       </div>`
-    : "";
+    : isAnthropicToken
+      ? `<div style="margin-top:8px">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <button class="btn" data-action="fetch-cc-setup-token" ${busy || ccStatus === "loading" ? "disabled" : ""}>
+              ${ccStatus === "loading" ? "Loading…" : "Load from Claude Code"}
+            </button>
+            ${ccStatus === "ok" ? `<span style="color:var(--ok);font-size:12px">✓ ${escapeHtml(ccMsg)}</span>` : ""}
+            ${ccStatus === "error" ? `<span style="color:var(--danger);font-size:12px">${escapeHtml(ccMsg)}</span>` : ""}
+          </div>
+          ${ccStatus === "error" ? `<div class="callout danger" style="margin-top:8px;font-size:12px">
+            <strong>Could not load token.</strong> Make sure Claude Code CLI is installed and logged in:<br/>
+            1. Install: <strong>https://claude.ai/code</strong><br/>
+            2. Run <span class="mono">claude auth login</span>, then try again.<br/>
+            Or run <span class="mono">claude setup-token</span> in your terminal and paste the token manually.
+          </div>` : ""}
+        </div>`
+      : "";
 
-  const authSection = isCodexOAuth
-    ? renderCodexOAuthInline(host, busy)
-    : `<label class="field full" style="margin-top:10px">
-        <span>${escapeHtml(credentialLabel)}${selectedProviderState?.hasCredential ? ' <em class="muted">(saved — leave blank to keep)</em>' : ""}</span>
-        <input type="password" data-input="setup-provider-credential" value="${escapeHtml(host.setupProviderCredential)}" placeholder="${escapeHtml(credentialPlaceholder)}" ${busy ? "disabled" : ""} autocomplete="off" />
-      </label>
-      ${loadCcTokenBtn}
-      <div class="settings-actions" style="margin-top:12px">
-        <button class="btn primary" data-action="save-setup-provider" ${busy ? "disabled" : ""}>Save Provider</button>
-        <button class="btn" data-action="cancel-setup-provider" ${busy ? "disabled" : ""}>Cancel</button>
-      </div>`;
+  const localModelBlock = isLocalModel ? `
+    <div class="callout info" style="margin-top:10px;font-size:13px">
+      <strong>Common server URLs</strong><br/>
+      <span style="margin-top:4px;display:block"><span class="mono">llama.cpp</span> &nbsp;→ <span class="mono mono-break" style="user-select:all">http://127.0.0.1:8080/v1</span></span>
+      <span><span class="mono">exo</span> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;→ <span class="mono mono-break" style="user-select:all">http://127.0.0.1:52415/v1</span></span><br/>
+      <span><span class="mono">ollama</span> &nbsp;&nbsp;&nbsp;&nbsp;→ <span class="mono mono-break" style="user-select:all">http://127.0.0.1:11434/v1</span></span>
+      <span style="margin-top:6px;display:block">You can paste <span class="mono">/v1/chat</span> or <span class="mono">/chat/completions</span>; setup/runtime normalize to OpenAI-compatible base URL.</span>
+    </div>
+    <label class="field full" style="margin-top:12px">
+      <span>Server base URL <em class="muted">(required)</em></span>
+      <input type="text" data-input="setup-provider-base-url" value="${escapeHtml(host.setupProviderBaseUrl || "http://127.0.0.1:8080/v1")}" placeholder="http://127.0.0.1:8080/v1" ${busy ? "disabled" : ""} />
+    </label>
+    <div class="settings-actions" style="margin-top:10px">
+      <button class="btn" data-action="fetch-setup-provider-models" ${busy ? "disabled" : ""}>Fetch models from server</button>
+    </div>
+    <label class="field full" style="margin-top:10px">
+      <span>Model IDs (comma separated) <em class="muted">(exact ids from /v1/models)</em></span>
+      <input type="text" data-input="setup-provider-models" value="${escapeHtml(host.setupProviderModels || "local-model")}" placeholder="local-model" ${busy ? "disabled" : ""} />
+    </label>
+    <div class="setup-provider-preview muted" style="font-size:12px">Effective endpoint: <span class="mono mono-break">${escapeHtml(localBasePreview)}/chat/completions</span></div>` : "";
+
+  const authSection = !effectiveTemplateId
+    ? `<div class="callout info" style="margin-top:14px;font-size:13px">Select a service above to continue.</div>
+       <div class="settings-actions" style="margin-top:12px">
+         <button class="btn" data-action="cancel-setup-provider" ${busy ? "disabled" : ""}>Cancel</button>
+       </div>`
+    : isCodexOAuth
+      ? renderCodexOAuthInline(host, busy)
+      : isLocalModel
+        ? `${localModelBlock}
+          <div class="settings-actions" style="margin-top:14px">
+            <button class="btn primary" data-action="save-setup-provider" ${busy ? "disabled" : ""}>Save Provider</button>
+            <button class="btn" data-action="cancel-setup-provider" ${busy ? "disabled" : ""}>Cancel</button>
+          </div>`
+        : `<label class="field full" style="margin-top:10px">
+            <span>Primary model</span>
+            <select data-input="setup-provider-model-choice" ${busy ? "disabled" : ""}>${renderProviderModelOptions(host)}</select>
+          </label>
+          <label class="field full" style="margin-top:10px">
+            <span>${escapeHtml(credentialLabel)}${selectedProviderState?.hasCredential ? ' <em class="muted">(saved — leave blank to keep)</em>' : ""}</span>
+            <input type="password" data-input="setup-provider-credential" value="${escapeHtml(host.setupProviderCredential)}" placeholder="${escapeHtml(credentialPlaceholder)}" ${busy ? "disabled" : ""} autocomplete="off" />
+          </label>
+          ${loadCcTokenBtn}
+          <div class="settings-actions" style="margin-top:12px">
+            <button class="btn primary" data-action="save-setup-provider" ${busy ? "disabled" : ""}>Save Provider</button>
+            <button class="btn" data-action="cancel-setup-provider" ${busy ? "disabled" : ""}>Cancel</button>
+          </div>`;
 
   return `<div class="card">
     <div class="card-title">${escapeHtml(title)}</div>
+    ${selectedProviderId
+      ? `<div class="setup-provider-route-chips">
+          <span class="muted" style="font-size:12px">Assigned routes:</span>
+          ${
+            assignedSlots.length > 0
+              ? assignedSlots
+                  .map((slot) => `<span class="chip">${escapeHtml(slot)}</span>`)
+                  .join("")
+              : `<span class="chip">none yet</span>`
+          }
+        </div>`
+      : ""}
 
     <label class="field" style="margin-top:12px">
       <span>Service</span>
@@ -415,21 +536,21 @@ function renderProviderForm(host: T560App, busy: boolean): string {
       <button class="btn" data-action="cancel-setup-provider" ${busy ? "disabled" : ""}>Cancel</button>
     </div>` : ""}
 
-    <details style="margin-top:14px">
-      <summary class="muted" style="cursor:pointer;font-size:12px">Advanced: model list, auth type, base URL…</summary>
+    ${effectiveTemplateId ? `<details style="margin-top:14px">
+      <summary class="muted" style="cursor:pointer;font-size:12px">Advanced: model list, auth type${isLocalModel ? "" : ", base URL"}…</summary>
       <div class="form-grid" style="margin-top:10px">
-        <label class="field">
+        ${!isLocalModel ? `<label class="field">
           <span>Model</span>
           <select data-input="setup-provider-model-choice" ${busy ? "disabled" : ""}>${renderProviderModelOptions(host)}</select>
-        </label>
-        ${!isAnthropic ? `<label class="field">
+        </label>` : ""}
+        ${!isAnthropic && !isLocalModel ? `<label class="field">
           <span>Auth type</span>
           <select data-input="setup-provider-auth" ${busy ? "disabled" : ""}>${renderAuthModeOptions(host)}</select>
         </label>` : ""}
-        <label class="field">
+        ${!isLocalModel ? `<label class="field">
           <span>Base URL (optional)</span>
           <input type="text" data-input="setup-provider-base-url" value="${escapeHtml(host.setupProviderBaseUrl)}" placeholder="https://api.openai.com/v1" ${busy ? "disabled" : ""} />
-        </label>
+        </label>` : ""}
         <label class="field">
           <span>API mode (optional)</span>
           <input type="text" data-input="setup-provider-api" value="${escapeHtml(host.setupProviderApi)}" placeholder="openai-responses" ${busy ? "disabled" : ""} />
@@ -441,13 +562,13 @@ function renderProviderForm(host: T560App, busy: boolean): string {
             <option value="false" ${!host.setupProviderEnabled ? "selected" : ""}>Disabled</option>
           </select>
         </label>
-        <label class="field full">
+        ${!isLocalModel ? `<label class="field full">
           <span>Models (comma separated)</span>
           <input type="text" data-input="setup-provider-models" value="${escapeHtml(host.setupProviderModels)}" ${busy ? "disabled" : ""} />
-        </label>
+        </label>` : ""}
       </div>
       ${selectedCatalog?.description ? `<div class="muted" style="margin-top:8px;font-size:12px">${escapeHtml(selectedCatalog.description)}</div>` : ""}
-    </details>
+    </details>` : ""}
   </div>`;
 }
 
@@ -456,6 +577,7 @@ function renderProviderSection(host: T560App, busy: boolean): string {
   if (host.setupSelectedProvider !== "") {
     return `<div class="settings-grid">
       ${renderProviderForm(host, busy)}
+      ${renderProvidersCard(host, busy)}
     </div>`;
   }
 
@@ -463,7 +585,8 @@ function renderProviderSection(host: T560App, busy: boolean): string {
   return `<div class="settings-grid">
     <div class="card">
       <div class="card-title">Roles</div>
-      <div class="card-sub">Pick a model for each task type. Saves automatically.</div>
+      <div class="card-sub">Pick a model for each task type. Changes save automatically.</div>
+      <div class="muted" style="margin-top:8px;font-size:12px">Chat replies use <strong>Default</strong>. Planning/Coder are used when the agent routes those task types.</div>
       <div class="roles-grid">
         <span>Default</span>${renderRoleDropdown(host, "default", busy)}
         <span>Planner</span>${renderRoleDropdown(host, "planning", busy)}
@@ -509,52 +632,142 @@ function renderTelegramSection(host: T560App, busy: boolean): string {
 }
 
 function renderVaultSection(host: T560App, busy: boolean): string {
+  const accountType = host.setupVaultAccountType === "email" ? "email" : "site";
+  const authMode = host.setupVaultAuthMode === "passwordless_mfa_code" ? "passwordless_mfa_code" : "password";
+  const emailSecretLabel =
+    host.setupVaultEmailSecretKind === "password" ? "Email password" : "Email app password";
+  const emailSecretHint =
+    host.setupVaultEmailSecretKind === "password"
+      ? "Uses your normal mailbox password."
+      : "Recommended when provider supports app-specific passwords.";
+
   const list = host.setupVaultEntries
     .map((entry) => {
+      const looksLikeEmail =
+        entry.service === "mail.google.com" ||
+        entry.service === "outlook.live.com" ||
+        entry.service === "outlook.office.com" ||
+        entry.service === "mail.yahoo.com" ||
+        entry.service === "mail.proton.me" ||
+        entry.service === "icloud.com" ||
+        entry.service === "email" ||
+        /mail|gmail|outlook|yahoo|icloud|proton/i.test(entry.websiteUrl || "");
+      const authSummary = looksLikeEmail
+        ? entry.authMode === "password_with_mfa"
+          ? "email_password"
+          : "app_password"
+        : entry.authMode;
       return `<div class="setup-vault-item">
         <div class="setup-vault-item__meta">
           <div class="mono">${escapeHtml(entry.service)}</div>
-          <div class="muted mono">${escapeHtml(entry.identifierMasked)}</div>
+          <div class="muted mono">${escapeHtml(entry.websiteUrl || "(no website URL saved)")}</div>
+          <div class="muted mono">${escapeHtml(entry.identifier || entry.identifierMasked)}</div>
         </div>
         <div class="setup-vault-item__meta">
-          <div class="muted">${escapeHtml(entry.authMode)} · MFA ${entry.hasMfaCode ? "yes" : "no"}</div>
+          <div class="muted">${escapeHtml(authSummary)} · strategy=${escapeHtml(entry.mfaStrategy)} · fallbackCode=${entry.hasMfaCode ? "yes" : "no"}</div>
+          <div class="muted">MFA source: ${escapeHtml(entry.mfaSourceService || "user prompt")}</div>
           <div class="muted">Updated ${escapeHtml(formatDateTime(entry.updatedAt))}</div>
         </div>
         <div class="setup-vault-item__actions">
+          <button class="btn btn--sm" data-action="edit-vault-credential" data-service="${escapeHtml(entry.service)}" data-website-url="${escapeHtml(entry.websiteUrl)}" data-auth-mode="${escapeHtml(entry.authMode)}" data-mfa-strategy="${escapeHtml(entry.mfaStrategy)}" data-mfa-source-service="${escapeHtml(entry.mfaSourceService)}" ${busy ? "disabled" : ""}>Edit</button>
           <button class="btn btn--sm danger" data-action="delete-vault-credential" data-service="${escapeHtml(entry.service)}" ${busy ? "disabled" : ""}>Delete</button>
         </div>
       </div>`;
     })
     .join("");
 
+  const emailProviderOptions = [
+    ["gmail", "Gmail"],
+    ["outlook", "Outlook / Microsoft"],
+    ["yahoo", "Yahoo"],
+    ["proton", "Proton Mail"],
+    ["icloud", "iCloud Mail"],
+    ["custom", "Other / Custom"],
+  ]
+    .map(
+      ([value, label]) =>
+        `<option value="${value}" ${host.setupVaultEmailProvider === value ? "selected" : ""}>${label}</option>`
+    )
+    .join("");
+
+  const emailFields = `<div class="form-grid" style="margin-top:12px">
+    <label class="field">
+      <span>Email provider</span>
+      <select data-input="setup-vault-email-provider" ${busy ? "disabled" : ""}>${emailProviderOptions}</select>
+    </label>
+    <label class="field">
+      <span>Email address</span>
+      <input type="text" data-input="setup-vault-identifier" value="${escapeHtml(host.setupVaultIdentifier)}" placeholder="you@example.com" ${busy ? "disabled" : ""} />
+    </label>
+    <label class="field">
+      <span>Secret type</span>
+      <select data-input="setup-vault-email-secret-kind" ${busy ? "disabled" : ""}>
+        <option value="app_password" ${host.setupVaultEmailSecretKind === "app_password" ? "selected" : ""}>App password</option>
+        <option value="password" ${host.setupVaultEmailSecretKind === "password" ? "selected" : ""}>Account password</option>
+      </select>
+    </label>
+    <label class="field">
+      <span>${escapeHtml(emailSecretLabel)}</span>
+      <input type="password" data-input="setup-vault-secret" value="${escapeHtml(host.setupVaultSecret)}" placeholder="enter secret" ${busy ? "disabled" : ""} />
+    </label>
+    ${host.setupVaultEmailProvider === "custom" ? `<label class="field full">
+      <span>Mailbox website URL</span>
+      <input type="text" data-input="setup-vault-website-url" value="${escapeHtml(host.setupVaultWebsiteUrl)}" placeholder="https://mail.example.com" ${busy ? "disabled" : ""} />
+    </label>` : ""}
+  </div>
+  <div class="muted" style="margin-top:8px;font-size:12px">${escapeHtml(emailSecretHint)}</div>`;
+
+  const siteFields = `<div class="form-grid" style="margin-top:12px">
+    <label class="field full">
+      <span>Site login URL</span>
+      <input type="text" data-input="setup-vault-website-url" value="${escapeHtml(host.setupVaultWebsiteUrl)}" placeholder="https://example.com/login" ${busy ? "disabled" : ""} />
+    </label>
+    <label class="field">
+      <span>Login email / username</span>
+      <input type="text" data-input="setup-vault-identifier" value="${escapeHtml(host.setupVaultIdentifier)}" placeholder="email or username" ${busy ? "disabled" : ""} />
+    </label>
+    <label class="field">
+      <span>Auth flow</span>
+      <select data-input="setup-vault-auth-mode" ${busy ? "disabled" : ""}>
+        <option value="password" ${authMode === "password" ? "selected" : ""}>Password</option>
+        <option value="passwordless_mfa_code" ${authMode === "passwordless_mfa_code" ? "selected" : ""}>Passwordless MFA code</option>
+      </select>
+    </label>
+    <label class="field">
+      <span>${authMode === "password" ? "Password" : "Fallback password (optional)"}</span>
+      <input type="password" data-input="setup-vault-secret" value="${escapeHtml(host.setupVaultSecret)}" placeholder="${authMode === "password" ? "password" : "optional fallback secret"}" ${busy ? "disabled" : ""} />
+    </label>
+    ${authMode === "passwordless_mfa_code" ? `<label class="field">
+      <span>MFA source email service (optional)</span>
+      <input type="text" data-input="setup-vault-mfa-source-service" value="${escapeHtml(host.setupVaultMfaSourceService)}" placeholder="mail.google.com" ${busy ? "disabled" : ""} />
+    </label>` : ""}
+    ${authMode === "passwordless_mfa_code" ? `<label class="field">
+      <span>Stored MFA code (optional)</span>
+      <input type="text" data-input="setup-vault-mfa-code" value="${escapeHtml(host.setupVaultMfaCode)}" placeholder="optional fallback code" ${busy ? "disabled" : ""} />
+    </label>` : ""}
+  </div>
+  <div class="muted" style="margin-top:8px;font-size:12px">${authMode === "passwordless_mfa_code" ? "When passwordless is selected, the agent will try the linked email source first (if configured), then ask you for the code." : "Uses saved password directly during browser login."}</div>`;
+
   return `<div class="card">
     <div class="card-title">Secure Vault</div>
     <div class="card-sub">Store site credentials securely (encrypted at rest in <span class="mono">.t560-secure</span>).</div>
+    <div class="callout info" style="margin-top:12px">
+      Step 1: choose account type. Step 2: save credentials. Then the agent can use <span class="mono">browser action=login</span> automatically.
+    </div>
     <div class="form-grid" style="margin-top:12px">
       <label class="field">
-        <span>Service/site</span>
-        <input type="text" data-input="setup-vault-service" value="${escapeHtml(host.setupVaultService)}" placeholder="email, x.com, havenvaults2-0" ${busy ? "disabled" : ""} />
-      </label>
-      <label class="field">
-        <span>Identifier</span>
-        <input type="text" data-input="setup-vault-identifier" value="${escapeHtml(host.setupVaultIdentifier)}" placeholder="email or username" ${busy ? "disabled" : ""} />
-      </label>
-      <label class="field">
-        <span>Auth mode</span>
-        <select data-input="setup-vault-auth-mode" ${busy ? "disabled" : ""}>
-          <option value="password" ${host.setupVaultAuthMode === "password" ? "selected" : ""}>Password</option>
-          <option value="passwordless_mfa_code" ${host.setupVaultAuthMode === "passwordless_mfa_code" ? "selected" : ""}>Passwordless MFA code</option>
+        <span>Account type</span>
+        <select data-input="setup-vault-account-type" ${busy ? "disabled" : ""}>
+          <option value="site" ${accountType === "site" ? "selected" : ""}>Website account</option>
+          <option value="email" ${accountType === "email" ? "selected" : ""}>Email inbox</option>
         </select>
       </label>
       <label class="field">
-        <span>Secret</span>
-        <input type="password" data-input="setup-vault-secret" value="${escapeHtml(host.setupVaultSecret)}" placeholder="password or app password" ${busy ? "disabled" : ""} />
-      </label>
-      <label class="field">
-        <span>MFA code (optional)</span>
-        <input type="text" data-input="setup-vault-mfa-code" value="${escapeHtml(host.setupVaultMfaCode)}" placeholder="optional code" ${busy ? "disabled" : ""} />
+        <span>Service key (optional)</span>
+        <input type="text" data-input="setup-vault-service" value="${escapeHtml(host.setupVaultService)}" placeholder="auto from URL if blank" ${busy ? "disabled" : ""} />
       </label>
     </div>
+    ${accountType === "email" ? emailFields : siteFields}
     <div class="settings-actions" style="margin-top:12px">
       <button class="btn primary" data-action="save-vault-credential" ${busy ? "disabled" : ""}>Save Vault Credential</button>
       <button class="btn" data-action="refresh-vault" ${busy ? "disabled" : ""}>Refresh Vault</button>

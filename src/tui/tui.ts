@@ -19,6 +19,7 @@ import {
 } from "../config/state.js";
 import { isHeartbeatCheckMessage } from "../gateway/heartbeat.js";
 import { startGatewayRuntime } from "../gateway/runtime.js";
+import { listConfiguredServices } from "../security/credentials-vault.js";
 import { handleSecureSetupFlow } from "../security/setup-flow.js";
 import { ChatLog } from "./components/chat-log.js";
 import { CustomEditor } from "./components/custom-editor.js";
@@ -173,9 +174,26 @@ function providerCommandUsage(): string {
   ].join("\n");
 }
 
-function getSlashCommands(options?: { providerRefs?: string[]; providerIds?: string[] }): SlashCommand[] {
+function getSetupServiceHints(options?: { setupServices?: string[] }): string[] {
+  const seeded = new Set<string>(["email", "x.com"]);
+  for (const service of options?.setupServices ?? []) {
+    const normalized = String(service ?? "").trim().toLowerCase();
+    if (!normalized) {
+      continue;
+    }
+    seeded.add(normalized);
+  }
+  return Array.from(seeded).slice(0, 8);
+}
+
+function getSlashCommands(options?: {
+  providerRefs?: string[];
+  providerIds?: string[];
+  setupServices?: string[];
+}): SlashCommand[] {
   const providerRefs = options?.providerRefs ?? [];
   const providerIds = options?.providerIds ?? [];
+  const setupServiceHints = getSetupServiceHints({ setupServices: options?.setupServices });
 
   return [
     { name: "help", description: "Show command help" },
@@ -239,7 +257,7 @@ function getSlashCommands(options?: { providerRefs?: string[]; providerIds?: str
         const raw = prefix.trim().toLowerCase();
         if (raw.startsWith("clear ")) {
           const tail = raw.slice("clear ".length).trim();
-          return ["email", "x.com", "havenvaults2-0"]
+          return setupServiceHints
             .filter((value) => value.startsWith(tail))
             .map((value) => ({ value: `clear ${value}`, label: `clear ${value}` }));
         }
@@ -249,7 +267,7 @@ function getSlashCommands(options?: { providerRefs?: string[]; providerIds?: str
             .filter((value) => value.startsWith(tail))
             .map((value) => ({ value: `mode ${value}`, label: `mode ${value}` }));
         }
-        return ["email", "x.com", "list", "cancel", "clear", "mode", "havenvaults2-0"]
+        return [...setupServiceHints, "list", "cancel", "clear", "mode"]
           .filter((value) => value.startsWith(raw))
           .map((value) => ({ value, label: value }));
       },
@@ -334,9 +352,11 @@ export async function runTui(opts: TuiOptions = {}): Promise<void> {
   const refreshRoutingUiState = async (): Promise<void> => {
     const config = await readConfig();
     const hints = collectProviderHints(config);
+    const setupServices = await listConfiguredServices(process.cwd()).catch(() => []);
     slashCommands = getSlashCommands({
       providerRefs: hints.providerRefs,
       providerIds: hints.providerIds,
+      setupServices,
     });
     editor.setAutocompleteProvider(new CombinedAutocompleteProvider(slashCommands));
   };
@@ -378,16 +398,20 @@ export async function runTui(opts: TuiOptions = {}): Promise<void> {
   const unsubscribeEvents = gateway.subscribeEvents({
     sessionId,
     onEvent: (event: AgentEvent) => {
-      if (event.stream === "assistant") {
-        if (traceMode === "none") {
-          return;
+      try {
+        if (event.stream === "assistant") {
+          if (traceMode === "none") {
+            return;
+          }
+          const text = typeof event.data.text === "string" ? event.data.text.trim() : "";
+          if (!text) {
+            return;
+          }
+          const prefix = event.data.phase === "pretool" ? "🧠" : "↳";
+          addSystem(`${prefix} ${text}`);
         }
-        const text = event.data.text.trim();
-        if (!text) {
-          return;
-        }
-        const prefix = event.data.phase === "pretool" ? "🧠" : "↳";
-        addSystem(`${prefix} ${text}`);
+      } catch {
+        // Ignore malformed events so one bad payload cannot crash the runtime.
       }
     },
   });
@@ -464,32 +488,33 @@ export async function runTui(opts: TuiOptions = {}): Promise<void> {
 
   editor.onSubmit = (raw: string) => {
     void (async () => {
-      const message = raw.trim();
-      editor.setText("");
+      try {
+        const message = raw.trim();
+        editor.setText("");
 
-      if (!message) {
-        requestRender();
-        return;
-      }
-      if (isHeartbeatCheckMessage(message)) {
-        requestRender();
-        return;
-      }
+        if (!message) {
+          requestRender();
+          return;
+        }
+        if (isHeartbeatCheckMessage(message)) {
+          requestRender();
+          return;
+        }
 
-      if (message === "/exit" || message === "/quit") {
-        await shutdown("user request");
-        return;
-      }
-      if (message === "/help" || message === "/commands") {
-        addSystem(renderHelpText());
-        return;
-      }
-      if (message === "/clear") {
-        chatLog.clearAll();
-        requestRender();
-        return;
-      }
-      if (message.startsWith("/provider")) {
+        if (message === "/exit" || message === "/quit") {
+          await shutdown("user request");
+          return;
+        }
+        if (message === "/help" || message === "/commands") {
+          addSystem(renderHelpText());
+          return;
+        }
+        if (message === "/clear") {
+          chatLog.clearAll();
+          requestRender();
+          return;
+        }
+        if (message.startsWith("/provider")) {
         const match = /^\/provider(?:\s+(.+))?$/i.exec(message);
         const args = String(match?.[1] ?? "").trim();
         const config = await readConfig();
@@ -561,7 +586,7 @@ export async function runTui(opts: TuiOptions = {}): Promise<void> {
         return;
       }
 
-      if (message.startsWith("/trace")) {
+        if (message.startsWith("/trace")) {
         const traceMatch = /^\/trace(?:\s+([a-z]+))?$/i.exec(message);
         if (!traceMatch) {
           addSystem("Usage: /trace <none|compact|full>");
@@ -582,7 +607,7 @@ export async function runTui(opts: TuiOptions = {}): Promise<void> {
         return;
       }
 
-      if (message.startsWith("/tools")) {
+        if (message.startsWith("/tools")) {
         const mode = message.split(/\s+/)[1]?.toLowerCase() ?? "";
         if (!mode || mode === "toggle") {
           toolsExpanded = !toolsExpanded;
@@ -600,47 +625,59 @@ export async function runTui(opts: TuiOptions = {}): Promise<void> {
         return;
       }
 
-      const setupHandled = await handleSecureSetupFlow({
-        sessionId,
-        message: raw,
-      });
-      if (setupHandled.handled) {
-        addSystem(setupHandled.message);
-        return;
-      }
-
-      const pairingCommand = parsePairingCommand(message);
-      if (pairingCommand) {
+        let setupHandled: Awaited<ReturnType<typeof handleSecureSetupFlow>>;
         try {
-          await handlePairing(pairingCommand);
+          setupHandled = await handleSecureSetupFlow({
+            sessionId,
+            message: raw,
+          });
         } catch (error) {
           const msg = error instanceof Error ? error.message : String(error);
-          addSystem(`pairing error: ${msg}`);
+          addSystem(`setup error: ${msg}`);
+          return;
         }
-        return;
-      }
+        if (setupHandled.handled) {
+          addSystem(setupHandled.message);
+          return;
+        }
 
-      if (terminalBusy) {
-        addSystem("waiting for previous response...");
-        return;
-      }
+        const pairingCommand = parsePairingCommand(message);
+        if (pairingCommand) {
+          try {
+            await handlePairing(pairingCommand);
+          } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            addSystem(`pairing error: ${msg}`);
+          }
+          return;
+        }
 
-      chatLog.addUser(message);
-      startWaiting();
+        if (terminalBusy) {
+          addSystem("waiting for previous response...");
+          return;
+        }
 
-      try {
-        const reply = await gateway.handleMessage({
-          channel: "terminal",
-          message,
-          sessionId,
-          externalUserId,
-          receivedAt: Date.now(),
-        });
-        chatLog.finalizeAssistant(composeAssistantText(reply));
+        chatLog.addUser(message);
+        startWaiting();
+
+        try {
+          const reply = await gateway.handleMessage({
+            channel: "terminal",
+            message,
+            sessionId,
+            externalUserId,
+            receivedAt: Date.now(),
+          });
+          chatLog.finalizeAssistant(composeAssistantText(reply));
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          addSystem(`error: ${msg}`);
+        } finally {
+          stopWaiting();
+        }
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
-        addSystem(`error: ${msg}`);
-      } finally {
+        addSystem(`runtime error: ${msg}`);
         stopWaiting();
       }
     })();
@@ -667,6 +704,24 @@ export async function runTui(opts: TuiOptions = {}): Promise<void> {
   addSystem(`web bind ${gateway.dashboard.bindHost}:${gateway.dashboard.port}`);
   addSystem(`telegram ${gateway.telegram.info}`);
   addSystem("channels active: terminal + webchat + telegram");
+
+  // Show onboarding hint if no providers are configured
+  {
+    const startupConfig = await readConfig().catch(() => null);
+    const hasProviders = Object.keys(startupConfig?.providers ?? {}).length > 0;
+    if (!hasProviders) {
+      addSystem(
+        [
+          "No AI providers configured. To use Anthropic Claude models:",
+          "  1. Install Claude Code CLI:  https://claude.ai/code",
+          "  2. Login:                    claude auth login",
+          "  3. Get auth token:           claude setup-token",
+          `  4. Open web setup:           ${gateway.dashboard.localUrl}/setup`,
+          "  (or run: t560 onboard  for the guided setup wizard)",
+        ].join("\n")
+      );
+    }
+  }
   if (opts.message?.trim()) {
     editor.setText(opts.message.trim());
   }

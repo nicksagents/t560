@@ -8,7 +8,8 @@ import {
   type AssistantMessage,
   type Context,
   type KnownProvider,
-  type Message
+  type Message,
+  type ToolCall,
 } from "@mariozechner/pi-ai";
 import type { GatewayChannelId } from "../gateway/types.js";
 import {
@@ -21,7 +22,7 @@ import {
   type T560Config
 } from "../config/state.js";
 import { loadSessionMessages, saveSessionMessages } from "./session.js";
-import { getCredential, normalizeSetupService } from "../security/credentials-vault.js";
+import { getCredential, listConfiguredServices, normalizeSetupService } from "../security/credentials-vault.js";
 import { createT560CodingTools } from "../agents/pi-tools.js";
 import { loadT560BootstrapContext } from "../agents/bootstrap-context.js";
 import { executeToolCall, toToolDefinitions } from "../agents/pi-tool-definition-adapter.js";
@@ -67,6 +68,7 @@ export function bustUsersPromptCache(): void {}
 
 const SUPPORTED_PROVIDERS = new Set<string>(getProviders());
 const OPENAI_RUNTIME_PROVIDER = "openai";
+const LOCAL_OPENAI_DUMMY_API_KEY = "local-no-key";
 const PROVIDER_RUNTIME_ALIASES: Record<string, KnownProvider> = {
   "deepseek": "openai",
   "local-openai": "openai",
@@ -86,13 +88,20 @@ const DEEPSEEK_MODEL_ALIAS_MAP: Record<string, string> = {
 const MAX_TOOL_ROUNDS = 20;
 const TOOL_ERROR_PREVIEW_MAX_CHARS = 240;
 const EMPTY_REPLY_URL_SCAN_LIMIT = 20;
-const DEFAULT_PROVIDER_TIMEOUT_MS = 30_000;
+const DEFAULT_PROVIDER_TIMEOUT_MS = 10 * 60_000;
 const MIN_PROVIDER_TIMEOUT_MS = 5_000;
-const MAX_PROVIDER_TIMEOUT_MS = 15 * 60_000;
+const MAX_PROVIDER_TIMEOUT_MS = 24 * 60 * 60_000;
+const DEFAULT_LOCAL_PROVIDER_TIMEOUT_MS = 30 * 60_000;
+const MIN_LOCAL_PROVIDER_TIMEOUT_MS = 60_000;
+const DEFAULT_TOOL_TIMEOUT_MS = 180_000;
+const MIN_TOOL_TIMEOUT_MS = 5_000;
+const MAX_TOOL_TIMEOUT_MS = 30 * 60_000;
 const MFA_PENDING_SESSION_MAX = 1024;
 const LIVE_PROGRESS_LINE_MAX = 420;
 const LIVE_PROGRESS_LINES_PER_ROUND = 8;
 const AUTO_MEMORY_MAX_CANDIDATES = 2;
+const LOCAL_MODEL_DISCOVERY_TIMEOUT_MS = 4_000;
+const LOCAL_MODEL_DISCOVERY_TTL_MS = 30_000;
 const GENERIC_PROGRESS_PATTERNS: RegExp[] = [
   /^i am using the latest findings(?: to choose the next step)?\.?$/i,
   /^using the latest findings(?: to choose the next step)?\.?$/i,
@@ -104,11 +113,13 @@ const GENERIC_PROGRESS_PATTERNS: RegExp[] = [
 
 type PendingMfaSession = {
   service?: string;
+  mfaSourceService?: string;
   tabId?: string;
   since: number;
 };
 
 const pendingMfaBySession = new Map<string, PendingMfaSession>();
+const localOpenAIModelDiscoveryCache = new Map<string, { expiresAt: number; models: string[] }>();
 
 type AutoMemoryCandidate = {
   title: string;
@@ -246,7 +257,62 @@ async function maybeAutoSaveMemoryFromUserMessage(params: {
   }
 }
 
-function resolveProviderTimeoutMs(): number {
+function hostLooksLocal(hostname: string): boolean {
+  const host = String(hostname ?? "").trim().toLowerCase();
+  if (!host) {
+    return false;
+  }
+  if (host === "localhost" || host === "::1" || host.endsWith(".local")) {
+    return true;
+  }
+  if (host.startsWith("127.")) {
+    return true;
+  }
+  const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!ipv4) {
+    return false;
+  }
+  const a = Number(ipv4[1]);
+  const b = Number(ipv4[2]);
+  if (a === 10) {
+    return true;
+  }
+  if (a === 192 && b === 168) {
+    return true;
+  }
+  if (a === 172 && b >= 16 && b <= 31) {
+    return true;
+  }
+  if (a === 100 && b >= 64 && b <= 127) {
+    return true;
+  }
+  return false;
+}
+
+function isLikelyLocalProviderEndpoint(params: {
+  routeProviderId?: string;
+  baseUrl?: string;
+}): boolean {
+  const providerId = String(params.routeProviderId ?? "").trim().toLowerCase();
+  if (providerId === "local-openai" || providerId.includes("local")) {
+    return true;
+  }
+  const rawBaseUrl = String(params.baseUrl ?? "").trim();
+  if (!rawBaseUrl) {
+    return false;
+  }
+  try {
+    const hostname = new URL(rawBaseUrl).hostname;
+    return hostLooksLocal(hostname);
+  } catch {
+    return false;
+  }
+}
+
+function resolveProviderTimeoutMs(params?: {
+  routeProviderId?: string;
+  baseUrl?: string;
+}): number {
   const rawSec = Number(process.env.T560_PROVIDER_TIMEOUT_SEC ?? "");
   if (Number.isFinite(rawSec) && rawSec > 0) {
     return Math.min(MAX_PROVIDER_TIMEOUT_MS, Math.max(MIN_PROVIDER_TIMEOUT_MS, Math.floor(rawSec * 1000)));
@@ -255,7 +321,72 @@ function resolveProviderTimeoutMs(): number {
   if (Number.isFinite(rawMs) && rawMs > 0) {
     return Math.min(MAX_PROVIDER_TIMEOUT_MS, Math.max(MIN_PROVIDER_TIMEOUT_MS, Math.floor(rawMs)));
   }
+  const localRoute = isLikelyLocalProviderEndpoint({
+    routeProviderId: params?.routeProviderId,
+    baseUrl: params?.baseUrl,
+  });
+  if (localRoute) {
+    const localSec = Number(process.env.T560_PROVIDER_TIMEOUT_LOCAL_SEC ?? "");
+    if (Number.isFinite(localSec) && localSec > 0) {
+      return Math.min(
+        MAX_PROVIDER_TIMEOUT_MS,
+        Math.max(MIN_LOCAL_PROVIDER_TIMEOUT_MS, Math.floor(localSec * 1000)),
+      );
+    }
+    const localMs = Number(process.env.T560_PROVIDER_TIMEOUT_LOCAL_MS ?? "");
+    if (Number.isFinite(localMs) && localMs > 0) {
+      return Math.min(
+        MAX_PROVIDER_TIMEOUT_MS,
+        Math.max(MIN_LOCAL_PROVIDER_TIMEOUT_MS, Math.floor(localMs)),
+      );
+    }
+    return DEFAULT_LOCAL_PROVIDER_TIMEOUT_MS;
+  }
   return DEFAULT_PROVIDER_TIMEOUT_MS;
+}
+
+function resolveToolExecutionTimeoutMs(): number {
+  const rawSec = Number(process.env.T560_TOOL_TIMEOUT_SEC ?? "");
+  if (Number.isFinite(rawSec) && rawSec > 0) {
+    return Math.min(MAX_TOOL_TIMEOUT_MS, Math.max(MIN_TOOL_TIMEOUT_MS, Math.floor(rawSec * 1000)));
+  }
+  const rawMs = Number(process.env.T560_TOOL_TIMEOUT_MS ?? "");
+  if (Number.isFinite(rawMs) && rawMs > 0) {
+    return Math.min(MAX_TOOL_TIMEOUT_MS, Math.max(MIN_TOOL_TIMEOUT_MS, Math.floor(rawMs)));
+  }
+  return DEFAULT_TOOL_TIMEOUT_MS;
+}
+
+async function runWithHardTimeout<T>(params: {
+  operation: Promise<T>;
+  timeoutMs: number;
+  timeoutMessage: string;
+  onTimeout?: () => void;
+}): Promise<T> {
+  const operationOutcome = params.operation.then(
+    (value) => ({ kind: "value" as const, value }),
+    (error) => ({ kind: "error" as const, error }),
+  );
+  const timeoutOutcome = new Promise<{ kind: "timeout" }>((resolve) => {
+    const timer = setTimeout(() => {
+      try {
+        params.onTimeout?.();
+      } catch {
+        // best effort
+      }
+      resolve({ kind: "timeout" });
+    }, params.timeoutMs);
+    timer.unref?.();
+  });
+
+  const winner = await Promise.race([operationOutcome, timeoutOutcome]);
+  if (winner.kind === "value") {
+    return winner.value;
+  }
+  if (winner.kind === "error") {
+    throw winner.error;
+  }
+  throw new Error(params.timeoutMessage);
 }
 
 function defaultBaseUrlForProviderAlias(providerId: string): string | undefined {
@@ -496,6 +627,16 @@ function normalizeBaseUrl(value: string | undefined): string | undefined {
   return trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
 }
 
+function normalizeOpenAICompatibleBaseUrl(value: string | undefined): string | undefined {
+  const normalized = normalizeBaseUrl(value);
+  if (!normalized) {
+    return undefined;
+  }
+  return normalized
+    .replace(/\/chat\/completions$/i, "")
+    .replace(/\/v1\/chat$/i, "/v1");
+}
+
 function isCustomOpenAIBaseUrl(baseUrl: string | undefined): boolean {
   if (!baseUrl) {
     return false;
@@ -631,6 +772,232 @@ function normalizeUrlCandidate(value: string): string | null {
   const trimmed = value.trim().replace(/[)\],.;]+$/g, "");
   if (!/^https?:\/\//i.test(trimmed)) {
     return null;
+  }
+  return trimmed;
+}
+
+function oneLineError(value: string, maxChars = 320): string {
+  const compact = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!compact) {
+    return "unknown provider error";
+  }
+  if (compact.length <= maxChars) {
+    return compact;
+  }
+  return `${compact.slice(0, maxChars - 3).trim()}...`;
+}
+
+function formatProviderRuntimeFailure(params: {
+  provider: string;
+  model: string;
+  endpoint?: string;
+  rawError: string;
+  availableModels?: string[];
+}): string {
+  const errorText = oneLineError(params.rawError);
+  const endpointHint = params.endpoint ? ` endpoint=${params.endpoint}` : "";
+  const availableModelsHint =
+    Array.isArray(params.availableModels) && params.availableModels.length > 0
+      ? ` Available local models: ${params.availableModels.slice(0, 8).join(", ")}.`
+      : "";
+  const lower = errorText.toLowerCase();
+
+  if (lower.includes("405")) {
+    return `Provider request failed (${params.provider}/${params.model}). Received HTTP 405.${endpointHint} Check the base URL: use an API root like .../v1, not .../v1/chat.`;
+  }
+  if (lower.includes("openai api key is required")) {
+    return `Provider request failed (${params.provider}/${params.model}). The OpenAI-compatible client requires a non-empty API key value for this request path.${endpointHint}`;
+  }
+  if (lower.includes("no instance found for model") || lower.includes("model") && lower.includes("not found")) {
+    return `Provider request failed (${params.provider}/${params.model}). Model id is not available on the local server.${endpointHint}${availableModelsHint} Use an exact model id from GET /v1/models.`;
+  }
+  return `Provider request failed (${params.provider}/${params.model}). ${errorText}${endpointHint}`;
+}
+
+function hasHeaderCaseInsensitive(headers: Record<string, string>, name: string): boolean {
+  const target = name.trim().toLowerCase();
+  return Object.keys(headers).some((key) => key.trim().toLowerCase() === target);
+}
+
+async function discoverLocalOpenAIModels(params: {
+  baseUrl: string;
+  apiKey?: string;
+  headers?: Record<string, string>;
+}): Promise<string[]> {
+  const baseUrl = normalizeBaseUrl(params.baseUrl);
+  if (!baseUrl) {
+    return [];
+  }
+
+  const cached = localOpenAIModelDiscoveryCache.get(baseUrl);
+  if (cached && cached.expiresAt > Date.now()) {
+    return [...cached.models];
+  }
+
+  const headers: Record<string, string> = {
+    accept: "application/json",
+    ...(params.headers ?? {}),
+  };
+  if (params.apiKey && !hasHeaderCaseInsensitive(headers, "authorization")) {
+    headers.authorization = `Bearer ${params.apiKey}`;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), LOCAL_MODEL_DISCOVERY_TIMEOUT_MS);
+  timeout.unref?.();
+  try {
+    const response = await fetch(`${baseUrl}/models`, {
+      method: "GET",
+      headers,
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      return [];
+    }
+    const payload = (await response.json()) as { data?: Array<{ id?: unknown }> };
+    const models = Array.isArray(payload?.data)
+      ? payload.data
+          .map((entry) => String(entry?.id ?? "").trim())
+          .filter(Boolean)
+      : [];
+    localOpenAIModelDiscoveryCache.set(baseUrl, {
+      expiresAt: Date.now() + LOCAL_MODEL_DISCOVERY_TTL_MS,
+      models,
+    });
+    return [...models];
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function normalizeModelLookupKey(value: string): string {
+  return String(value ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function modelIdTail(value: string): string {
+  const trimmed = String(value ?? "").trim();
+  if (!trimmed) {
+    return "";
+  }
+  const parts = trimmed.split("/");
+  return String(parts[parts.length - 1] ?? "").trim();
+}
+
+function modelTokens(value: string): string[] {
+  return String(value ?? "")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/g)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 2);
+}
+
+function scoreModelSimilarity(requested: string, candidate: string): number {
+  const req = String(requested ?? "").trim();
+  const cand = String(candidate ?? "").trim();
+  if (!req || !cand) {
+    return 0;
+  }
+  const reqLower = req.toLowerCase();
+  const candLower = cand.toLowerCase();
+  if (reqLower === candLower) {
+    return 100;
+  }
+
+  let score = 0;
+  const reqKey = normalizeModelLookupKey(req);
+  const candKey = normalizeModelLookupKey(cand);
+  const reqTail = modelIdTail(req);
+  const candTail = modelIdTail(cand);
+  const reqTailLower = reqTail.toLowerCase();
+  const candTailLower = candTail.toLowerCase();
+  const reqTailKey = normalizeModelLookupKey(reqTail);
+  const candTailKey = normalizeModelLookupKey(candTail);
+
+  if (reqTailLower && reqTailLower === candTailLower) {
+    score += 40;
+  }
+  if (reqTailKey && reqTailKey === candTailKey) {
+    score += 35;
+  }
+  if (reqKey && candKey) {
+    if (reqKey === candKey) {
+      score += 30;
+    } else if (reqKey.includes(candKey) || candKey.includes(reqKey)) {
+      score += 20;
+    }
+  }
+  if (reqLower.includes(candLower) || candLower.includes(reqLower)) {
+    score += 10;
+  }
+  if (reqTailLower && candTailLower && (reqTailLower.includes(candTailLower) || candTailLower.includes(reqTailLower))) {
+    score += 10;
+  }
+
+  const reqTokens = new Set(modelTokens(reqTail || req));
+  const candTokens = new Set(modelTokens(candTail || cand));
+  let overlap = 0;
+  for (const token of reqTokens) {
+    if (candTokens.has(token)) {
+      overlap += 1;
+    }
+  }
+  score += overlap * 2;
+  return score;
+}
+
+function remapModelIdFromAvailable(requested: string, available: string[]): string {
+  const trimmed = String(requested ?? "").trim();
+  if (!trimmed || available.length === 0) {
+    return trimmed;
+  }
+
+  const lower = trimmed.toLowerCase();
+  const exactCaseInsensitive = available.find((entry) => entry.toLowerCase() === lower);
+  if (exactCaseInsensitive) {
+    return exactCaseInsensitive;
+  }
+
+  const requestedKey = normalizeModelLookupKey(trimmed);
+  if (!requestedKey) {
+    return trimmed;
+  }
+  const keyMatches = available.filter((entry) => normalizeModelLookupKey(entry) === requestedKey);
+  if (keyMatches.length === 1) {
+    return keyMatches[0];
+  }
+
+  const requestedTail = modelIdTail(trimmed);
+  if (requestedTail) {
+    const requestedTailLower = requestedTail.toLowerCase();
+    const tailCaseInsensitive = available.filter(
+      (entry) => modelIdTail(entry).toLowerCase() === requestedTailLower
+    );
+    if (tailCaseInsensitive.length === 1) {
+      return tailCaseInsensitive[0];
+    }
+    const requestedTailKey = normalizeModelLookupKey(requestedTail);
+    const tailKeyMatches = available.filter(
+      (entry) => normalizeModelLookupKey(modelIdTail(entry)) === requestedTailKey
+    );
+    if (tailKeyMatches.length === 1) {
+      return tailKeyMatches[0];
+    }
+  }
+
+  const ranked = available
+    .map((entry) => ({ entry, score: scoreModelSimilarity(trimmed, entry) }))
+    .sort((a, b) => b.score - a.score);
+  const best = ranked[0];
+  const second = ranked[1];
+  if (best && best.score >= 8 && (!second || best.score >= second.score + 4)) {
+    return best.entry;
+  }
+
+  // If only one model is available on the local server, use it automatically.
+  if (available.length === 1) {
+    return available[0] ?? trimmed;
   }
   return trimmed;
 }
@@ -773,13 +1140,24 @@ function shouldAttemptWebRecovery(params: {
   tools: Array<{ name: string }>;
   userMessage: string;
   toolOutcomes: Array<{ toolName: string; isError: boolean }>;
+  mfaPending: boolean;
 }): boolean {
+  if (params.mfaPending) {
+    return false;
+  }
+  if (
+    hasLikelyLoginIntent(params.userMessage) ||
+    looksLikeSiteVisitIntent(params.userMessage) ||
+    looksLikeAccountDashboardIntent(params.userMessage)
+  ) {
+    return false;
+  }
   const hasWebSearch = hasTool(params.tools, "web_search");
   const hasWebFetch = hasTool(params.tools, "web_fetch");
   if (!hasWebSearch && !hasWebFetch) {
     return false;
   }
-  const likelyLookup = /\b(search|look up|lookup|latest|current|today|news|web|internet|url|website|source|login|log in|sign in|otp|one[-\s]?time code|verification code|2fa|mfa|auth)\b/i.test(
+  const likelyLookup = /\b(search|look up|lookup|latest|current|today|news|web|internet|url|website|source)\b/i.test(
     params.userMessage,
   );
   if (!likelyLookup) {
@@ -838,6 +1216,26 @@ function hasLikelyLogoutIntent(message: string): boolean {
   return false;
 }
 
+function hasLikelyLoginIntent(message: string): boolean {
+  const text = String(message ?? "").toLowerCase();
+  if (!text.trim()) {
+    return false;
+  }
+  return (
+    /\blogin\b/.test(text) ||
+    /\blog\s*in(?:to)?\b/.test(text) ||
+    /\blog\s+me\s+in\b/.test(text) ||
+    /\bsign\s*in(?:to)?\b/.test(text) ||
+    /\bsign\s+me\s+in\b/.test(text) ||
+    /\bauth(?:enticate|entication)?\b/.test(text) ||
+    /\bverification\b/.test(text) ||
+    /\bone[-\s]?time code\b/.test(text) ||
+    /\botp\b/.test(text) ||
+    /\b2fa\b/.test(text) ||
+    /\bmfa\b/.test(text)
+  );
+}
+
 function buildLogoutToolForceInstruction(): string {
   return [
     "System instruction: this is a logout request for the current website session.",
@@ -849,6 +1247,13 @@ function buildLogoutToolForceInstruction(): string {
 
 function requestLikelyNeedsTools(message: string): boolean {
   const text = message.toLowerCase();
+  const emailIntent =
+    /\be-?mails?\b/.test(text) ||
+    /\binbox\b/.test(text) ||
+    /\bmailbox\b/.test(text) ||
+    /\bunread\b/.test(text) ||
+    /\bimap\b/.test(text) ||
+    /\bsmtp\b/.test(text);
   return (
     /\b(create|make|write|edit|delete|remove|rename|move|copy)\b/.test(text) ||
     /\b(file|folder|directory|desktop|documents|downloads)\b/.test(text) ||
@@ -857,13 +1262,185 @@ function requestLikelyNeedsTools(message: string): boolean {
     /\b(search|look up|lookup|latest|current|today|news|web|internet|url|website|source)\b/.test(
       text,
     ) ||
-    /\b(open|click|navigate|browse|tab|page|site|scrape|crawl)\b/.test(text)
-    ||
-    /\b(login|log in|logout|log out|sign in|sign out|signout|otp|one[-\s]?time code|verification code|2fa|mfa|authenticator|passcode)\b/.test(
-      text,
-    ) ||
+    /\b(open|click|navigate|browse|tab|page|site|scrape|crawl|visit|access)\b/.test(text) ||
+    /\bgo\s+to\b/.test(text) ||
+    /\bgoto\b/.test(text)
+    || hasLikelyLoginIntent(text) ||
+    /\b(logout|log out|sign out|signout|authenticator|passcode)\b/.test(text) ||
+    emailIntent ||
+    ((/\breply\b/.test(text) || /\brespond\b/.test(text)) &&
+      (/\be-?mails?\b/.test(text) || /\binbox\b/.test(text) || /\bmailbox\b/.test(text))) ||
     hasLikelyLogoutIntent(text) ||
     /\benter (that )?code\b/.test(text)
+  );
+}
+
+function requestLikelyNeedsCompletionVerification(message: string): boolean {
+  const text = String(message ?? "").toLowerCase();
+  if (!text.trim()) {
+    return false;
+  }
+  return (
+    /\b(create|make|write|edit|update|change|fix|rename|move|copy)\b/.test(text) ||
+    /\b(delete|remove|wipe|clear|purge|destroy)\b/.test(text) ||
+    /\b(send|submit|post|publish)\b/.test(text) ||
+    /\b(install|uninstall|upgrade|downgrade|configure|setup)\b/.test(text) ||
+    /\b(login|log in|logout|log out|sign in|sign out|authenticate|mfa|otp)\b/.test(text) ||
+    /\b(buy|purchase|checkout|order|pay)\b/.test(text)
+  );
+}
+
+function toToolArgsRecord(args: unknown): Record<string, unknown> {
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    return {};
+  }
+  return args as Record<string, unknown>;
+}
+
+function looksLikeStateMutationCommand(command: string): boolean {
+  const text = String(command ?? "").toLowerCase();
+  if (!text.trim()) {
+    return false;
+  }
+  return (
+    /\b(rm|rmdir|mv|cp|mkdir|touch|chmod|chown|ln)\b/.test(text) ||
+    /\b(sed|awk|perl)\b/.test(text) ||
+    /\b(npm|pnpm|yarn)\s+(install|remove|add|uninstall|update|upgrade|run)\b/.test(text) ||
+    /\bgit\s+(add|commit|push|checkout|switch|merge|rebase|reset)\b/.test(text) ||
+    /\b(docker|kubectl|systemctl)\b/.test(text) ||
+    />>?/.test(text)
+  );
+}
+
+function looksLikeStateVerificationCommand(command: string): boolean {
+  const text = String(command ?? "").toLowerCase();
+  if (!text.trim()) {
+    return false;
+  }
+  return (
+    /\b(test|stat|ls|find|rg|grep|cat|head|tail|wc|du|md5sum|sha256sum)\b/.test(text) ||
+    /\[\s*![^]]*-e/.test(text) ||
+    /\[\s*-e/.test(text)
+  );
+}
+
+function toolCallMutatesState(toolName: string, args: Record<string, unknown>): boolean {
+  const normalizedTool = String(toolName ?? "").trim().toLowerCase();
+  if (!normalizedTool) {
+    return false;
+  }
+  if (normalizedTool === "write" || normalizedTool === "edit") {
+    return true;
+  }
+  if (
+    normalizedTool === "memory_save" ||
+    normalizedTool === "memory_delete" ||
+    normalizedTool === "memory_prune" ||
+    normalizedTool === "memory_feedback" ||
+    normalizedTool === "memory_compact"
+  ) {
+    return true;
+  }
+  if (normalizedTool === "email") {
+    const action = String(args.action ?? "").trim().toLowerCase();
+    return action === "send";
+  }
+  if (normalizedTool === "browser") {
+    const action = String(args.action ?? "").trim().toLowerCase();
+    return (
+      action === "submit" ||
+      action === "login" ||
+      action === "mfa" ||
+      action === "upload" ||
+      action === "dialog" ||
+      action === "challenge"
+    );
+  }
+  if (normalizedTool === "exec") {
+    const command = String(args.command ?? args.cmd ?? "");
+    return looksLikeStateMutationCommand(command);
+  }
+  return false;
+}
+
+function toolCallVerifiesState(toolName: string, args: Record<string, unknown>): boolean {
+  const normalizedTool = String(toolName ?? "").trim().toLowerCase();
+  if (!normalizedTool) {
+    return false;
+  }
+  if (
+    normalizedTool === "read" ||
+    normalizedTool === "ls" ||
+    normalizedTool === "find" ||
+    normalizedTool === "exists" ||
+    normalizedTool === "web_search" ||
+    normalizedTool === "web_fetch" ||
+    normalizedTool === "memory_search" ||
+    normalizedTool === "memory_get" ||
+    normalizedTool === "memory_save" ||
+    normalizedTool === "memory_delete" ||
+    normalizedTool === "memory_prune" ||
+    normalizedTool === "memory_feedback" ||
+    normalizedTool === "memory_compact" ||
+    normalizedTool === "memory_list" ||
+    normalizedTool === "memory_stats"
+  ) {
+    return true;
+  }
+  if (normalizedTool === "email") {
+    const action = String(args.action ?? "").trim().toLowerCase();
+    return (
+      action === "status" ||
+      action === "list_unread" ||
+      action === "read_unread" ||
+      action === "read_recent" ||
+      action === "send"
+    );
+  }
+  if (normalizedTool === "browser") {
+    const action = String(args.action ?? "").trim().toLowerCase();
+    return (
+      action === "snapshot" ||
+      action === "wait" ||
+      action === "wait_for_request" ||
+      action === "downloads" ||
+      action === "console" ||
+      action === "pdf"
+    );
+  }
+  if (normalizedTool === "exec") {
+    const command = String(args.command ?? args.cmd ?? "");
+    return looksLikeStateVerificationCommand(command);
+  }
+  return false;
+}
+
+function buildCompletionVerificationInstruction(): string {
+  return [
+    "System instruction: do not finalize yet.",
+    "A state-changing step needs direct post-action verification before any completion claim.",
+    "Run verification now (for filesystem use explicit existence/list checks; for web/app use snapshot/readback/status evidence), then summarize only verified results.",
+  ].join(" ");
+}
+
+function messageLikelyNeedsEmailTool(message: string): boolean {
+  const text = String(message ?? "").toLowerCase();
+  if (!text.trim()) {
+    return false;
+  }
+  const emailIntent =
+    /\be-?mails?\b/.test(text) ||
+    /\binbox\b/.test(text) ||
+    /\bmailbox\b/.test(text) ||
+    /\bunread\b/.test(text) ||
+    /\bimap\b/.test(text) ||
+    /\bsmtp\b/.test(text);
+  return (
+    emailIntent ||
+    /\bsend (an )?e-?mails?\b/.test(text) ||
+    /\bcheck (my|the)?\s*inbox\b/.test(text) ||
+    ((/\breply\b/.test(text) || /\brespond\b/.test(text)) &&
+      (/\be-?mails?\b/.test(text) || /\binbox\b/.test(text) || /\bmailbox\b/.test(text)))
   );
 }
 
@@ -877,6 +1454,98 @@ function extractLikelyOneTimeCode(message: string): string | null {
   }
   if (/^[A-Za-z0-9]{6,10}$/.test(compact) && /\d/.test(compact)) {
     return compact;
+  }
+  return null;
+}
+
+function extractOneTimeCodeCandidatesFromText(text: string): string[] {
+  const source = String(text ?? "");
+  if (!source.trim()) {
+    return [];
+  }
+  const candidates: Array<{ value: string; score: number }> = [];
+  const push = (value: string, score: number) => {
+    const normalized = String(value ?? "").trim();
+    if (!normalized || normalized.length < 4 || normalized.length > 10) {
+      return;
+    }
+    if (!/^[a-z0-9]+$/i.test(normalized)) {
+      return;
+    }
+    if (!/\d/.test(normalized)) {
+      return;
+    }
+    candidates.push({ value: normalized, score });
+  };
+
+  const contextual = /(?:verification|one[-\s]?time|security|login|sign[-\s]?in|otp|mfa|2fa|auth(?:entication)?)\D{0,24}([a-z0-9]{4,10})/gi;
+  for (const match of source.matchAll(contextual)) {
+    const value = String(match[1] ?? "").trim();
+    let score = 10;
+    if (/^\d+$/.test(value)) {
+      score += value.length === 6 ? 5 : value.length === 8 ? 4 : 2;
+    }
+    push(value, score);
+  }
+
+  const genericNumeric = /\b(\d{4,10})\b/g;
+  for (const match of source.matchAll(genericNumeric)) {
+    const value = String(match[1] ?? "").trim();
+    let score = 2;
+    if (value.length === 6) {
+      score += 4;
+    } else if (value.length === 8) {
+      score += 3;
+    }
+    push(value, score);
+  }
+
+  const genericAlphaNum = /\b([a-z0-9]{6,10})\b/gi;
+  for (const match of source.matchAll(genericAlphaNum)) {
+    const value = String(match[1] ?? "").trim();
+    if (!/\d/.test(value)) {
+      continue;
+    }
+    push(value, 1);
+  }
+
+  const best = new Map<string, number>();
+  for (const candidate of candidates) {
+    const prev = best.get(candidate.value) ?? Number.NEGATIVE_INFINITY;
+    if (candidate.score > prev) {
+      best.set(candidate.value, candidate.score);
+    }
+  }
+  return Array.from(best.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([value]) => value);
+}
+
+function extractLikelyOneTimeCodeFromEmailOutcome(content: string): string | null {
+  const parsed = parseJsonRecord(content);
+  const sourceTexts: string[] = [];
+  if (parsed) {
+    const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
+    for (const entry of messages) {
+      if (!entry || typeof entry !== "object") {
+        continue;
+      }
+      const row = entry as Record<string, unknown>;
+      sourceTexts.push(
+        String(row.subject ?? ""),
+        String(row.snippet ?? ""),
+      );
+    }
+    sourceTexts.push(String(parsed.reason ?? ""), String(parsed.nextStep ?? ""));
+  }
+  if (sourceTexts.length === 0) {
+    sourceTexts.push(String(content ?? ""));
+  }
+  for (const text of sourceTexts) {
+    const candidates = extractOneTimeCodeCandidatesFromText(text);
+    if (candidates.length > 0) {
+      return candidates[0] ?? null;
+    }
   }
   return null;
 }
@@ -1273,6 +1942,9 @@ function summarizeOutcomeForProgress(params: {
       return `I pulled a concrete detail: ${summary} I'm cross-checking this before finalizing.`;
     }
   }
+  if (/^[\[{]/.test(raw)) {
+    return null;
+  }
 
   const summary = firstSentence(raw, 170);
   if (!summary || isGenericProgressLine(summary)) {
@@ -1340,8 +2012,10 @@ function updatePendingMfaStateFromBrowserTool(params: {
   const tabRecord = getNestedRecord(parsed, "tab");
   const activeTabId = String(parsed.activeTabId ?? tabRecord?.id ?? "").trim();
   const service = String(parsed.service ?? "").trim();
+  const mfaSourceService = String(parsed.mfaSourceService ?? mfaRecord?.sourceService ?? "").trim();
   pendingMfaBySession.set(params.sessionId, {
     ...(service ? { service } : {}),
+    ...(mfaSourceService ? { mfaSourceService } : {}),
     ...(activeTabId ? { tabId: activeTabId } : {}),
     since: Date.now(),
   });
@@ -1351,6 +2025,130 @@ function updatePendingMfaStateFromBrowserTool(params: {
       pendingMfaBySession.delete(oldest);
     }
   }
+}
+
+function parseBrowserMfaState(outcomeContent: string): {
+  requiresMfa: boolean;
+  mfaSourceService: string | null;
+  mfaSourceCredentialAvailable: boolean;
+} {
+  const parsed = parseJsonRecord(outcomeContent);
+  if (!parsed) {
+    return {
+      requiresMfa: false,
+      mfaSourceService: null,
+      mfaSourceCredentialAvailable: false,
+    };
+  }
+  const mfaRecord = getNestedRecord(parsed, "mfa");
+  const requiresMfa =
+    parsed.requiresMfa === true ||
+    mfaRecord?.required === true ||
+    mfaRecord?.requiresMfa === true;
+  const mfaSourceServiceRaw = String(parsed.mfaSourceService ?? mfaRecord?.sourceService ?? "").trim();
+  const mfaSourceService = mfaSourceServiceRaw || null;
+  const mfaSourceCredentialAvailable =
+    parsed.mfaSourceCredentialAvailable === true ||
+    mfaRecord?.sourceCredentialAvailable === true;
+  return {
+    requiresMfa,
+    mfaSourceService,
+    mfaSourceCredentialAvailable,
+  };
+}
+
+function parseBrowserLoginState(outcomeContent: string): {
+  submitted: boolean;
+  requiresMfa: boolean;
+  mfaExpected: boolean;
+  identifier: string | null;
+} | null {
+  const parsed = parseJsonRecord(outcomeContent);
+  if (!parsed) {
+    return null;
+  }
+  const mfaRecord = getNestedRecord(parsed, "mfa");
+  const hasLoginShape =
+    "submitted" in parsed ||
+    "requiresMfa" in parsed ||
+    "mfaExpected" in parsed ||
+    "identifier" in parsed ||
+    mfaRecord !== null;
+  if (!hasLoginShape) {
+    return null;
+  }
+  const identifierRaw = String(parsed.identifierFull ?? parsed.identifier ?? parsed.identifierMasked ?? "").trim();
+  return {
+    submitted: parsed.submitted === true,
+    requiresMfa:
+      parsed.requiresMfa === true ||
+      mfaRecord?.required === true ||
+      mfaRecord?.requiresMfa === true,
+    mfaExpected: parsed.mfaExpected === true || mfaRecord?.expected === true,
+    identifier: identifierRaw || null,
+  };
+}
+
+function normalizeBrowserActionName(value: unknown): string {
+  const raw = String(value ?? "")
+    .trim()
+    .toLowerCase();
+  if (raw === "wait-for-request" || raw === "waitforrequest" || raw === "wait-for-network") {
+    return "wait_for_request";
+  }
+  if (raw === "captcha" || raw === "human-check" || raw === "human_check" || raw === "human-verification") {
+    return "challenge";
+  }
+  return raw;
+}
+
+function parseBrowserChallengeState(outcomeContent: string): {
+  detected: boolean;
+  tabId: string | null;
+} {
+  const parsed = parseJsonRecord(outcomeContent);
+  if (!parsed) {
+    return {
+      detected: false,
+      tabId: null,
+    };
+  }
+  const challengeRecord = getNestedRecord(parsed, "challenge");
+  const tabRecord = getNestedRecord(parsed, "tab");
+  const detected =
+    parsed.humanVerificationRequired === true ||
+    parsed.challengeDetected === true ||
+    challengeRecord?.detected === true;
+  const tabIdRaw = String(parsed.activeTabId ?? tabRecord?.id ?? "").trim();
+  return {
+    detected,
+    tabId: tabIdRaw || null,
+  };
+}
+
+function outcomeLooksLikeHumanVerificationError(outcomeContent: string): boolean {
+  const text = String(outcomeContent ?? "").toLowerCase();
+  return /\b(captcha|recaptcha|hcaptcha|turnstile|human verification|verify you are human|security check|cloudflare)\b/.test(
+    text,
+  );
+}
+
+function buildAutoMfaFromEmailInstruction(params: {
+  sourceService: string;
+  pending: PendingMfaSession | undefined;
+}): string {
+  const tabPart = params.pending?.tabId ? `, tabId="${params.pending.tabId}"` : "";
+  const servicePart = params.pending?.service ? `, service="${params.pending.service}"` : "";
+  return [
+    "System instruction: login reached MFA challenge and mailbox access is configured.",
+    `Use email tool now with action="list_unread" and service="${params.sourceService}" to fetch the latest one-time code.`,
+    "Extract the code, then immediately call browser tool action=\"mfa\" with that code",
+    `${tabPart}${servicePart}.`,
+    "If no usable code is found in email, ask the user for the one-time code in one short line and stop.",
+  ]
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function buildMfaContinuationInstruction(params: {
@@ -1363,6 +2161,7 @@ function buildMfaContinuationInstruction(params: {
     `Use browser tool immediately with action="mfa", code="${params.mfaCode}"`,
     `${params.pending.tabId ? `, tabId="${params.pending.tabId}"` : ""}.`,
     `${params.pending.service ? `Use service="${params.pending.service}" if needed.` : ""}`,
+    `${params.pending.mfaSourceService ? `Prefer MFA inbox source service="${params.pending.mfaSourceService}" when a retrieval step is needed.` : ""}`,
     "Do not ask the user to repeat this same code.",
   ]
     .join(" ")
@@ -1371,8 +2170,257 @@ function buildMfaContinuationInstruction(params: {
 }
 
 function looksLikeLoginIntent(message: string): boolean {
+  return hasLikelyLoginIntent(message);
+}
+
+function looksLikeAccountDashboardIntent(message: string): boolean {
   const text = String(message ?? "").toLowerCase();
-  return /\b(login|log in|sign in|authenticate|verification|one[-\s]?time code|otp|2fa|mfa)\b/.test(text);
+  if (!text.trim()) {
+    return false;
+  }
+  return (
+    /\bdashboard\b/.test(text) ||
+    /\bbalance\b/.test(text) ||
+    /\baccount\b/.test(text) ||
+    /\bportfolio\b/.test(text) ||
+    /\bstatement\b/.test(text)
+  );
+}
+
+function messageLikelyAsksToContinueWithoutCode(message: string): boolean {
+  const text = String(message ?? "").toLowerCase();
+  if (!text.trim()) {
+    return false;
+  }
+  return (
+    /\b(continue|proceed|go ahead|keep going|next step|do it|finish)\b/.test(text) ||
+    looksLikeLoginIntent(text) ||
+    looksLikeAccountDashboardIntent(text)
+  );
+}
+
+function looksLikeMfaRecoveryIntent(message: string): boolean {
+  const text = String(message ?? "").toLowerCase();
+  if (!text.trim()) {
+    return false;
+  }
+  if (
+    /\b(what|which)\s+email\b/.test(text) ||
+    /\b(email|address)\b[\s\S]{0,40}\b(enter|entered|use|used|fill|filled|typed|typing)\b/.test(text)
+  ) {
+    return true;
+  }
+  const codeTerms = /\b(one[-\s]?time code|otp|verification code|auth code|2fa code|mfa code|code)\b/.test(text);
+  if (!codeTerms) {
+    return false;
+  }
+  return (
+    /\b(not getting|not receiving|didn['’]?t get|never got|no code|code not|missing)\b/.test(text) ||
+    /\b(resend|send again|retry|try again)\b/.test(text)
+  );
+}
+
+function extractHttpUrlsFromText(message: string): string[] {
+  const text = String(message ?? "");
+  if (!text.trim()) {
+    return [];
+  }
+  const matches = text.match(/https?:\/\/[^\s"'`<>]+/gi) ?? [];
+  const out: string[] = [];
+  for (const raw of matches) {
+    const cleaned = raw.trim();
+    if (!cleaned) {
+      continue;
+    }
+    try {
+      const normalized = new URL(cleaned).toString();
+      if (!out.includes(normalized)) {
+        out.push(normalized);
+      }
+    } catch {
+      // ignore invalid URL fragments
+    }
+  }
+  return out;
+}
+
+function extractLikelyDomainsFromText(message: string): string[] {
+  const text = String(message ?? "");
+  if (!text.trim()) {
+    return [];
+  }
+  const compacted = text.replace(/([a-z0-9])\s*([.-])\s*(?=[a-z0-9])/gi, "$1$2");
+  const matches = compacted.match(/\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\b/gi) ?? [];
+  const out: string[] = [];
+  for (const raw of matches) {
+    const host = raw.trim().toLowerCase().replace(/^www\./, "");
+    if (!host) {
+      continue;
+    }
+    if (!out.includes(host)) {
+      out.push(host);
+    }
+  }
+  return out;
+}
+
+function normalizeServiceFingerprint(value: string): string {
+  return String(value ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function isGenericServiceName(service: string): boolean {
+  const normalized = normalizeSetupService(service) ?? "";
+  return normalized === "email" || normalized === "mail" || normalized === "x.com";
+}
+
+function hostFromWebsiteUrl(value: string): string | null {
+  const raw = String(value ?? "").trim();
+  if (!raw) {
+    return null;
+  }
+  try {
+    return new URL(raw).hostname.trim().toLowerCase().replace(/^www\./, "") || null;
+  } catch {
+    return null;
+  }
+}
+
+function extractTargetUrlFromMessage(message: string): string | null {
+  const explicit = extractHttpUrlsFromText(message)[0];
+  if (explicit) {
+    return explicit;
+  }
+  const domain = extractLikelyDomainsFromText(message)[0];
+  if (!domain) {
+    return null;
+  }
+  return `https://${domain}`;
+}
+
+function looksLikeSiteVisitIntent(message: string): boolean {
+  const text = String(message ?? "").toLowerCase();
+  if (!text.trim()) {
+    return false;
+  }
+  const hasSite = extractHttpUrlsFromText(message).length > 0 || extractLikelyDomainsFromText(message).length > 0;
+  if (!hasSite) {
+    return false;
+  }
+  return (
+    /\b(go to|goto|open|visit|navigate|check|load|access)\b/.test(text) ||
+    hasLikelyLoginIntent(text) ||
+    looksLikeAccountDashboardIntent(text)
+  );
+}
+
+function assistantRefusedOtpRelay(text: string): boolean {
+  const normalized = String(text ?? "").toLowerCase();
+  if (!normalized.trim()) {
+    return false;
+  }
+  return (
+    /can(?:not|'t)\s+(?:relay|provide|share|send)\s+(?:any\s+)?(?:one[-\s]?time|otp|verification)\s+(?:password|code|codes)/.test(
+      normalized,
+    ) ||
+    /one[-\s]?time\s+(?:password|code).*treated as sensitive/.test(normalized)
+  );
+}
+
+function inferTargetUrlFromService(service: string): string | null {
+  const normalized = normalizeSetupService(service);
+  if (!normalized || !normalized.includes(".")) {
+    return null;
+  }
+  return `https://${normalized}`;
+}
+
+async function resolveSavedServiceFromUserMessage(params: {
+  workspaceDir: string;
+  message: string;
+}): Promise<string | null> {
+  const candidates = new Set<string>();
+  const add = (value: string) => {
+    const normalized = normalizeSetupService(value);
+    if (normalized) {
+      candidates.add(normalized);
+    }
+  };
+
+  const urls = extractHttpUrlsFromText(params.message);
+  for (const url of urls) {
+    try {
+      const host = new URL(url).hostname.trim().toLowerCase().replace(/^www\./, "");
+      if (!host) {
+        continue;
+      }
+      add(host);
+      const first = host.split(".")[0] ?? "";
+      if (first) {
+        add(first);
+      }
+    } catch {
+      // ignore
+    }
+  }
+  const domains = extractLikelyDomainsFromText(params.message);
+  for (const domain of domains) {
+    add(domain);
+    const first = domain.split(".")[0] ?? "";
+    if (first) {
+      add(first);
+    }
+  }
+
+  const textTokens = String(params.message ?? "")
+    .toLowerCase()
+    .split(/[^a-z0-9._-]+/g)
+    .map((token) => token.trim())
+    .filter(Boolean);
+  for (const token of textTokens) {
+    if (token.length < 3) {
+      continue;
+    }
+    if (token.includes("-") || token.includes(".") || /vault|bank|finance|account|mail/.test(token)) {
+      add(token);
+    }
+  }
+
+  for (const service of candidates) {
+    const credential = await getCredential({
+      workspaceDir: params.workspaceDir,
+      service,
+    });
+    if (credential) {
+      return service;
+    }
+  }
+
+  const messageFingerprint = normalizeServiceFingerprint(
+    String(params.message ?? "").replace(/([a-z0-9])\s*([.-])\s*(?=[a-z0-9])/gi, "$1$2"),
+  );
+  if (!messageFingerprint) {
+    return null;
+  }
+  const configured = await listConfiguredServices(params.workspaceDir);
+  for (const service of configured) {
+    if (isGenericServiceName(service)) {
+      continue;
+    }
+    const serviceFingerprint = normalizeServiceFingerprint(service);
+    if (serviceFingerprint.length >= 8 && messageFingerprint.includes(serviceFingerprint)) {
+      return service;
+    }
+    const credential = await getCredential({
+      workspaceDir: params.workspaceDir,
+      service,
+    });
+    const websiteHost = hostFromWebsiteUrl(String(credential?.websiteUrl ?? ""));
+    const websiteFingerprint = normalizeServiceFingerprint(websiteHost ?? "");
+    if (websiteFingerprint.length >= 8 && messageFingerprint.includes(websiteFingerprint)) {
+      return service;
+    }
+  }
+  return null;
 }
 
 function assistantIsAskingForIdentifier(text: string): boolean {
@@ -1382,6 +2430,11 @@ function assistantIsAskingForIdentifier(text: string): boolean {
   }
   return (
     /\b(which|what)\s+(email|username)\b/.test(normalized) ||
+    /\bwhat\s+email\s+address\b/.test(normalized) ||
+    /\bneed (?:the )?(?:exact )?(email|username)\b/.test(normalized) ||
+    /\bjust need (?:your )?(email|username)\b/.test(normalized) ||
+    /\bneed .* (email|username) .* (enter|use|send)\b/.test(normalized) ||
+    /\bemail address (?:to use|you(?:'|’)d like|for this)\b/.test(normalized) ||
     /\bemail should i use\b/.test(normalized) ||
     /\busername should i use\b/.test(normalized) ||
     /\bwhat (is )?your email\b/.test(normalized) ||
@@ -1413,6 +2466,82 @@ function extractHostFromBrowserOutcomeContent(content: string): string | null {
     }
   }
   return null;
+}
+
+function extractUrlFromBrowserOutcomeContent(content: string): string | null {
+  const parsed = parseJsonRecord(content);
+  if (!parsed) {
+    return null;
+  }
+  const candidates = [
+    String(parsed.url ?? ""),
+    String(getNestedRecord(parsed, "snapshot")?.url ?? ""),
+    String(getNestedRecord(parsed, "tab")?.url ?? ""),
+    String(getNestedRecord(parsed, "openedSnapshot")?.url ?? ""),
+  ]
+    .map((value) => value.trim())
+    .filter(Boolean);
+  for (const raw of candidates) {
+    try {
+      const normalized = new URL(raw).toString();
+      if (normalized) {
+        return normalized;
+      }
+    } catch {
+      // ignore invalid URL fragments
+    }
+  }
+  return null;
+}
+
+function latestBrowserUrlFromToolOutcomes(
+  toolOutcomes: Array<{ toolName: string; isError: boolean; content: string }>,
+): string | null {
+  const successfulBrowserOutcomes = toolOutcomes
+    .filter((entry) => !entry.isError && String(entry.toolName ?? "").trim().toLowerCase() === "browser")
+    .slice()
+    .reverse();
+  for (const outcome of successfulBrowserOutcomes) {
+    const url = extractUrlFromBrowserOutcomeContent(outcome.content);
+    if (url) {
+      return url;
+    }
+  }
+  return null;
+}
+
+function enrichCheckoutArgsWithPageContext(params: {
+  toolName: string;
+  toolArgs: unknown;
+  toolOutcomes: Array<{ toolName: string; isError: boolean; content: string }>;
+}): unknown {
+  if (String(params.toolName ?? "").trim().toLowerCase() !== "browser") {
+    return params.toolArgs;
+  }
+  if (!params.toolArgs || typeof params.toolArgs !== "object" || Array.isArray(params.toolArgs)) {
+    return params.toolArgs;
+  }
+  const args = params.toolArgs as Record<string, unknown>;
+  const action = String(args.action ?? "").trim().toLowerCase();
+  if (!action || !["click", "submit", "act", "press"].includes(action)) {
+    return params.toolArgs;
+  }
+  const knownUrl =
+    String(args.currentUrl ?? "").trim() ||
+    String(args.currentPageUrl ?? "").trim() ||
+    String(args.url ?? "").trim() ||
+    String(args.targetUrl ?? "").trim();
+  if (knownUrl) {
+    return params.toolArgs;
+  }
+  const latestUrl = latestBrowserUrlFromToolOutcomes(params.toolOutcomes);
+  if (!latestUrl) {
+    return params.toolArgs;
+  }
+  return {
+    ...args,
+    currentPageUrl: latestUrl,
+  };
 }
 
 function buildServiceCandidatesFromHost(host: string): string[] {
@@ -1524,7 +2653,11 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
     routeProviderId: provider,
     profile,
   });
-  const normalizedBaseUrl = normalizeBaseUrl(profile.baseUrl) ?? normalizeBaseUrl(runtimeResolution.baseUrlOverride);
+  const rawBaseUrl = normalizeBaseUrl(profile.baseUrl) ?? normalizeBaseUrl(runtimeResolution.baseUrlOverride);
+  const normalizedBaseUrl =
+    runtimeResolution.runtimeProvider === OPENAI_RUNTIME_PROVIDER
+      ? normalizeOpenAICompatibleBaseUrl(rawBaseUrl)
+      : rawBaseUrl;
   const routeProviderId = String(provider).trim().toLowerCase();
   const profileProviderId = String(profile.provider ?? "").trim().toLowerCase();
   const allowMissingCredential = Boolean(
@@ -1535,6 +2668,7 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
   if (!credential && !allowMissingCredential) {
     throw new Error(`Credentials missing for provider '${provider}'.`);
   }
+  const requestApiKey = credential ?? (allowMissingCredential ? LOCAL_OPENAI_DUMMY_API_KEY : undefined);
 
   const typedProvider = runtimeResolution.runtimeProvider;
   const runtimeProfile: ProviderProfile =
@@ -1544,8 +2678,35 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
 
   const sessionId = params.sessionId || params.externalUserId || "default";
   const history = await loadSessionMessages(sessionId);
-  const pendingMfa = pendingMfaBySession.get(sessionId);
+  let pendingMfa = pendingMfaBySession.get(sessionId);
+  const pendingServiceHint = pendingMfa?.service ?? null;
   const oneTimeCode = extractLikelyOneTimeCode(params.message);
+  const mfaRecoveryIntent =
+    pendingMfa && !oneTimeCode ? looksLikeMfaRecoveryIntent(params.message) : false;
+  if (
+    pendingMfa &&
+    !oneTimeCode &&
+    (looksLikeLoginIntent(params.message) || looksLikeSiteVisitIntent(params.message) || mfaRecoveryIntent)
+  ) {
+    pendingMfaBySession.delete(sessionId);
+    pendingMfa = undefined;
+  }
+  if (
+    pendingMfa &&
+    !oneTimeCode &&
+    messageLikelyAsksToContinueWithoutCode(params.message) &&
+    !looksLikeLoginIntent(params.message) &&
+    !looksLikeSiteVisitIntent(params.message)
+  ) {
+    return {
+      message:
+        "I’m paused at MFA. Send the one-time code (4-10 digits) and I’ll enter it immediately.",
+      thinking: null,
+      toolCalls: [],
+      provider,
+      model,
+    };
+  }
   const effectiveUserMessage =
     pendingMfa && oneTimeCode
       ? buildMfaContinuationInstruction({
@@ -1560,11 +2721,20 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
     timestamp: Date.now()
   };
 
-  const resolvedModelId = resolveModelAlias({
+  let discoveredLocalModels: string[] = [];
+  let resolvedModelId = resolveModelAlias({
     runtimeProvider: typedProvider,
     requestedProvider: runtimeResolution.requestedProvider,
     modelId: model,
   });
+  if (routeProviderId === "local-openai" && normalizedBaseUrl) {
+    discoveredLocalModels = await discoverLocalOpenAIModels({
+      baseUrl: normalizedBaseUrl,
+      apiKey: requestApiKey,
+      headers: runtimeProfile.headers,
+    });
+    resolvedModelId = remapModelIdFromAvailable(resolvedModelId, discoveredLocalModels);
+  }
   const discovered = getModel(typedProvider, resolvedModelId as never);
   let modelDef = discovered
     ? applyProfileModelOverrides({
@@ -1591,6 +2761,12 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
   }
 
   const smallTalkTurn = isSmallTalkMessage(params.message);
+  const emailToolAllowed =
+    process.env.T560_ENABLE_EMAIL_TOOL_ALWAYS === "1" ||
+    messageLikelyNeedsEmailTool(params.message) ||
+    looksLikeLoginIntent(params.message) ||
+    looksLikeAccountDashboardIntent(params.message) ||
+    Boolean(pendingMfa);
   const tools = smallTalkTurn
     ? []
     : createT560CodingTools({
@@ -1598,7 +2774,7 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
         config: params.config,
         modelProvider: typedProvider,
         senderIsOwner: true
-      });
+      }).filter((tool) => emailToolAllowed || String(tool.name ?? "").toLowerCase() !== "email");
   const toolDefinitions = normalizeToolParameters(toToolDefinitions(tools));
 
   const soulPrompt = await loadSoulPrompt();
@@ -1646,54 +2822,117 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
   });
 
   const messages: Message[] = [...history, userMessage];
+  let savedServiceFromMessage: string | null = null;
+  const autoAuthIntent =
+    looksLikeLoginIntent(params.message) ||
+    looksLikeAccountDashboardIntent(params.message) ||
+    looksLikeSiteVisitIntent(params.message) ||
+    mfaRecoveryIntent;
+  if (
+    !pendingMfa &&
+    autoAuthIntent
+  ) {
+    if (mfaRecoveryIntent && pendingServiceHint) {
+      savedServiceFromMessage = normalizeSetupService(pendingServiceHint) ?? pendingServiceHint;
+    }
+    try {
+      if (!savedServiceFromMessage) {
+        const savedService = await resolveSavedServiceFromUserMessage({
+          workspaceDir: process.cwd(),
+          message: params.message,
+        });
+        savedServiceFromMessage = savedService;
+      }
+    } catch {
+      // best effort bootstrap; continue without it if lookup fails
+    }
+  }
   const allToolCalls: string[] = [];
   const toolOutcomes: Array<{
     toolName: string;
     isError: boolean;
     content: string;
   }> = [];
+  let completionVerificationNeeded = requestLikelyNeedsCompletionVerification(params.message);
+  let completionVerificationSatisfied = !completionVerificationNeeded;
+  let completionVerificationPromptSent = false;
+  const registerCompletionVerificationSignal = (params: {
+    toolName: string;
+    args: Record<string, unknown>;
+    isError: boolean;
+  }) => {
+    if (params.isError) {
+      return;
+    }
+    const normalizedToolName = String(params.toolName ?? "").trim().toLowerCase();
+    if (!normalizedToolName) {
+      return;
+    }
+    if (toolCallMutatesState(normalizedToolName, params.args)) {
+      completionVerificationNeeded = true;
+      completionVerificationSatisfied = false;
+      completionVerificationPromptSent = false;
+    }
+    if (completionVerificationNeeded && toolCallVerifiesState(normalizedToolName, params.args)) {
+      completionVerificationSatisfied = true;
+    }
+  };
+  let latestBrowserLoginState: {
+    submitted: boolean;
+    requiresMfa: boolean;
+    mfaExpected: boolean;
+    identifier: string | null;
+  } | null = null;
   let recoveryPromptSent = false;
   let finalizationPromptSent = false;
   let emptyReplyRecoveryPromptSent = false;
+  let forceWaitForMfaCode = false;
   let lastAssistant: AssistantMessage | undefined;
   let checkoutBlockedMessage: string | null = null;
+  const challengeScreenshotKeys = new Set<string>();
   const forceToolUse =
     !smallTalkTurn &&
     (requestLikelyNeedsTools(params.message) || Boolean(pendingMfa && oneTimeCode));
-  const providerTimeoutMs = resolveProviderTimeoutMs();
+  const providerTimeoutMs = resolveProviderTimeoutMs({
+    routeProviderId,
+    baseUrl: normalizedBaseUrl,
+  });
+  const toolExecutionTimeoutMs = resolveToolExecutionTimeoutMs();
+  const timedOutToolCallIds = new Set<string>();
   const modelBaseUrl =
     typeof (modelDef as { baseUrl?: unknown }).baseUrl === "string"
       ? (modelDef as { baseUrl: string }).baseUrl
       : "";
   const requestAssistant = async (context: Context): Promise<AssistantMessage> => {
     const abortController = new AbortController();
-    const timeout = setTimeout(() => {
-      abortController.abort();
-    }, providerTimeoutMs);
-    timeout.unref?.();
+    const endpointHint = modelBaseUrl ? ` endpoint=${modelBaseUrl}` : "";
+    const timeoutMessage =
+      `Provider request timed out after ${Math.round(providerTimeoutMs / 1000)}s.${endpointHint}`;
     try {
-      return await complete(modelDef, context, {
-        ...(credential ? { apiKey: credential } : {}),
-        ...(profile.headers && Object.keys(profile.headers).length > 0
-          ? { headers: profile.headers }
-          : {}),
-        sessionId,
-        signal: abortController.signal,
-        metadata: {
-          channel: params.channel,
-          userId: params.externalUserId
-        }
+      return await runWithHardTimeout({
+        operation: complete(modelDef, context, {
+          ...(requestApiKey ? { apiKey: requestApiKey } : {}),
+          ...(profile.headers && Object.keys(profile.headers).length > 0
+            ? { headers: profile.headers }
+            : {}),
+          sessionId,
+          signal: abortController.signal,
+          metadata: {
+            channel: params.channel,
+            userId: params.externalUserId
+          }
+        }),
+        timeoutMs: providerTimeoutMs,
+        timeoutMessage,
+        onTimeout: () => {
+          abortController.abort();
+        },
       });
     } catch (error: unknown) {
       if (abortController.signal.aborted) {
-        const endpointHint = modelBaseUrl ? ` endpoint=${modelBaseUrl}` : "";
-        throw new Error(
-          `Provider request timed out after ${Math.round(providerTimeoutMs / 1000)}s.${endpointHint}`
-        );
+        throw new Error(timeoutMessage);
       }
       throw error;
-    } finally {
-      clearTimeout(timeout);
     }
   };
   const emitAssistantProgress = (text: string, phase: "pretool" | "progress" = "progress") => {
@@ -1713,12 +2952,260 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
     });
   };
 
+  let syntheticToolCounter = 0;
+  const runSyntheticToolCall = async (toolName: string, argumentsRecord: Record<string, unknown>) => {
+    const toolCall = {
+      id: `auto-${Date.now()}-${syntheticToolCounter}`,
+      name: toolName,
+      arguments: argumentsRecord,
+    } as unknown as ToolCall;
+    syntheticToolCounter += 1;
+    const argsProgress = summarizeArgsForProgress(String(toolName ?? "").trim().toLowerCase(), argumentsRecord);
+    if (argsProgress) {
+      emitAssistantProgress(argsProgress, "pretool");
+    }
+    let outcome: { isError: boolean; content: string };
+    try {
+      outcome = await runWithHardTimeout({
+        operation: executeToolCall({
+          tools,
+          toolDefinitions,
+          toolCall,
+          context: {
+            sessionId,
+            channel: params.channel,
+            provider: typedProvider,
+            model: resolvedModelId,
+          },
+          eventHooks: {
+            onStart: ({ toolCallId, toolName: startedTool, args }) => {
+              handleToolExecutionStart({
+                sessionId,
+                channel: params.channel,
+                toolCallId,
+                toolName: startedTool,
+                args,
+              });
+            },
+            onUpdate: ({ toolCallId, toolName: updatedTool, partialResult }) => {
+              if (timedOutToolCallIds.has(toolCallId)) {
+                return;
+              }
+              handleToolExecutionUpdate({
+                sessionId,
+                channel: params.channel,
+                toolCallId,
+                toolName: updatedTool,
+                partialResult,
+              });
+            },
+            onEnd: ({ toolCallId, toolName: endedTool, result, isError, error }) => {
+              if (timedOutToolCallIds.has(toolCallId)) {
+                return;
+              }
+              handleToolExecutionEnd({
+                sessionId,
+                channel: params.channel,
+                toolCallId,
+                toolName: endedTool,
+                result,
+                ...(isError ? { error: error ?? "tool execution failed" } : {}),
+              });
+            },
+          },
+        }),
+        timeoutMs: toolExecutionTimeoutMs,
+        timeoutMessage: `Tool '${toolName}' timed out after ${Math.round(toolExecutionTimeoutMs / 1000)}s.`,
+      });
+    } catch (error: unknown) {
+      timedOutToolCallIds.add(toolCall.id);
+      const toolError = error instanceof Error ? error.message : String(error);
+      handleToolExecutionEnd({
+        sessionId,
+        channel: params.channel,
+        toolCallId: toolCall.id,
+        toolName,
+        result: toolError,
+        error: toolError,
+      });
+      outcome = {
+        isError: true,
+        content: toolError,
+      };
+    }
+
+    allToolCalls.push(toolName);
+    toolOutcomes.push({
+      toolName,
+      isError: outcome.isError,
+      content: outcome.content,
+    });
+    registerCompletionVerificationSignal({
+      toolName,
+      args: argumentsRecord,
+      isError: outcome.isError,
+    });
+    const progressFromOutcome = summarizeOutcomeForProgress({
+      toolName: String(toolName ?? "").trim().toLowerCase(),
+      content: outcome.content,
+      isError: outcome.isError,
+    });
+    if (progressFromOutcome) {
+      emitAssistantProgress(progressFromOutcome, "progress");
+    }
+    const normalizedToolName = String(toolName ?? "").trim().toLowerCase();
+    if (normalizedToolName === "browser") {
+      updatePendingMfaStateFromBrowserTool({
+        sessionId,
+        toolArgs: argumentsRecord,
+        outcomeContent: outcome.content,
+        isError: outcome.isError,
+      });
+      await maybeCaptureCaptchaScreenshotForTelegram(argumentsRecord, outcome);
+      const action = String(argumentsRecord.action ?? "")
+        .trim()
+        .toLowerCase();
+      if (!outcome.isError && action === "login") {
+        const parsedLoginState = parseBrowserLoginState(outcome.content);
+        if (parsedLoginState) {
+          latestBrowserLoginState = parsedLoginState;
+        }
+      }
+    }
+    return {
+      toolCall,
+      outcome,
+    };
+  };
+
+  async function maybeCaptureCaptchaScreenshotForTelegram(
+    toolArgs: unknown,
+    outcome: { isError: boolean; content: string },
+  ): Promise<void> {
+    if (params.channel !== "telegram") {
+      return;
+    }
+    const args = toolArgs && typeof toolArgs === "object" ? (toolArgs as Record<string, unknown>) : {};
+    const action = normalizeBrowserActionName(args.action);
+    const challengeState = parseBrowserChallengeState(outcome.content);
+    const looksLikeChallengeError =
+      outcome.isError &&
+      (action === "login" || action === "challenge" || action === "open" || action === "click" || action === "act") &&
+      outcomeLooksLikeHumanVerificationError(outcome.content);
+    if (!challengeState.detected && !looksLikeChallengeError) {
+      return;
+    }
+    const tabIdRaw = String(args.tabId ?? challengeState.tabId ?? "").trim();
+    const key = tabIdRaw ? `tab:${tabIdRaw}` : "tab:active";
+    if (challengeScreenshotKeys.has(key)) {
+      return;
+    }
+    challengeScreenshotKeys.add(key);
+    await runSyntheticToolCall("browser", {
+      action: "screenshot",
+      ...(tabIdRaw ? { tabId: tabIdRaw } : {}),
+      engine: "live",
+      allowEngineFallback: true,
+      reason: "captcha_challenge",
+    });
+  }
+
+  let autoAuthLoginSucceeded = false;
+  if (!pendingMfa && savedServiceFromMessage && autoAuthIntent) {
+    const targetUrl = extractTargetUrlFromMessage(params.message) || inferTargetUrlFromService(savedServiceFromMessage);
+    if (targetUrl) {
+      await runSyntheticToolCall("browser", {
+        action: "open",
+        url: targetUrl,
+        engine: "live",
+        allowEngineFallback: true,
+      });
+    }
+    const loginRun = await runSyntheticToolCall("browser", {
+      action: "login",
+      service: savedServiceFromMessage,
+      engine: "live",
+      allowEngineFallback: true,
+    });
+    if (!loginRun.outcome.isError) {
+      autoAuthLoginSucceeded = true;
+      const autoLoginState = parseBrowserLoginState(loginRun.outcome.content);
+      if (autoLoginState) {
+        latestBrowserLoginState = autoLoginState;
+      }
+      const mfaState = parseBrowserMfaState(loginRun.outcome.content);
+      if (mfaState.requiresMfa) {
+        let resolvedCode: string | null = null;
+        const pendingAfterLogin = pendingMfaBySession.get(sessionId);
+        if (mfaState.mfaSourceCredentialAvailable && mfaState.mfaSourceService && hasTool(tools, "email")) {
+          for (const action of ["list_unread", "read_recent"] as const) {
+            const emailRun = await runSyntheticToolCall("email", {
+              action,
+              service: mfaState.mfaSourceService,
+              limit: 8,
+              includeBody: true,
+              markSeen: false,
+            });
+            if (emailRun.outcome.isError) {
+              continue;
+            }
+            const candidate = extractLikelyOneTimeCodeFromEmailOutcome(emailRun.outcome.content);
+            if (candidate) {
+              resolvedCode = candidate;
+              break;
+            }
+          }
+        }
+        if (resolvedCode) {
+          await runSyntheticToolCall("browser", {
+            action: "mfa",
+            code: resolvedCode,
+            ...(pendingAfterLogin?.tabId ? { tabId: pendingAfterLogin.tabId } : {}),
+            ...(pendingAfterLogin?.service ? { service: pendingAfterLogin.service } : {}),
+            engine: "live",
+            allowEngineFallback: true,
+          });
+        }
+        if (pendingMfaBySession.has(sessionId)) {
+          forceWaitForMfaCode = true;
+        }
+      }
+    }
+  }
+  if (
+    autoAuthLoginSucceeded &&
+    latestBrowserLoginState &&
+    !latestBrowserLoginState.submitted &&
+    latestBrowserLoginState.mfaExpected
+  ) {
+    messages.push({
+      role: "user",
+      content: [
+        "System instruction: vault login filled the identifier but code request is not confirmed as submitted yet.",
+        "Continue in browser on current tab and trigger the non-social email/code submit action.",
+        "Do not ask for credentials; ask only for one-time code after submission is confirmed.",
+      ].join(" "),
+      timestamp: Date.now(),
+    });
+  }
+  if (autoAuthLoginSucceeded && !forceWaitForMfaCode) {
+    messages.push({
+      role: "user",
+      content: [
+        "System instruction: Automatic vault-backed browser login steps have already run in runtime for this request.",
+        "Continue from the current browser tab/session and do not ask the user for credentials.",
+        "If MFA is encountered, request only the one-time code or use configured mailbox retrieval.",
+      ].join(" "),
+      timestamp: Date.now(),
+    });
+  }
+
   beginCheckoutWorkflowTurn({
     sessionId,
     userMessage: params.message,
   });
 
-  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+  for (let round = 0; round < MAX_TOOL_ROUNDS && !forceWaitForMfaCode; round++) {
     let roundProgressCount = 0;
     const emitRoundProgress = (text: string, phase: "pretool" | "progress" = "progress") => {
       if (roundProgressCount >= LIVE_PROGRESS_LINES_PER_ROUND) {
@@ -1758,26 +3245,40 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
 
     if (toolCalls.length === 0) {
       if (
-        looksLikeLoginIntent(params.message) &&
-        assistantIsAskingForIdentifier(roundFlattened.text) &&
-        allToolCalls.length > 0
+        (looksLikeLoginIntent(params.message) ||
+          looksLikeAccountDashboardIntent(params.message) ||
+          looksLikeSiteVisitIntent(params.message)) &&
+        assistantIsAskingForIdentifier(roundFlattened.text)
       ) {
-        const savedService = await resolveSavedServiceFromBrowserOutcomes({
-          workspaceDir: process.cwd(),
-          toolOutcomes,
-        });
+        let savedService = savedServiceFromMessage;
+        if (!savedService && allToolCalls.length > 0) {
+          savedService = await resolveSavedServiceFromBrowserOutcomes({
+            workspaceDir: process.cwd(),
+            toolOutcomes,
+          });
+        }
         if (savedService) {
           messages.push({
             role: "user",
             content: [
               "System instruction: secure credentials already exist for the current site.",
-              `Do not ask the user for email or username.`,
-              `Immediately call browser action=\"login\" with service=\"${savedService}\" on the current tab, then continue the login flow.`,
+              `Do not ask the user for email, username, or password.`,
+              `Immediately call browser action=\"login\" with service=\"${savedService}\" on the current tab and fill identifier from vault.`,
+              "If MFA is required, ask only for the one-time code.",
             ].join(" "),
             timestamp: Date.now()
           });
           continue;
         }
+      }
+      if (!completionVerificationSatisfied && !completionVerificationPromptSent) {
+        completionVerificationPromptSent = true;
+        messages.push({
+          role: "user",
+          content: buildCompletionVerificationInstruction(),
+          timestamp: Date.now(),
+        });
+        continue;
       }
       if (!roundFlattened.text && !emptyReplyRecoveryPromptSent) {
         emptyReplyRecoveryPromptSent = true;
@@ -1820,7 +3321,8 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
         shouldAttemptWebRecovery({
           tools,
           userMessage: params.message,
-          toolOutcomes
+          toolOutcomes,
+          mfaPending: pendingMfaBySession.has(sessionId),
         })
       ) {
         recoveryPromptSent = true;
@@ -1844,10 +3346,15 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
       }
       allToolCalls.push(toolCall.name);
       let outcome: { isError: boolean; content: string };
+      const checkoutToolArgs = enrichCheckoutArgsWithPageContext({
+        toolName: toolCall.name,
+        toolArgs: toolCall.arguments,
+        toolOutcomes,
+      });
       const checkoutDecision = enforceCheckoutWorkflow({
         sessionId,
         toolName: toolCall.name,
-        toolArgs: toolCall.arguments,
+        toolArgs: checkoutToolArgs,
       });
       if (!checkoutDecision.allowed) {
         checkoutBlockedMessage = checkoutDecision.message;
@@ -1873,52 +3380,84 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
           content: checkoutDecision.message,
         };
       } else {
-        outcome = await executeToolCall({
-          tools,
-          toolDefinitions,
-          toolCall,
-          context: {
+        try {
+          outcome = await runWithHardTimeout({
+            operation: executeToolCall({
+              tools,
+              toolDefinitions,
+              toolCall,
+              context: {
+                sessionId,
+                channel: params.channel,
+                provider: typedProvider,
+                model: resolvedModelId
+              },
+              eventHooks: {
+                onStart: ({ toolCallId, toolName, args }) => {
+                  handleToolExecutionStart({
+                    sessionId,
+                    channel: params.channel,
+                    toolCallId,
+                    toolName,
+                    args,
+                  });
+                },
+                onUpdate: ({ toolCallId, toolName, partialResult }) => {
+                  if (timedOutToolCallIds.has(toolCallId)) {
+                    return;
+                  }
+                  handleToolExecutionUpdate({
+                    sessionId,
+                    channel: params.channel,
+                    toolCallId,
+                    toolName,
+                    partialResult,
+                  });
+                },
+                onEnd: ({ toolCallId, toolName, result, isError, error }) => {
+                  if (timedOutToolCallIds.has(toolCallId)) {
+                    return;
+                  }
+                  handleToolExecutionEnd({
+                    sessionId,
+                    channel: params.channel,
+                    toolCallId,
+                    toolName,
+                    result,
+                    ...(isError ? { error: error ?? "tool execution failed" } : {}),
+                  });
+                },
+              },
+            }),
+            timeoutMs: toolExecutionTimeoutMs,
+            timeoutMessage: `Tool '${String(toolCall.name ?? "tool")}' timed out after ${Math.round(toolExecutionTimeoutMs / 1000)}s.`,
+          });
+        } catch (error: unknown) {
+          timedOutToolCallIds.add(toolCall.id);
+          const toolError = error instanceof Error ? error.message : String(error);
+          handleToolExecutionEnd({
             sessionId,
             channel: params.channel,
-            provider: typedProvider,
-            model: resolvedModelId
-          },
-          eventHooks: {
-            onStart: ({ toolCallId, toolName, args }) => {
-              handleToolExecutionStart({
-                sessionId,
-                channel: params.channel,
-                toolCallId,
-                toolName,
-                args,
-              });
-            },
-            onUpdate: ({ toolCallId, toolName, partialResult }) => {
-              handleToolExecutionUpdate({
-                sessionId,
-                channel: params.channel,
-                toolCallId,
-                toolName,
-                partialResult,
-              });
-            },
-            onEnd: ({ toolCallId, toolName, result, isError, error }) => {
-              handleToolExecutionEnd({
-                sessionId,
-                channel: params.channel,
-                toolCallId,
-                toolName,
-                result,
-                ...(isError ? { error: error ?? "tool execution failed" } : {}),
-              });
-            },
-          },
-        });
+            toolCallId: toolCall.id,
+            toolName: toolCall.name,
+            result: toolError,
+            error: toolError,
+          });
+          outcome = {
+            isError: true,
+            content: toolError,
+          };
+        }
       }
       toolOutcomes.push({
         toolName: toolCall.name,
         isError: outcome.isError,
         content: outcome.content
+      });
+      registerCompletionVerificationSignal({
+        toolName: toolCall.name,
+        args: toToolArgsRecord(toolCall.arguments),
+        isError: outcome.isError,
       });
       const progressFromOutcome = summarizeOutcomeForProgress({
         toolName: String(toolCall.name ?? "").trim().toLowerCase(),
@@ -1935,6 +3474,41 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
           outcomeContent: outcome.content,
           isError: outcome.isError,
         });
+        await maybeCaptureCaptchaScreenshotForTelegram(toolCall.arguments, outcome);
+        const action = String(
+          toolCall.arguments && typeof toolCall.arguments === "object"
+            ? (toolCall.arguments as Record<string, unknown>).action ?? ""
+            : "",
+        )
+          .trim()
+          .toLowerCase();
+        if (!outcome.isError && action === "login") {
+          const parsedLoginState = parseBrowserLoginState(outcome.content);
+          if (parsedLoginState) {
+            latestBrowserLoginState = parsedLoginState;
+          }
+          const mfaState = parseBrowserMfaState(outcome.content);
+          if (mfaState.requiresMfa) {
+            const pendingNow = pendingMfaBySession.get(sessionId);
+            if (
+              mfaState.mfaSourceCredentialAvailable &&
+              mfaState.mfaSourceService &&
+              hasTool(tools, "email")
+            ) {
+              messages.push({
+                role: "user",
+                content: buildAutoMfaFromEmailInstruction({
+                  sourceService: mfaState.mfaSourceService,
+                  pending: pendingNow,
+                }),
+                timestamp: Date.now(),
+              });
+            } else {
+              forceWaitForMfaCode = true;
+            }
+            break;
+          }
+        }
       }
 
       messages.push({
@@ -1949,16 +3523,60 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
         break;
       }
     }
+    if (forceWaitForMfaCode) {
+      break;
+    }
     if (checkoutBlockedMessage) {
       break;
     }
   }
 
-  if (!lastAssistant) {
-    throw new Error("Provider did not return an assistant response.");
+  if (
+    !forceWaitForMfaCode &&
+    autoAuthLoginSucceeded &&
+    latestBrowserLoginState?.mfaExpected &&
+    !latestBrowserLoginState.submitted
+  ) {
+    let retryService = savedServiceFromMessage;
+    if (!retryService) {
+      retryService = await resolveSavedServiceFromBrowserOutcomes({
+        workspaceDir: process.cwd(),
+        toolOutcomes,
+      });
+    }
+    if (retryService) {
+      const retryLoginRun = await runSyntheticToolCall("browser", {
+        action: "login",
+        service: retryService,
+        engine: "live",
+        allowEngineFallback: true,
+      });
+      if (!retryLoginRun.outcome.isError) {
+        const retryLoginState = parseBrowserLoginState(retryLoginRun.outcome.content);
+        if (retryLoginState) {
+          latestBrowserLoginState = retryLoginState;
+        }
+        const retryMfaState = parseBrowserMfaState(retryLoginRun.outcome.content);
+        if (retryMfaState.requiresMfa && pendingMfaBySession.has(sessionId)) {
+          forceWaitForMfaCode = true;
+        }
+      }
+    }
   }
 
-  if (allToolCalls.length > 0 && !flattenAssistantMessage(lastAssistant).text) {
+  if (!lastAssistant) {
+    if (forceWaitForMfaCode) {
+      lastAssistant = {
+        role: "assistant",
+        content: [{ type: "text", text: "" }],
+        timestamp: Date.now(),
+      } as AssistantMessage;
+    } else {
+      throw new Error("Provider did not return an assistant response.");
+    }
+  }
+
+  if (!forceWaitForMfaCode && allToolCalls.length > 0 && !flattenAssistantMessage(lastAssistant).text) {
     try {
       messages.push({
         role: "user",
@@ -1999,7 +3617,42 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
     .trim()
     .toLowerCase();
   const assistantErrored = assistantStopReason === "error" || assistantStopReason === "aborted";
-  if (!flattened.text && allToolCalls.length > 0) {
+  const assistantErrorMessage = String((lastAssistant as { errorMessage?: unknown }).errorMessage ?? "").trim();
+  if (forceWaitForMfaCode) {
+    if (latestBrowserLoginState?.submitted) {
+      if (latestBrowserLoginState.identifier) {
+        message = `I filled the saved sign-in email (${latestBrowserLoginState.identifier}) and sent the one-time code request. Send me the code and I will enter it immediately.`;
+      } else {
+        message =
+          "I used your saved vault credentials and sent the one-time code request. Send me the code and I will enter it immediately.";
+      }
+    } else if (latestBrowserLoginState?.identifier) {
+      message = `I filled the saved sign-in email (${latestBrowserLoginState.identifier}) and reached the one-time code step. Send me the code and I will enter it immediately.`;
+    } else {
+      message = "I reached the one-time code step with saved credentials. Send me the code and I will enter it immediately.";
+    }
+  }
+
+  if (
+    !forceWaitForMfaCode &&
+    latestBrowserLoginState?.mfaExpected &&
+    assistantRefusedOtpRelay(message) &&
+    (looksLikeLoginIntent(params.message) ||
+      looksLikeAccountDashboardIntent(params.message) ||
+      looksLikeSiteVisitIntent(params.message))
+  ) {
+    if (latestBrowserLoginState.submitted) {
+      message = latestBrowserLoginState.identifier
+        ? `I filled ${latestBrowserLoginState.identifier} and sent the one-time code request. Send me the code and I will enter it immediately.`
+        : "I sent the one-time code request. Send me the code and I will enter it immediately.";
+    } else {
+      message = latestBrowserLoginState.identifier
+        ? `I filled ${latestBrowserLoginState.identifier}, but the send-code click is not confirmed yet. Tell me to retry and I will trigger it again.`
+        : "The send-code click is not confirmed yet. Tell me to retry and I will trigger it again.";
+    }
+  }
+
+  if (!forceWaitForMfaCode && !flattened.text && allToolCalls.length > 0) {
     message = buildToolOnlyFallbackMessage({
       userMessage: params.message,
       successfulToolOutcomes,
@@ -2014,6 +3667,16 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
     ].join("\n");
   }
 
+  if (!message.trim() && assistantErrored && assistantErrorMessage) {
+    message = formatProviderRuntimeFailure({
+      provider,
+      model: resolvedModelId,
+      endpoint: modelBaseUrl || undefined,
+      rawError: assistantErrorMessage,
+      availableModels: discoveredLocalModels,
+    });
+  }
+
   if (!message.trim()) {
     message = allToolCalls.length > 0
       ? [
@@ -2023,6 +3686,14 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
           .filter(Boolean)
           .join("\n")
       : "I could not generate a non-empty response for this request. Please retry and I will continue from the current session state.";
+  }
+
+  if (!forceWaitForMfaCode && completionVerificationNeeded && !completionVerificationSatisfied) {
+    message = [
+      "I cannot claim this task is complete yet.",
+      "A state-changing step ran, but a direct post-action verification step has not completed successfully.",
+      "Tell me to continue and I will run verification before finalizing."
+    ].join("\n");
   }
 
   if (failedToolOutcomes.length > 0 && successfulToolOutcomes.length === 0) {

@@ -47,3 +47,35 @@ test("checkout workflow blocks risky browser actions until user confirms purchas
   assert.equal(allowed.allowed, true);
   assert.match(String(describeCheckoutWorkflowState(sessionId)), /active/i);
 });
+
+test("checkout workflow blocks ref-only clicks and Enter submits when page URL is checkout-like", () => {
+  const sessionId = `checkout-url-context-${Date.now()}`;
+
+  const blockedRefClick = enforceCheckoutWorkflow({
+    sessionId,
+    toolName: "browser",
+    toolArgs: {
+      action: "click",
+      ref: "e12",
+      currentPageUrl: "https://www.amazon.com/checkout",
+    },
+  });
+  assert.equal(blockedRefClick.allowed, false);
+  if (blockedRefClick.allowed) {
+    assert.fail("expected checkout ref click to be blocked");
+  }
+
+  const blockedEnter = enforceCheckoutWorkflow({
+    sessionId,
+    toolName: "browser",
+    toolArgs: {
+      action: "press",
+      key: "Enter",
+      currentPageUrl: "https://food.example.com/cart/checkout",
+    },
+  });
+  assert.equal(blockedEnter.allowed, false);
+  if (blockedEnter.allowed) {
+    assert.fail("expected checkout Enter submit to be blocked");
+  }
+});

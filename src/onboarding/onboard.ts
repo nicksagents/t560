@@ -155,6 +155,54 @@ async function configureProviderAuth(params: {
   progress: (label: string) => { update: (message: string) => void; stop: (message?: string) => void };
 }): Promise<ProviderProfile> {
   const base = normalizeProviderProfile(params.provider.id, params.existing);
+
+  // Fast path for local model servers (llama.cpp, exo, ollama, etc.)
+  if (params.provider.id === "local-openai") {
+    await params.note(
+      [
+        "Enter the URL of your running local model server.",
+        "",
+        "Common defaults:",
+        "  llama.cpp   http://127.0.0.1:8080/v1",
+        "  exo         http://127.0.0.1:52415/v1",
+        "  ollama      http://127.0.0.1:11434/v1",
+        "",
+        "Make sure your server is running before continuing.",
+      ].join("\n"),
+      "Local Model Setup"
+    );
+
+    const localBaseUrl = await params.askRequired(
+      "Server API base URL:",
+      base.baseUrl ?? "http://127.0.0.1:8080/v1"
+    );
+
+    const localModel = await params.askRequired(
+      "Model name (as loaded in your server, e.g. llama3.2, mistral-7b, phi-4):",
+      base.models?.[0] ?? "local-model"
+    );
+
+    const needsApiKey = await params.askYesNo(
+      "Does your local server require an API key?",
+      Boolean(base.apiKey?.trim())
+    );
+
+    let localApiKey: string | undefined;
+    if (needsApiKey) {
+      localApiKey = await params.askRequired("API key:", base.apiKey ?? "");
+    }
+
+    return {
+      enabled: true,
+      provider: "local-openai",
+      authMode: "api_key",
+      apiKey: localApiKey,
+      baseUrl: localBaseUrl.trim(),
+      api: "openai-completions",
+      models: [localModel.trim()].filter(Boolean),
+    };
+  }
+
   const authMode = await params.choose(
     `${params.provider.label} auth mode`,
     params.provider.authModes.map((mode) => ({
@@ -182,6 +230,23 @@ async function configureProviderAuth(params: {
     apiKey = await params.askRequired(`${params.provider.label} API key:`, apiKey);
     oauthToken = undefined;
     token = undefined;
+  } else if (authMode === "token") {
+    if (params.provider.id === "anthropic") {
+      await params.note(
+        [
+          "To get your Claude Code auth token:",
+          "  1. Install Claude Code CLI if needed:  https://claude.ai/code",
+          "  2. Login:     claude auth login",
+          "  3. Get token: claude setup-token",
+          "",
+          "Copy the token that starts with sk-ant-oat01- and paste it below.",
+        ].join("\n"),
+        "Anthropic — Claude Code auth token"
+      );
+    }
+    token = await params.askRequired(`${params.provider.label} auth token (sk-ant-oat01-…):`, token);
+    apiKey = undefined;
+    oauthToken = undefined;
   } else if (authMode === "oauth") {
     if (params.provider.id === "openai-codex") {
       const useWebAuth = await params.askYesNo(
@@ -229,15 +294,24 @@ async function configureProviderAuth(params: {
       } else {
         oauthToken = await params.askRequired(`${params.provider.label} OAuth token:`, oauthToken);
       }
+    } else if (params.provider.id === "anthropic") {
+      await params.note(
+        [
+          "To get your Claude Code OAuth token:",
+          "  1. Install Claude Code CLI if needed:  https://claude.ai/code",
+          "  2. Login: claude auth login",
+          "  Your OAuth token is stored in ~/.claude/.credentials.json.",
+          "",
+          "Alternatively, switch to Token mode and run: claude setup-token",
+        ].join("\n"),
+        "Anthropic — Claude Code OAuth token"
+      );
+      oauthToken = await params.askRequired(`${params.provider.label} OAuth token:`, oauthToken);
     } else {
       oauthToken = await params.askRequired(`${params.provider.label} OAuth token:`, oauthToken);
     }
     apiKey = undefined;
     token = undefined;
-  } else {
-    token = await params.askRequired(`${params.provider.label} setup token:`, token);
-    apiKey = undefined;
-    oauthToken = undefined;
   }
 
   const currentModels = normalizeProviderModels(

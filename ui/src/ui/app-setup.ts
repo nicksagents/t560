@@ -36,8 +36,12 @@ export type SetupTelegramState = {
 
 export type SetupVaultEntry = {
   service: string;
+  websiteUrl: string;
+  identifier: string;
   identifierMasked: string;
   authMode: string;
+  mfaStrategy: string;
+  mfaSourceService: string;
   hasMfaCode: boolean;
   createdAt: number;
   updatedAt: number;
@@ -52,6 +56,16 @@ type SetupResponse = {
 
 type VaultResponse = {
   entries?: unknown;
+  created?: unknown;
+  identifierReused?: unknown;
+  service?: unknown;
+};
+
+type SetupProviderModelsResponse = {
+  ok?: unknown;
+  models?: unknown;
+  normalizedBaseUrl?: unknown;
+  error?: unknown;
 };
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -196,9 +210,19 @@ function normalizeVaultEntries(raw: unknown): SetupVaultEntry[] {
       }
       return {
         service,
+        websiteUrl: typeof obj.websiteUrl === "string" ? obj.websiteUrl : "",
+        identifier:
+          typeof obj.identifier === "string"
+            ? obj.identifier
+            : typeof obj.identifierMasked === "string"
+              ? obj.identifierMasked
+              : "",
         identifierMasked:
           typeof obj.identifierMasked === "string" ? obj.identifierMasked : "(hidden)",
         authMode: typeof obj.authMode === "string" ? obj.authMode : "password",
+        mfaStrategy: typeof obj.mfaStrategy === "string" ? obj.mfaStrategy : "user_prompt",
+        mfaSourceService:
+          typeof obj.mfaSourceService === "string" ? obj.mfaSourceService : "",
         hasMfaCode: obj.hasMfaCode === true,
         createdAt: Number.isFinite(Number(obj.createdAt)) ? Number(obj.createdAt) : 0,
         updatedAt: Number.isFinite(Number(obj.updatedAt)) ? Number(obj.updatedAt) : 0,
@@ -227,12 +251,98 @@ function toCsv(values: string[]): string {
   return values.join(", ");
 }
 
+function readSetupInputValue(
+  host: T560App,
+  inputName: string,
+  options: { trim?: boolean } = {}
+): string {
+  const el = host.querySelector(`[data-input="${inputName}"]`) as
+    | HTMLInputElement
+    | HTMLTextAreaElement
+    | HTMLSelectElement
+    | null;
+  const value = String(el?.value ?? "");
+  return options.trim === false ? value : value.trim();
+}
+
+function resolveEmailProviderDefaults(provider: string): {
+  websiteUrl: string;
+  service: string;
+} {
+  const key = String(provider ?? "").trim().toLowerCase();
+  if (key === "gmail") {
+    return { websiteUrl: "https://mail.google.com", service: "mail.google.com" };
+  }
+  if (key === "outlook") {
+    return { websiteUrl: "https://outlook.live.com", service: "outlook.live.com" };
+  }
+  if (key === "yahoo") {
+    return { websiteUrl: "https://mail.yahoo.com", service: "mail.yahoo.com" };
+  }
+  if (key === "proton") {
+    return { websiteUrl: "https://mail.proton.me", service: "mail.proton.me" };
+  }
+  if (key === "icloud") {
+    return { websiteUrl: "https://www.icloud.com/mail", service: "icloud.com" };
+  }
+  return { websiteUrl: "", service: "" };
+}
+
 function normalizeProviderIdDraft(value: string): string {
   return value
     .trim()
     .toLowerCase()
     .replace(/[^a-z0-9._-]+/g, "-")
     .replace(/^-+|-+$/g, "");
+}
+
+function uniqModelIds(values: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const value of values) {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      continue;
+    }
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    out.push(trimmed);
+  }
+  return out;
+}
+
+function normalizeOpenAICompatibleBaseUrl(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return "";
+  }
+  let normalized = trimmed;
+  if (!/^https?:\/\//i.test(normalized)) {
+    normalized = `http://${normalized}`;
+  }
+  normalized = normalized.replace(/\/+$/g, "");
+  normalized = normalized.replace(/\/chat\/completions$/i, "");
+  normalized = normalized.replace(/\/v1\/chat$/i, "/v1");
+  if (!/\/v1$/i.test(normalized)) {
+    normalized = `${normalized}/v1`;
+  }
+  return normalized;
+}
+
+function isLikelyHttpUrl(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return false;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
 }
 
 function resolveProviderModelForSlot(
@@ -448,8 +558,10 @@ export function startSetupProviderDraft(host: T560App): void {
 
   host.setupProviderAuthMode = template?.authModes[0] ?? "api_key";
   host.setupProviderModels = toCsv(template?.models ?? []);
-  host.setupProviderBaseUrl = "";
-  host.setupProviderApi = "";
+  host.setupProviderBaseUrl =
+    host.setupNewProviderTemplate === "local-openai" ? "http://127.0.0.1:8080/v1" : "";
+  host.setupProviderApi =
+    host.setupNewProviderTemplate === "local-openai" ? "openai-completions" : "";
   host.setupProviderCredential = "";
   host.setupProviderEnabled = true;
   if (!host.setupProviderModels.trim()) {
@@ -479,17 +591,68 @@ export async function saveSetupProvider(host: T560App): Promise<void> {
   host.setupSaving = true;
   clearSetupNotice(host);
   try {
+    const templateId = (host.setupNewProviderTemplate.trim() || providerId).toLowerCase();
+    const isLocalProvider = templateId === "local-openai" || providerId === "local-openai";
+    const existing = host.setupProviders[providerId];
+
+    // Read text/password inputs from DOM rather than state — state is not
+    // updated on every keystroke (to prevent re-renders closing mobile keyboard).
+    const models = uniqModelIds(
+      splitCsv(readSetupInputValue(host, "setup-provider-models") || host.setupProviderModels)
+    );
+    if (models.length === 0) {
+      setSetupNotice(host, "error", "Add at least one model id before saving this provider.");
+      return;
+    }
+
+    const rawBaseUrl = readSetupInputValue(host, "setup-provider-base-url") || host.setupProviderBaseUrl;
+    let baseUrl = rawBaseUrl;
+    if (isLocalProvider) {
+      if (!rawBaseUrl.trim()) {
+        setSetupNotice(host, "error", "Local model provider requires a server URL (example: http://127.0.0.1:52415/v1).");
+        return;
+      }
+      const normalizedLocalBase = normalizeOpenAICompatibleBaseUrl(rawBaseUrl);
+      if (!isLikelyHttpUrl(normalizedLocalBase)) {
+        setSetupNotice(host, "error", "Local model server URL is invalid. Use http://host:port/v1.");
+        return;
+      }
+      baseUrl = normalizedLocalBase;
+    } else if (baseUrl && !isLikelyHttpUrl(baseUrl)) {
+      setSetupNotice(host, "error", "Base URL must be a valid http(s) URL.");
+      return;
+    }
+
+    let api = readSetupInputValue(host, "setup-provider-api") || host.setupProviderApi;
+    if (isLocalProvider && !api.trim()) {
+      api = "openai-completions";
+    }
+    const credential = readSetupInputValue(host, "setup-provider-credential", { trim: false }) || host.setupProviderCredential;
+    if (
+      !isLocalProvider &&
+      host.setupProviderAuthMode !== "oauth" &&
+      !existing?.hasCredential &&
+      !credential.trim()
+    ) {
+      setSetupNotice(
+        host,
+        "error",
+        "This provider needs a credential before it can run. Paste the key/token, then save."
+      );
+      return;
+    }
+
     const payload = await requestJson<{ setup?: unknown }>("/api/setup/provider", {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         providerId,
         authMode: host.setupProviderAuthMode,
-        models: splitCsv(host.setupProviderModels),
-        baseUrl: host.setupProviderBaseUrl,
-        api: host.setupProviderApi,
+        models,
+        baseUrl,
+        api,
         enabled: host.setupProviderEnabled,
-        credential: host.setupProviderCredential,
+        credential,
       }),
     });
 
@@ -498,9 +661,81 @@ export async function saveSetupProvider(host: T560App): Promise<void> {
     applySetupPayload(host, setupPayload);
     host.setupProviderCredential = "";
     host.setupSelectedProvider = "";
-    setSetupNotice(host, "success", `Saved provider settings for ${providerId}.`);
+    if (isLocalProvider && rawBaseUrl.trim() && rawBaseUrl.trim() !== baseUrl.trim()) {
+      setSetupNotice(
+        host,
+        "success",
+        `Saved provider settings for ${providerId}. URL normalized to ${baseUrl} for OpenAI-compatible routing.`
+      );
+    } else {
+      setSetupNotice(host, "success", `Saved provider settings for ${providerId}.`);
+    }
   } catch (error: unknown) {
     setSetupNotice(host, "error", toErrorMessage(error, "Failed to save provider settings."));
+  } finally {
+    host.setupSaving = false;
+  }
+}
+
+export async function fetchSetupLocalProviderModels(host: T560App): Promise<void> {
+  if (host.setupSaving) {
+    return;
+  }
+  const providerId = host.setupSelectedProvider.trim() || host.setupNewProviderTemplate.trim();
+  if (!providerId || providerId !== "local-openai") {
+    setSetupNotice(host, "error", "Model fetch is available for local-openai only.");
+    return;
+  }
+
+  const rawBaseUrl = readSetupInputValue(host, "setup-provider-base-url") || host.setupProviderBaseUrl;
+  if (!rawBaseUrl.trim()) {
+    setSetupNotice(host, "error", "Enter your local model server URL first.");
+    return;
+  }
+  const baseUrl = normalizeOpenAICompatibleBaseUrl(rawBaseUrl);
+  if (!isLikelyHttpUrl(baseUrl)) {
+    setSetupNotice(host, "error", "Local model server URL is invalid. Use http://host:port/v1.");
+    return;
+  }
+  const credential =
+    readSetupInputValue(host, "setup-provider-credential", { trim: false }) || host.setupProviderCredential;
+
+  host.setupSaving = true;
+  clearSetupNotice(host);
+  try {
+    const payload = await requestJson<SetupProviderModelsResponse>("/api/setup/provider/models", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        providerId: "local-openai",
+        baseUrl,
+        ...(credential.trim() ? { apiKey: credential.trim() } : {}),
+      }),
+    });
+    const record = asRecord(payload);
+    const ok = record.ok !== false;
+    const models = Array.isArray(record.models)
+      ? record.models.map((entry) => String(entry ?? "").trim()).filter(Boolean)
+      : [];
+    const normalizedBaseUrl = String(record.normalizedBaseUrl ?? "").trim();
+    if (!ok || models.length === 0) {
+      const error = String(record.error ?? "Could not fetch models from local server.");
+      setSetupNotice(host, "error", error);
+      return;
+    }
+    host.setupProviderBaseUrl = normalizedBaseUrl || baseUrl;
+    host.setupProviderModels = models.join(", ");
+    setSetupNotice(
+      host,
+      "success",
+      `Fetched ${models.length} model id${models.length === 1 ? "" : "s"} from local server.`
+    );
+  } catch (error: unknown) {
+    setSetupNotice(
+      host,
+      "error",
+      toErrorMessage(error, "Could not fetch models from local server.")
+    );
   } finally {
     host.setupSaving = false;
   }
@@ -587,27 +822,6 @@ export async function saveSetupRouting(host: T560App): Promise<void> {
   }
 }
 
-export async function assignSetupRouteFromProvider(
-  host: T560App,
-  slot: "default" | "planning" | "coding",
-  providerId: string
-): Promise<void> {
-  const provider = normalizeProviderIdDraft(providerId);
-  if (!provider) {
-    return;
-  }
-
-  const model = resolveProviderModelForSlot(host, provider, slot);
-  if (!model) {
-    setSetupNotice(host, "error", `No model found for provider ${provider}. Add models first.`);
-    return;
-  }
-
-  setRoutingDraftSlot(host, slot, provider, model);
-  ensureRoutingDraftComplete(host);
-  await saveSetupRouting(host);
-}
-
 export async function assignSetupRouteModel(
   host: T560App,
   slot: "default" | "planning" | "coding",
@@ -635,16 +849,21 @@ export async function saveSetupTelegram(host: T560App): Promise<void> {
   host.setupSaving = true;
   clearSetupNotice(host);
   try {
+    // Read text/password inputs from DOM — not from state — to avoid keyboard-closing re-renders.
+    const botToken = readSetupInputValue(host, "setup-telegram-token") || host.setupTelegramToken;
+    const allowFrom = splitCsv(readSetupInputValue(host, "setup-telegram-allow-from") || host.setupTelegramAllowFrom);
+    const allowedChatIds = splitCsv(readSetupInputValue(host, "setup-telegram-allowed-chat-ids") || host.setupTelegramAllowedChatIds)
+      .map((entry) => Number(entry))
+      .filter((entry) => Number.isInteger(entry));
+
     const payload = await requestJson<{ setup?: unknown }>("/api/setup/telegram", {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         dmPolicy: host.setupTelegramDmPolicy,
-        allowFrom: splitCsv(host.setupTelegramAllowFrom),
-        allowedChatIds: splitCsv(host.setupTelegramAllowedChatIds)
-          .map((entry) => Number(entry))
-          .filter((entry) => Number.isInteger(entry)),
-        ...(host.setupTelegramToken.trim() ? { botToken: host.setupTelegramToken.trim() } : {}),
+        allowFrom,
+        allowedChatIds,
+        ...(botToken ? { botToken } : {}),
       }),
     });
 
@@ -664,14 +883,68 @@ export async function saveVaultCredential(host: T560App): Promise<void> {
   if (host.setupSaving) {
     return;
   }
-  const service = host.setupVaultService.trim();
+  const accountTypeRaw = readSetupInputValue(host, "setup-vault-account-type");
+  host.setupVaultAccountType = accountTypeRaw === "email" ? "email" : "site";
+  host.setupVaultEmailProvider =
+    readSetupInputValue(host, "setup-vault-email-provider") || host.setupVaultEmailProvider;
+  host.setupVaultEmailSecretKind =
+    readSetupInputValue(host, "setup-vault-email-secret-kind") === "password"
+      ? "password"
+      : "app_password";
+  host.setupVaultWebsiteUrl =
+    readSetupInputValue(host, "setup-vault-website-url") || host.setupVaultWebsiteUrl;
+  host.setupVaultService =
+    readSetupInputValue(host, "setup-vault-service") || host.setupVaultService;
+  host.setupVaultIdentifier =
+    readSetupInputValue(host, "setup-vault-identifier") || host.setupVaultIdentifier;
+  host.setupVaultAuthMode =
+    readSetupInputValue(host, "setup-vault-auth-mode") || host.setupVaultAuthMode;
+  host.setupVaultMfaStrategy =
+    readSetupInputValue(host, "setup-vault-mfa-strategy") || host.setupVaultMfaStrategy;
+  host.setupVaultMfaSourceService =
+    readSetupInputValue(host, "setup-vault-mfa-source-service") || host.setupVaultMfaSourceService;
+  host.setupVaultSecret = readSetupInputValue(host, "setup-vault-secret", { trim: false });
+  host.setupVaultMfaCode = readSetupInputValue(host, "setup-vault-mfa-code");
+
+  let websiteUrl = host.setupVaultWebsiteUrl.trim();
+  let service = host.setupVaultService.trim();
   const identifier = host.setupVaultIdentifier.trim();
-  if (!service || !identifier) {
-    setSetupNotice(host, "error", "Vault service and identifier are required.");
+  let authMode = host.setupVaultAuthMode;
+  let mfaStrategy = host.setupVaultMfaStrategy;
+  let mfaSourceService = host.setupVaultMfaSourceService.trim();
+
+  if (host.setupVaultAccountType === "email") {
+    const defaults = resolveEmailProviderDefaults(host.setupVaultEmailProvider);
+    if (!websiteUrl) {
+      websiteUrl = defaults.websiteUrl;
+    }
+    if (!service) {
+      service = defaults.service;
+    }
+    authMode =
+      host.setupVaultEmailSecretKind === "password"
+        ? "password_with_mfa"
+        : "password";
+    mfaStrategy = "user_prompt";
+    mfaSourceService = "";
+  } else {
+    if (authMode === "passwordless_mfa_code") {
+      mfaStrategy = mfaSourceService ? "email_or_user" : "user_prompt";
+    } else {
+      mfaStrategy = "user_prompt";
+      mfaSourceService = "";
+    }
+  }
+
+  if (!websiteUrl && !service) {
+    setSetupNotice(host, "error", "Website URL is required.");
     return;
   }
-  if (host.setupVaultAuthMode === "password" && !host.setupVaultSecret) {
-    setSetupNotice(host, "error", "Vault password mode requires a secret.");
+  if (
+    (authMode === "password" || authMode === "password_with_mfa") &&
+    !host.setupVaultSecret
+  ) {
+    setSetupNotice(host, "error", "Password-based auth mode requires a secret.");
     return;
   }
 
@@ -682,9 +955,12 @@ export async function saveVaultCredential(host: T560App): Promise<void> {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
+        websiteUrl,
         service,
         identifier,
-        authMode: host.setupVaultAuthMode,
+        authMode,
+        mfaStrategy,
+        mfaSourceService,
         secret: host.setupVaultSecret,
         mfaCode: host.setupVaultMfaCode,
       }),
@@ -692,9 +968,23 @@ export async function saveVaultCredential(host: T560App): Promise<void> {
 
     const record = asRecord(payload);
     host.setupVaultEntries = normalizeVaultEntries(record.entries);
+    const created = record.created === true;
+    const identifierReused = record.identifierReused === true;
+    const serviceSaved = String(record.service ?? service).trim() || service;
     host.setupVaultSecret = "";
     host.setupVaultMfaCode = "";
-    setSetupNotice(host, "success", `Saved vault credentials for ${service}.`);
+    if (created) {
+      host.setupVaultIdentifier = "";
+    }
+    setSetupNotice(
+      host,
+      "success",
+      created
+        ? `Saved new vault credentials for ${serviceSaved}.`
+        : identifierReused
+          ? `Updated ${serviceSaved}; existing identifier was reused.`
+          : `Updated vault credentials for ${serviceSaved}.`
+    );
   } catch (error: unknown) {
     setSetupNotice(host, "error", toErrorMessage(error, "Failed to save vault credentials."));
   } finally {

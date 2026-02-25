@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { createBrowserTool } from "../src/agents/tools/browser-tool.ts";
 
 test("browser tool can open, snapshot, click, and navigate history", async () => {
-  const tool = createBrowserTool();
+  const tool = createBrowserTool({ allowLiveEngine: false });
   const originalFetch = global.fetch;
 
   global.fetch = async (input) => {
@@ -101,6 +101,73 @@ test("browser tool can open, snapshot, click, and navigate history", async () =>
     });
     assert.equal(reloaded.ok, true);
     assert.match(reloaded.snapshot.url, /example\.com\/next/);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test("browser tool detects human-verification challenges in fetch mode", async () => {
+  const tool = createBrowserTool({ allowLiveEngine: false });
+  const originalFetch = global.fetch;
+
+  global.fetch = async (input) => {
+    const url = String(input ?? "");
+    if (url.includes("example.com/login")) {
+      return new Response(
+        `
+          <html>
+            <head><title>Verify</title></head>
+            <body>
+              <h1>Verify you are human</h1>
+              <div class="g-recaptcha" data-sitekey="abc"></div>
+            </body>
+          </html>
+        `,
+        { status: 200, headers: { "content-type": "text/html; charset=utf-8" } },
+      );
+    }
+    return new Response("not found", { status: 404, headers: { "content-type": "text/plain" } });
+  };
+
+  try {
+    await tool.execute("reset-2", { action: "reset" });
+    const opened = await tool.execute("open-2", {
+      action: "open",
+      url: "https://example.com/login",
+      snapshotAfter: true,
+    });
+    assert.equal(opened.ok, true);
+
+    const challenge = await tool.execute("challenge-1", {
+      action: "challenge",
+      tabId: opened.tab.id,
+    });
+    assert.equal(challenge.ok, true);
+    assert.equal(challenge.humanVerificationRequired, true);
+    assert.equal(challenge.challenge.detected, true);
+    assert.equal(challenge.challenge.provider, "recaptcha");
+    assert.match(String(challenge.challenge.signals.join(" ")), /human-verification-copy|captcha-selector|recaptcha/i);
+
+    const aliasChallenge = await tool.execute("challenge-2", {
+      action: "captcha",
+      tabId: opened.tab.id,
+    });
+    assert.equal(aliasChallenge.ok, true);
+    assert.equal(aliasChallenge.challenge.detected, true);
+
+    const acted = await tool.execute("act-challenge-1", {
+      action: "act",
+      kind: "challenge",
+      tabId: opened.tab.id,
+    });
+    assert.equal(acted.ok, true);
+    assert.equal(acted.kind, "challenge");
+    assert.equal(acted.challenge.detected, true);
+
+    const status = await tool.execute("status-1", { action: "status" });
+    assert.equal(status.ok, true);
+    assert.equal(Array.isArray(status.capabilities), true);
+    assert.equal(status.capabilities.includes("challenge"), true);
   } finally {
     global.fetch = originalFetch;
   }
