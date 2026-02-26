@@ -9,6 +9,7 @@ import { connectGateway, injectAssistantNote, reloadChatHistory } from "./app-ga
 import { sendMessage, abortChat } from "./app-chat.js";
 import type { BootstrapContextFile, SettingsNotice } from "./app-config.js";
 import {
+  eraseAgentMemory,
   formatConfigDraft,
   loadDashboardSettings,
   saveBootstrapDraft,
@@ -35,7 +36,7 @@ import {
   startSetupProviderDraft,
   submitCodexOAuthCode,
 } from "./app-setup.js";
-import { setTheme, toggleNav, toggleThinking } from "./app-settings.js";
+import { setSessionKey, setTheme, toggleNav, toggleThinking } from "./app-settings.js";
 import { handleNewMessage, scrollToBottom, setupScrollListener } from "./app-scroll.js";
 import { setupCopyHandler } from "./chat/copy-as-markdown.js";
 import { renderApp } from "./app-render.js";
@@ -497,6 +498,34 @@ export class T560App extends LitElement {
         }
         case "save-bootstrap-file":
           void saveBootstrapDraft(this);
+          break;
+        case "erase-agent-memory":
+          if (window.confirm("Erase all durable agent memory now? This cannot be undone.")) {
+            void (async () => {
+              const erased = await eraseAgentMemory(this);
+              if (!erased) {
+                return;
+              }
+              const freshSession = shortId();
+              setSessionKey(this, freshSession);
+              this.chatMessages = [];
+              this.chatQueue = [];
+              this.chatAttachments = [];
+              this.hasNewMessages = false;
+              this.chatInjectDraft = "";
+              this.chatLastSyncedAt = 0;
+              this.chatHistoryReloading = false;
+              this.chatHistoryStatus = "Started a fresh chat session after memory reset.";
+              this.chatHistoryStatusKind = "success";
+              this.gatewayEventLog = [];
+              savePersistedChatState({
+                sessionKey: freshSession,
+                messages: [],
+                queue: [],
+              });
+              saveChatDraft("");
+            })();
+          }
           break;
         case "refresh-setup":
           void loadSetupState(this, true);

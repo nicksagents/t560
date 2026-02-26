@@ -534,7 +534,9 @@ Use this skill when...
 
 `src/agents/skills.ts` currently reads:
 - `name:` and `description:` from skill frontmatter/body
+- optional `tools:` (for example `tools: [browser, email]`) to auto-inject only skills that match enabled runtime tools
 - fallback description from first non-empty line when description is missing
+- runtime can also generate per-tool reminder snippets from `tools:` matches so each tool-result round re-briefs tool usage guidance
 
 Reference examples:
 - `skills/clawhub/SKILL.md`

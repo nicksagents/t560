@@ -1,6 +1,7 @@
 ---
 name: web-human-browser
 description: Execute end-to-end website tasks using browser tool actions like a human operator: navigate, log in with vault credentials, handle OTP/MFA, detect human verification challenges, wait for network events, and safely gate purchases.
+tools: [browser]
 ---
 
 # Web Human Browser

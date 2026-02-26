@@ -34,6 +34,13 @@ export type AgentEvent =
       data: {
         phase: "route" | "provider";
         slot?: "default" | "planning" | "coding";
+        routeIntent?: {
+          slot: "default" | "planning" | "coding";
+          planningScore: number;
+          codingScore: number;
+          planningSignals: string[];
+          codingSignals: string[];
+        };
         provider?: string;
         model?: string;
       };

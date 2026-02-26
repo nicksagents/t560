@@ -1,6 +1,7 @@
 ---
 name: terminal-exec
 description: Run terminal commands and manage background processes with the exec/process tools. Use for shell work (bash commands, file operations, installs, system checks), or when verifying/creating/removing files on the host.
+tools: [exec, process]
 ---
 
 # Terminal Exec (exec/process)

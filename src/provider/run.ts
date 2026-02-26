@@ -1,4 +1,6 @@
-import { readFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import {
   complete,
   getModel,
@@ -14,7 +16,7 @@ import {
 import type { GatewayChannelId } from "../gateway/types.js";
 import {
   resolveLegacyUserPath,
-  resolveBootstrapMaxChars,
+  resolveStateDir,
   resolveSoulPath,
   resolveUsersPath,
   type ProviderProfile,
@@ -24,10 +26,10 @@ import {
 import { loadSessionMessages, saveSessionMessages } from "./session.js";
 import { getCredential, listConfiguredServices, normalizeSetupService } from "../security/credentials-vault.js";
 import { createT560CodingTools } from "../agents/pi-tools.js";
-import { loadT560BootstrapContext } from "../agents/bootstrap-context.js";
+import type { InjectedContextFile } from "../agents/bootstrap-context.js";
 import { executeToolCall, toToolDefinitions } from "../agents/pi-tool-definition-adapter.js";
 import { normalizeToolParameters } from "../agents/pi-tools.schema.js";
-import { resolveSkillsPromptForRun } from "../agents/skills.js";
+import { resolveSkillsPromptForRun, resolveToolSkillRemindersForRun } from "../agents/skills.js";
 import { buildAgentSystemPrompt } from "../agents/system-prompt.js";
 import { createMemorySaveTool } from "../agents/tools/memory-tools.js";
 import { emitAgentEvent } from "../agents/agent-events.js";
@@ -86,8 +88,14 @@ const DEEPSEEK_MODEL_ALIAS_MAP: Record<string, string> = {
   "deepseek-r1-0528": "deepseek-reasoner",
 };
 const MAX_TOOL_ROUNDS = 20;
+const COMPACT_MODE_MAX_TOOL_ROUNDS = 8;
 const TOOL_ERROR_PREVIEW_MAX_CHARS = 240;
 const EMPTY_REPLY_URL_SCAN_LIMIT = 20;
+const DEFAULT_TOOL_RESULT_CONTEXT_MAX_CHARS = 12_000;
+const DEFAULT_COMPACT_TOOL_RESULT_CONTEXT_MAX_CHARS = 2_500;
+const DEFAULT_COMPACT_HISTORY_MESSAGES = 10;
+const MIN_COMPACT_HISTORY_MESSAGES = 2;
+const MAX_COMPACT_HISTORY_MESSAGES = 20;
 const DEFAULT_PROVIDER_TIMEOUT_MS = 10 * 60_000;
 const MIN_PROVIDER_TIMEOUT_MS = 5_000;
 const MAX_PROVIDER_TIMEOUT_MS = 24 * 60 * 60_000;
@@ -102,6 +110,7 @@ const LIVE_PROGRESS_LINES_PER_ROUND = 8;
 const AUTO_MEMORY_MAX_CANDIDATES = 2;
 const LOCAL_MODEL_DISCOVERY_TIMEOUT_MS = 4_000;
 const LOCAL_MODEL_DISCOVERY_TTL_MS = 30_000;
+const PROMPT_TRACE_DEFAULT_FILENAME = "prompt-trace.jsonl";
 const GENERIC_PROGRESS_PATTERNS: RegExp[] = [
   /^i am using the latest findings(?: to choose the next step)?\.?$/i,
   /^using the latest findings(?: to choose the next step)?\.?$/i,
@@ -110,6 +119,65 @@ const GENERIC_PROGRESS_PATTERNS: RegExp[] = [
   /^working on it\.?$/i,
   /^analyzing(?: request)?(?: and planning)?(?: tool steps)?\.?$/i,
 ];
+
+function isPromptTraceEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = String(env.T560_DEBUG_PROMPT_TRACE ?? "").trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
+
+function resolvePathFromEnv(raw: string): string {
+  const value = String(raw ?? "").trim();
+  if (!value) {
+    return value;
+  }
+  if (value === "~") {
+    return os.homedir();
+  }
+  if (value.startsWith("~/")) {
+    return path.join(os.homedir(), value.slice(2));
+  }
+  return path.resolve(value);
+}
+
+function resolvePromptTracePath(env: NodeJS.ProcessEnv = process.env): string {
+  const explicit = String(env.T560_DEBUG_PROMPT_TRACE_PATH ?? "").trim();
+  if (explicit) {
+    return resolvePathFromEnv(explicit);
+  }
+  return path.join(resolveStateDir(env), PROMPT_TRACE_DEFAULT_FILENAME);
+}
+
+function stringifyPromptTraceRecord(record: unknown): string {
+  return JSON.stringify(
+    record,
+    (_key, value) => {
+      if (typeof value === "bigint") {
+        return value.toString();
+      }
+      if (value instanceof Error) {
+        return {
+          name: value.name,
+          message: value.message,
+          stack: value.stack,
+        };
+      }
+      return value;
+    },
+  );
+}
+
+async function appendPromptTraceRecord(record: unknown, env: NodeJS.ProcessEnv = process.env): Promise<void> {
+  if (!isPromptTraceEnabled(env)) {
+    return;
+  }
+  try {
+    const tracePath = resolvePromptTracePath(env);
+    await mkdir(path.dirname(tracePath), { recursive: true });
+    await appendFile(tracePath, `${stringifyPromptTraceRecord(record)}\n`, "utf-8");
+  } catch {
+    // Debug logging must never fail the user request path.
+  }
+}
 
 type PendingMfaSession = {
   service?: string;
@@ -357,6 +425,189 @@ function resolveToolExecutionTimeoutMs(): number {
   return DEFAULT_TOOL_TIMEOUT_MS;
 }
 
+function parseExplicitBoolean(value: string): boolean | null {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  if (normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on") {
+    return true;
+  }
+  if (normalized === "0" || normalized === "false" || normalized === "no" || normalized === "off") {
+    return false;
+  }
+  return null;
+}
+
+function isCompactModeEnabled(params: {
+  routeProviderId: string;
+  baseUrl?: string;
+}): boolean {
+  const explicit = parseExplicitBoolean(String(process.env.T560_SMALL_MODEL_MODE ?? ""));
+  if (explicit !== null) {
+    return explicit;
+  }
+  return isLikelyLocalProviderEndpoint({
+    routeProviderId: params.routeProviderId,
+    baseUrl: params.baseUrl,
+  });
+}
+
+function resolveCompactHistoryMessages(): number {
+  const raw = Number(process.env.T560_SMALL_MODEL_HISTORY_MESSAGES ?? "");
+  if (Number.isFinite(raw) && raw > 0) {
+    return Math.min(MAX_COMPACT_HISTORY_MESSAGES, Math.max(MIN_COMPACT_HISTORY_MESSAGES, Math.floor(raw)));
+  }
+  return DEFAULT_COMPACT_HISTORY_MESSAGES;
+}
+
+function resolveToolResultContextMaxChars(compactMode: boolean): number {
+  const raw = Number(process.env.T560_TOOL_RESULT_CONTEXT_MAX_CHARS ?? "");
+  if (Number.isFinite(raw) && raw > 200) {
+    return Math.floor(raw);
+  }
+  const rawCompact = Number(process.env.T560_TOOL_RESULT_CONTEXT_COMPACT_MAX_CHARS ?? "");
+  if (compactMode && Number.isFinite(rawCompact) && rawCompact > 200) {
+    return Math.floor(rawCompact);
+  }
+  return compactMode
+    ? DEFAULT_COMPACT_TOOL_RESULT_CONTEXT_MAX_CHARS
+    : DEFAULT_TOOL_RESULT_CONTEXT_MAX_CHARS;
+}
+
+function clampTextForModelContext(text: string, maxChars: number): string {
+  const source = String(text ?? "");
+  if (source.length <= maxChars) {
+    return source;
+  }
+  return `${source.slice(0, Math.max(0, maxChars - 42))}\n\n[truncated for model context]`;
+}
+
+function hasInjectedIdentityContent(value: unknown): boolean {
+  return typeof value === "string" && value.trim().length > 0 && value.trim() !== "(missing file)";
+}
+
+function buildInjectedIdentityContextFiles(params: {
+  soulPath: string;
+  soulContent: string;
+  userPath: string;
+  userContent: string;
+}): InjectedContextFile[] {
+  return [
+    {
+      name: "SOUL.md",
+      path: params.soulPath,
+      content: params.soulContent,
+      missing: false,
+      truncated: false,
+      source: "fallback:soul",
+      rawChars: params.soulContent.length,
+      injectedChars: params.soulContent.length,
+    },
+    {
+      name: "USER.md",
+      path: params.userPath,
+      content: params.userContent,
+      missing: false,
+      truncated: false,
+      source: "fallback:user",
+      rawChars: params.userContent.length,
+      injectedChars: params.userContent.length,
+    },
+  ];
+}
+
+export function assertIdentityContextFilesInjected(
+  files: Array<{ name: string; missing: boolean; content: string }>,
+): void {
+  const soul = files.find((entry) => String(entry.name).trim().toUpperCase() === "SOUL.MD");
+  const user = files.find((entry) => String(entry.name).trim().toUpperCase() === "USER.MD");
+  if (!soul || soul.missing || !hasInjectedIdentityContent(soul.content)) {
+    throw new Error("SOUL.md must be injected into provider context for every run.");
+  }
+  if (!user || user.missing || !hasInjectedIdentityContent(user.content)) {
+    throw new Error("USER.md must be injected into provider context for every run.");
+  }
+}
+
+export function assertSystemPromptHasIdentityFiles(systemPrompt: string): void {
+  const prompt = String(systemPrompt ?? "");
+  if (!/<assistant_soul>/i.test(prompt)) {
+    throw new Error("Provider system prompt missing injected assistant soul block.");
+  }
+  if (!/<user_profile>/i.test(prompt)) {
+    throw new Error("Provider system prompt missing injected user profile block.");
+  }
+}
+
+function firstNonEmptyLine(value: string): string {
+  return String(value ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line.length > 0) ?? "";
+}
+
+export function assertSystemPromptHasIdentityContent(params: {
+  systemPrompt: string;
+  soulContent: string;
+  userContent: string;
+}): void {
+  const prompt = String(params.systemPrompt ?? "");
+  const soulLine = firstNonEmptyLine(params.soulContent);
+  const userLine = firstNonEmptyLine(params.userContent);
+  if (!soulLine || !prompt.includes(soulLine)) {
+    throw new Error("Provider system prompt missing SOUL.md content.");
+  }
+  if (!userLine || !prompt.includes(userLine)) {
+    throw new Error("Provider system prompt missing USER.md content.");
+  }
+}
+
+export function assertToolSkillCoverage(toolNames: string[], reminders: Record<string, string>): void {
+  const normalized = Array.from(
+    new Set(
+      (toolNames ?? [])
+        .map((name) => String(name ?? "").trim().toLowerCase())
+        .filter(Boolean),
+    ),
+  );
+  const uncovered = normalized.filter((name) => !String(reminders?.[name] ?? "").trim());
+  if (uncovered.length > 0) {
+    throw new Error(`Missing tool skill reminders for enabled tools: ${uncovered.join(", ")}`);
+  }
+}
+
+function selectToolsForCompactMode<T extends { name: string }>(
+  tools: T[],
+  message: string,
+  pendingMfa: boolean,
+): T[] {
+  const needsEmail = messageLikelyNeedsEmailTool(message) || pendingMfa;
+  const needsWeb =
+    looksLikeLoginIntent(message) ||
+    looksLikeSiteVisitIntent(message) ||
+    looksLikeAccountDashboardIntent(message) ||
+    /\b(search|look up|lookup|latest|current|today|news|web|internet|url|website|source|open|visit|navigate)\b/i.test(
+      message,
+    ) ||
+    pendingMfa;
+  const needsMemory =
+    /\b(memory|remember|recall|forget|preference|store this|save this|past conversation)\b/i.test(message);
+  return tools.filter((tool) => {
+    const normalized = String(tool.name ?? "").trim().toLowerCase();
+    if (!needsMemory && normalized.startsWith("memory_")) {
+      return false;
+    }
+    if (!needsWeb && (normalized === "browser" || normalized === "web_search" || normalized === "web_fetch")) {
+      return false;
+    }
+    if (!needsEmail && normalized === "email") {
+      return false;
+    }
+    return true;
+  });
+}
+
 async function runWithHardTimeout<T>(params: {
   operation: Promise<T>;
   timeoutMs: number;
@@ -446,8 +697,7 @@ function resolveRuntimeProvider(params: {
 async function loadTextFile(path: string): Promise<string | undefined> {
   try {
     const raw = await readFile(path, "utf-8");
-    const trimmed = raw.trim();
-    return trimmed || undefined;
+    return raw.trim() ? raw : undefined;
   } catch {
     return undefined;
   }
@@ -503,6 +753,18 @@ type FlattenedMessage = {
   toolCalls: string[];
 };
 
+function stripInlineThinking(raw: string): { text: string; thinking: string | null } {
+  const thinkParts: string[] = [];
+  const stripped = raw.replace(/<think>([\s\S]*?)<\/think>/gi, (_, inner: string) => {
+    thinkParts.push(inner.trim());
+    return "";
+  });
+  return {
+    text: stripped.trim(),
+    thinking: thinkParts.length > 0 ? thinkParts.join("\n").trim() : null,
+  };
+}
+
 function flattenAssistantMessage(message: AssistantMessage): FlattenedMessage {
   const textParts: string[] = [];
   const thinkingParts: string[] = [];
@@ -510,7 +772,9 @@ function flattenAssistantMessage(message: AssistantMessage): FlattenedMessage {
 
   for (const block of message.content) {
     if (block.type === "text") {
-      textParts.push(block.text);
+      const { text, thinking } = stripInlineThinking(block.text);
+      if (text) textParts.push(text);
+      if (thinking) thinkingParts.push(thinking);
     } else if (block.type === "thinking") {
       thinkingParts.push(block.thinking);
     } else if (block.type === "toolCall") {
@@ -2617,6 +2881,23 @@ const SMALL_TALK_MESSAGES = new Set<string>([
   "ping",
 ]);
 
+const SMALL_TALK_PATTERNS: RegExp[] = [
+  /^(?:hi|hello|hey)(?: there)?(?: how are you(?: today| doing)?)?$/,
+  /^how are you(?: today| doing)?$/,
+  /^(?:what's up|whats up|how's it going|hows it going)$/,
+  /^(?:good morning|good afternoon|good evening|good night)$/,
+];
+
+type IdentityAnchors = {
+  assistantName: string | null;
+  userName: string | null;
+};
+
+type IdentityIntent = {
+  askAssistant: boolean;
+  askUser: boolean;
+};
+
 function normalizeSimpleMessage(message: string): string {
   return message
     .toLowerCase()
@@ -2625,15 +2906,179 @@ function normalizeSimpleMessage(message: string): string {
     .trim();
 }
 
-function isSmallTalkMessage(message: string): boolean {
+export function isSmallTalkMessage(message: string): boolean {
   const normalized = normalizeSimpleMessage(message);
   if (!normalized) {
     return false;
   }
-  if (normalized.split(" ").length > 4) {
+  if (normalized.split(" ").length > 10) {
     return false;
   }
-  return SMALL_TALK_MESSAGES.has(normalized);
+  if (
+    /\b(?:can you|could you|please)\b/.test(normalized) &&
+    /\b(?:run|execute|open|search|look up|lookup|write|edit|create|delete|install|navigate|login|sign in)\b/.test(
+      normalized,
+    )
+  ) {
+    return false;
+  }
+  if (
+    /\b(?:run|execute|open|search|look up|lookup|write|edit|create|delete|install|navigate|go to|goto|login|sign in|buy|order)\b/.test(
+      normalized,
+    )
+  ) {
+    return false;
+  }
+  if (SMALL_TALK_MESSAGES.has(normalized)) {
+    return true;
+  }
+  return SMALL_TALK_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+export function detectIdentityIntent(message: string): IdentityIntent {
+  const normalized = normalizeSimpleMessage(message);
+  if (!normalized) {
+    return { askAssistant: false, askUser: false };
+  }
+  const askAssistant =
+    /\bwho are you\b/.test(normalized) ||
+    /\bwho you are\b/.test(normalized) ||
+    /\bwhat(?:s| is) your name\b/.test(normalized) ||
+    /\byour identity\b/.test(normalized) ||
+    /\bdo you know (?:who|what) you\b/.test(normalized);
+  const askUser =
+    /\bwho am i\b/.test(normalized) ||
+    /\bwho i am\b/.test(normalized) ||
+    /\bwhat(?:s| is) my name\b/.test(normalized) ||
+    /\bmy identity\b/.test(normalized) ||
+    /\bdo you know (?:who|what) i\b/.test(normalized);
+  return { askAssistant, askUser };
+}
+
+function parseAssistantNameFromSoul(content: string): string | null {
+  const text = String(content ?? "");
+  const fromNamedAssistant = /\b(?:assistant|ai assistant)\s+named\s+([A-Za-z0-9_-]{2,64})\b/i.exec(text);
+  if (fromNamedAssistant?.[1]) {
+    return fromNamedAssistant[1];
+  }
+  const fromPretendNamed = /\bpretend you are\s+(?:an?|the)\s+ai assistant\s+named\s+([A-Za-z0-9_-]{2,64})\b/i.exec(text);
+  if (fromPretendNamed?.[1]) {
+    return fromPretendNamed[1];
+  }
+  const fromIdentity = /##\s*Identity[\s\S]{0,260}?You are\s+([A-Za-z0-9_-]+)/im.exec(text);
+  if (fromIdentity?.[1] && !["a", "an", "the", "ai", "assistant"].includes(fromIdentity[1].toLowerCase())) {
+    return fromIdentity[1];
+  }
+  const sentenceMatches = text.matchAll(/\bYou are\s+([A-Za-z0-9_-]+)/gi);
+  for (const match of sentenceMatches) {
+    const candidate = String(match[1] ?? "").trim();
+    if (!candidate) {
+      continue;
+    }
+    if (["a", "an", "the", "ai", "assistant"].includes(candidate.toLowerCase())) {
+      continue;
+    }
+    return candidate;
+  }
+  return null;
+}
+
+function parseUserNameFromUserProfile(content: string): string | null {
+  const text = String(content ?? "");
+  const fromLine = /^Name:\s*([^\n\r]{1,80})$/im.exec(text);
+  if (fromLine?.[1]) {
+    return fromLine[1].trim();
+  }
+  const fromSentence = /\bI am\s+([A-Z][A-Za-z0-9_-]{1,40})\b/i.exec(text);
+  if (fromSentence?.[1]) {
+    return fromSentence[1].trim();
+  }
+  return null;
+}
+
+function buildIdentityAnchors(soulContent: string, userContent: string): IdentityAnchors {
+  return {
+    assistantName: parseAssistantNameFromSoul(soulContent),
+    userName: parseUserNameFromUserProfile(userContent),
+  };
+}
+
+export function isIdentityAnswerGrounded(
+  answer: string,
+  anchors: IdentityAnchors,
+  intent: IdentityIntent,
+): boolean {
+  const text = String(answer ?? "").toLowerCase();
+  if (!text) {
+    return false;
+  }
+  const assistantName = String(anchors.assistantName ?? "").toLowerCase();
+  const userName = String(anchors.userName ?? "").toLowerCase();
+  const mentionsAssistant = assistantName ? text.includes(assistantName) : false;
+  const mentionsUser = userName ? text.includes(userName) : false;
+
+  if (intent.askAssistant && assistantName && !mentionsAssistant) {
+    return false;
+  }
+  if (intent.askUser && userName && !mentionsUser) {
+    return false;
+  }
+  if (intent.askAssistant && !intent.askUser && userName && mentionsUser) {
+    return false;
+  }
+  if (intent.askUser && !intent.askAssistant && assistantName && mentionsAssistant) {
+    return false;
+  }
+
+  return intent.askAssistant || intent.askUser ? true : mentionsAssistant || mentionsUser;
+}
+
+function buildIdentityGroundingInstruction(intent: IdentityIntent, anchors: IdentityAnchors): string {
+  const hints: string[] = [];
+  if (anchors.assistantName) {
+    hints.push(`assistant identity from SOUL.md: ${anchors.assistantName}`);
+  }
+  if (anchors.userName) {
+    hints.push(`user identity from USER.md: ${anchors.userName}`);
+  }
+  const hintText = hints.length > 0 ? ` Use these anchors: ${hints.join("; ")}.` : "";
+  if (intent.askAssistant && !intent.askUser) {
+    return "System instruction: answer the user's assistant-identity question naturally using SOUL.md identity content. Do not invent a different assistant name." + hintText;
+  }
+  if (intent.askUser && !intent.askAssistant) {
+    return "System instruction: answer the user's self-identity question naturally using USER.md identity content. Do not invent a different user name." + hintText;
+  }
+  return "System instruction: answer both assistant and user identity naturally using SOUL.md and USER.md identity content. Do not invent different names." + hintText;
+}
+
+function stripIdentityReasoningLeak(answer: string): string {
+  const raw = String(answer ?? "").trim();
+  if (!raw) {
+    return raw;
+  }
+  const paragraphs = raw.split(/\n\s*\n/).map((part) => part.trim()).filter(Boolean);
+  if (paragraphs.length < 2) {
+    return raw;
+  }
+  const looksLikeLeak = (text: string): boolean => {
+    const normalized = text.toLowerCase();
+    return (
+      normalized.startsWith("okay, the user") ||
+      normalized.startsWith("the user is asking") ||
+      normalized.includes("let me think") ||
+      normalized.includes("i need to") ||
+      normalized.includes("i should") ||
+      normalized.includes("system instruction")
+    );
+  };
+  let index = 0;
+  while (index < paragraphs.length && looksLikeLeak(paragraphs[index])) {
+    index += 1;
+  }
+  if (index <= 0 || index >= paragraphs.length) {
+    return raw;
+  }
+  return paragraphs.slice(index).join("\n\n");
 }
 
 export async function chatWithProvider(params: ProviderChatParams): Promise<ProviderChatResult> {
@@ -2720,6 +3165,7 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
     content: effectiveUserMessage,
     timestamp: Date.now()
   };
+  const smallTalkTurn = isSmallTalkMessage(params.message);
 
   let discoveredLocalModels: string[] = [];
   let resolvedModelId = resolveModelAlias({
@@ -2760,14 +3206,17 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
     );
   }
 
-  const smallTalkTurn = isSmallTalkMessage(params.message);
+  const compactMode = isCompactModeEnabled({
+    routeProviderId,
+    baseUrl: normalizedBaseUrl,
+  });
   const emailToolAllowed =
     process.env.T560_ENABLE_EMAIL_TOOL_ALWAYS === "1" ||
     messageLikelyNeedsEmailTool(params.message) ||
     looksLikeLoginIntent(params.message) ||
     looksLikeAccountDashboardIntent(params.message) ||
     Boolean(pendingMfa);
-  const tools = smallTalkTurn
+  const baseTools = smallTalkTurn
     ? []
     : createT560CodingTools({
         workspaceDir: process.cwd(),
@@ -2775,6 +3224,10 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
         modelProvider: typedProvider,
         senderIsOwner: true
       }).filter((tool) => emailToolAllowed || String(tool.name ?? "").toLowerCase() !== "email");
+  const tools =
+    compactMode && !smallTalkTurn
+      ? selectToolsForCompactMode(baseTools, params.message, Boolean(pendingMfa))
+      : baseTools;
   const toolDefinitions = normalizeToolParameters(toToolDefinitions(tools));
 
   const soulPrompt = await loadSoulPrompt();
@@ -2787,26 +3240,36 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
   }
   const skillsPrompt = await resolveSkillsPromptForRun({
     workspaceDir: process.cwd(),
-    config: params.config
+    config: params.config,
+    compactMode,
+    toolNames: tools.map((tool) => tool.name),
   });
-  const injectedContextFiles = await loadT560BootstrapContext({
+  const injectedContextFiles = buildInjectedIdentityContextFiles({
+    soulPath: soulPrompt.path,
+    soulContent: soulPrompt.content,
+    userPath: usersPrompt.path,
+    userContent: usersPrompt.content,
+  });
+  assertIdentityContextFilesInjected(injectedContextFiles);
+  const toolSkillReminders = await resolveToolSkillRemindersForRun({
     workspaceDir: process.cwd(),
-    maxChars: resolveBootstrapMaxChars(params.config),
-    soulFallback: {
-      path: soulPrompt.path,
-      content: soulPrompt.content
-    },
-    userFallback: {
-      path: usersPrompt.path,
-      content: usersPrompt.content
-    }
+    compactMode,
+    toolNames: tools.map((tool) => tool.name),
   });
+  assertToolSkillCoverage(tools.map((tool) => tool.name), toolSkillReminders);
 
   const systemPrompt = buildAgentSystemPrompt({
     workspaceDir: process.cwd(),
     skillsPrompt,
     injectedContextFiles,
-    toolNames: tools.map((tool) => tool.name)
+    toolNames: tools.map((tool) => tool.name),
+    compactMode,
+  });
+  assertSystemPromptHasIdentityFiles(systemPrompt);
+  assertSystemPromptHasIdentityContent({
+    systemPrompt,
+    soulContent: soulPrompt.content,
+    userContent: usersPrompt.content,
   });
 
   emitAgentEvent({
@@ -2821,7 +3284,20 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
     }
   });
 
-  const messages: Message[] = [...history, userMessage];
+  const historyForRun = compactMode
+    ? history.slice(Math.max(0, history.length - resolveCompactHistoryMessages()))
+    : history;
+  const messages: Message[] = [...historyForRun, userMessage];
+  const identityIntent = detectIdentityIntent(params.message);
+  const identityQuestion = identityIntent.askAssistant || identityIntent.askUser;
+  const injectedSoulContent =
+    injectedContextFiles.find((file) => String(file.name ?? "").trim().toUpperCase() === "SOUL.MD" && !file.missing)
+      ?.content ?? soulPrompt.content;
+  const injectedUserContent =
+    injectedContextFiles.find((file) => String(file.name ?? "").trim().toUpperCase() === "USER.MD" && !file.missing)
+      ?.content ?? usersPrompt.content;
+  const identityAnchors = buildIdentityAnchors(injectedSoulContent, injectedUserContent);
+  let identityRetryCount = 0;
   let savedServiceFromMessage: string | null = null;
   const autoAuthIntent =
     looksLikeLoginIntent(params.message) ||
@@ -2889,21 +3365,41 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
   let forceWaitForMfaCode = false;
   let lastAssistant: AssistantMessage | undefined;
   let checkoutBlockedMessage: string | null = null;
+  let compactGuardrailMessage: string | null = null;
+  let compactFailureStreak = 0;
   const challengeScreenshotKeys = new Set<string>();
   const forceToolUse =
     !smallTalkTurn &&
     (requestLikelyNeedsTools(params.message) || Boolean(pendingMfa && oneTimeCode));
+  const maxToolRounds = compactMode ? COMPACT_MODE_MAX_TOOL_ROUNDS : MAX_TOOL_ROUNDS;
+  const toolResultContextMaxChars = resolveToolResultContextMaxChars(compactMode);
   const providerTimeoutMs = resolveProviderTimeoutMs({
     routeProviderId,
     baseUrl: normalizedBaseUrl,
   });
   const toolExecutionTimeoutMs = resolveToolExecutionTimeoutMs();
   const timedOutToolCallIds = new Set<string>();
+  let providerAttempt = 0;
   const modelBaseUrl =
     typeof (modelDef as { baseUrl?: unknown }).baseUrl === "string"
       ? (modelDef as { baseUrl: string }).baseUrl
       : "";
   const requestAssistant = async (context: Context): Promise<AssistantMessage> => {
+    assertSystemPromptHasIdentityFiles(String(context.systemPrompt ?? ""));
+    providerAttempt += 1;
+    await appendPromptTraceRecord({
+      type: "provider_prompt_context",
+      timestamp: new Date().toISOString(),
+      sessionId,
+      channel: params.channel,
+      provider: typedProvider,
+      model: resolvedModelId,
+      attempt: providerAttempt,
+      compactMode,
+      forceToolUse,
+      identityIntent,
+      context,
+    });
     const abortController = new AbortController();
     const endpointHint = modelBaseUrl ? ` endpoint=${modelBaseUrl}` : "";
     const timeoutMessage =
@@ -3205,7 +3701,7 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
     userMessage: params.message,
   });
 
-  for (let round = 0; round < MAX_TOOL_ROUNDS && !forceWaitForMfaCode; round++) {
+  for (let round = 0; round < maxToolRounds && !forceWaitForMfaCode; round++) {
     let roundProgressCount = 0;
     const emitRoundProgress = (text: string, phase: "pretool" | "progress" = "progress") => {
       if (roundProgressCount >= LIVE_PROGRESS_LINES_PER_ROUND) {
@@ -3244,6 +3740,19 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
     }
 
     if (toolCalls.length === 0) {
+      if (
+        identityQuestion &&
+        identityRetryCount < 2 &&
+        !isIdentityAnswerGrounded(roundFlattened.text, identityAnchors, identityIntent)
+      ) {
+        identityRetryCount += 1;
+        messages.push({
+          role: "user",
+          content: buildIdentityGroundingInstruction(identityIntent, identityAnchors),
+          timestamp: Date.now(),
+        });
+        continue;
+      }
       if (
         (looksLikeLoginIntent(params.message) ||
           looksLikeAccountDashboardIntent(params.message) ||
@@ -3337,8 +3846,9 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
     }
 
     for (const toolCall of toolCalls) {
+      const normalizedToolName = String(toolCall.name ?? "").trim().toLowerCase();
       const argsProgress = summarizeArgsForProgress(
-        String(toolCall.name ?? "").trim().toLowerCase(),
+        normalizedToolName,
         toolCall.arguments,
       );
       if (argsProgress) {
@@ -3460,14 +3970,14 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
         isError: outcome.isError,
       });
       const progressFromOutcome = summarizeOutcomeForProgress({
-        toolName: String(toolCall.name ?? "").trim().toLowerCase(),
+        toolName: normalizedToolName,
         content: outcome.content,
         isError: outcome.isError,
       });
       if (progressFromOutcome) {
         emitRoundProgress(progressFromOutcome);
       }
-      if (String(toolCall.name ?? "").trim().toLowerCase() === "browser") {
+      if (normalizedToolName === "browser") {
         updatePendingMfaStateFromBrowserTool({
           sessionId,
           toolArgs: toolCall.arguments,
@@ -3515,10 +4025,35 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
         role: "toolResult",
         toolCallId: toolCall.id,
         toolName: toolCall.name,
-        content: [{ type: "text", text: outcome.content }],
+        content: [
+          {
+            type: "text",
+            text: clampTextForModelContext(outcome.content, toolResultContextMaxChars),
+          },
+        ],
         isError: outcome.isError,
         timestamp: Date.now()
       });
+      const toolReminder = toolSkillReminders[normalizedToolName];
+      if (toolReminder) {
+        messages.push({
+          role: "user",
+          content: [
+            `System instruction: tool "${normalizedToolName}" was just used.`,
+            "Continue by following this tool-specific guidance:",
+            toolReminder,
+          ].join("\n"),
+          timestamp: Date.now(),
+        });
+      }
+      if (compactMode) {
+        compactFailureStreak = outcome.isError ? compactFailureStreak + 1 : 0;
+        if (compactFailureStreak >= 3) {
+          compactGuardrailMessage =
+            "I stopped after repeated tool failures to protect the local runtime. Tell me one narrower next step and I will continue.";
+          break;
+        }
+      }
       if (checkoutBlockedMessage) {
         break;
       }
@@ -3527,6 +4062,9 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
       break;
     }
     if (checkoutBlockedMessage) {
+      break;
+    }
+    if (compactGuardrailMessage) {
       break;
     }
   }
@@ -3613,6 +4151,9 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
       ? `Verified steps completed: ${successfulToolOutcomes.length}`
       : "";
   let message = flattened.text || "";
+  if (identityQuestion) {
+    message = stripIdentityReasoningLeak(message);
+  }
   const assistantStopReason = String((lastAssistant as { stopReason?: unknown }).stopReason ?? "")
     .trim()
     .toLowerCase();
@@ -3715,6 +4256,9 @@ export async function chatWithProvider(params: ProviderChatParams): Promise<Prov
     ]
       .filter(Boolean)
       .join("\n");
+  }
+  if (compactGuardrailMessage) {
+    message = compactGuardrailMessage;
   }
 
   await maybeAutoSaveMemoryFromUserMessage({

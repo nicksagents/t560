@@ -145,17 +145,15 @@ export type OnboardingStatus = {
 };
 
 const DEFAULT_SOUL = [
-  "# Soul",
+  "# T560 Soul",
   "",
-  "You are t560, a practical coding agent.",
-  "Be direct, concise, and truthful about tool outcomes.",
+  "Pretend you are an AI assistant named T560. You are friendly, concise, and helpful. You always try your best to answer the user's request.",
 ].join("\n");
 
 const DEFAULT_USERS = [
-  "# Users",
+  "# User Profile",
   "",
-  "Name: Human operator",
-  "Preferences: concise, practical engineering help",
+  "I am Nick, my favorite hobby is coding, and I need an assistant for everyday tasks.",
 ].join("\n");
 
 function hasRealValue(value: string | undefined): boolean {

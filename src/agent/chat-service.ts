@@ -36,29 +36,214 @@ function foundationMessage(input: string, source: GatewayChannelId, missing: str
   ].join(" ");
 }
 
-function chooseRouteSlot(message: string): "default" | "planning" | "coding" {
-  const text = message.toLowerCase();
-  if (
-    text.includes("plan") ||
-    text.includes("strategy") ||
-    text.includes("roadmap") ||
-    text.includes("architecture") ||
-    text.includes("design doc")
-  ) {
-    return "planning";
+type RouteSignal = {
+  label: string;
+  pattern: RegExp;
+  weight: number;
+  strong?: boolean;
+};
+
+type RouteIntentAnalysis = {
+  slot: "default" | "planning" | "coding";
+  planningScore: number;
+  codingScore: number;
+  planningSignals: string[];
+  codingSignals: string[];
+};
+
+const PLANNING_SIGNALS: RouteSignal[] = [
+  {
+    label: "architecture",
+    pattern: /\b(architecture|design doc|technical design|system design|design proposal)\b/,
+    weight: 3,
+    strong: true,
+  },
+  {
+    label: "roadmap",
+    pattern: /\b(roadmap|migration plan|rollout plan|implementation plan)\b/,
+    weight: 3,
+    strong: true,
+  },
+  {
+    label: "planning",
+    pattern: /\b(plan|strategy)\b.{0,40}\b(feature|project|migration|rollout|approach|implementation|build)\b/,
+    weight: 2,
+  },
+  {
+    label: "options",
+    pattern: /\b(compare|trade[-\s]?offs?|pros and cons|evaluate options|decision matrix)\b/,
+    weight: 2,
+  },
+  {
+    label: "step-plan",
+    pattern: /\bstep[-\s]?by[-\s]?step plan\b/,
+    weight: 2,
+  },
+  {
+    label: "task-list",
+    pattern: /\b(list of tasks|task list|task breakdown|todo list|checklist|milestones?)\b/,
+    weight: 3,
+    strong: true,
+  },
+  {
+    label: "plan-request",
+    pattern: /\b(plan|planning)\b.{0,40}\b(first|before coding|before implementation|next steps?)\b/,
+    weight: 3,
+    strong: true,
+  },
+];
+
+const CODING_SIGNALS: RouteSignal[] = [
+  {
+    label: "fenced-code",
+    pattern: /```/,
+    weight: 3,
+    strong: true,
+  },
+  {
+    label: "repo-path",
+    pattern: /\b(src\/|package\.json|tsconfig\.json|dockerfile|makefile|requirements\.txt|pom\.xml)\b/,
+    weight: 3,
+    strong: true,
+  },
+  {
+    label: "code-file",
+    pattern: /\b\w+\.(ts|tsx|js|jsx|py|go|rs|java|c|cpp|cs|rb|php|swift|kt)\b/,
+    weight: 3,
+    strong: true,
+  },
+  {
+    label: "coding-action",
+    pattern:
+      /\b(write|implement|refactor|debug|fix|patch|add|update|remove)\b.{0,70}\b(code|function|class|module|script|test|bug|error|compile|build)\b/,
+    weight: 2,
+  },
+  {
+    label: "script-request",
+    pattern: /\b(write|create|build)\b.{0,35}\b(script|program|automation)\b/,
+    weight: 2,
+  },
+  {
+    label: "test-debug",
+    pattern: /\b(unit test|integration test|test case|failing test|stack trace|compile error|type error|eslint|tsc|pytest)\b/,
+    weight: 2,
+  },
+  {
+    label: "review",
+    pattern: /\b(code review|pr review|pull request)\b/,
+    weight: 2,
+  },
+];
+
+export function analyzeRouteIntent(message: string): RouteIntentAnalysis {
+  const text = String(message ?? "").toLowerCase();
+  if (!text.trim()) {
+    return {
+      slot: "default",
+      planningScore: 0,
+      codingScore: 0,
+      planningSignals: [],
+      codingSignals: [],
+    };
   }
-  if (
-    text.includes("code") ||
-    text.includes("refactor") ||
-    text.includes("bug") ||
-    text.includes("test") ||
-    text.includes("typescript") ||
-    text.includes("python") ||
-    text.includes("implement")
-  ) {
-    return "coding";
+
+  let planningScore = 0;
+  let codingScore = 0;
+  const planningSignals: string[] = [];
+  const codingSignals: string[] = [];
+  let planningStrong = false;
+  let codingStrong = false;
+
+  for (const signal of PLANNING_SIGNALS) {
+    if (!signal.pattern.test(text)) {
+      continue;
+    }
+    planningScore += signal.weight;
+    planningSignals.push(signal.label);
+    planningStrong = planningStrong || signal.strong === true;
   }
-  return "default";
+  for (const signal of CODING_SIGNALS) {
+    if (!signal.pattern.test(text)) {
+      continue;
+    }
+    codingScore += signal.weight;
+    codingSignals.push(signal.label);
+    codingStrong = codingStrong || signal.strong === true;
+  }
+
+  // If user explicitly asks for a task plan / checklist / roadmap, keep this in planning route
+  // even when coding keywords also appear.
+  const explicitPlanningRequest =
+    /\b(list of tasks|task list|task breakdown|todo list|checklist|roadmap|implementation plan|next steps?)\b/.test(
+      text,
+    ) &&
+    /\b(plan|planning|create|draft|build|make|come up with|outline)\b/.test(text);
+  if (explicitPlanningRequest) {
+    return {
+      slot: "planning",
+      planningScore: Math.max(planningScore, 3),
+      codingScore,
+      planningSignals: planningSignals.length > 0 ? planningSignals : ["task-list"],
+      codingSignals,
+    };
+  }
+
+  if (codingStrong && codingScore >= 3 && codingScore >= planningScore) {
+    return {
+      slot: "coding",
+      planningScore,
+      codingScore,
+      planningSignals,
+      codingSignals,
+    };
+  }
+  if (codingScore >= 4 && codingScore >= planningScore + 1) {
+    return {
+      slot: "coding",
+      planningScore,
+      codingScore,
+      planningSignals,
+      codingSignals,
+    };
+  }
+  if (planningStrong && planningScore >= 3 && planningScore >= codingScore) {
+    return {
+      slot: "planning",
+      planningScore,
+      codingScore,
+      planningSignals,
+      codingSignals,
+    };
+  }
+  if (planningScore >= 3 && planningScore >= codingScore) {
+    return {
+      slot: "planning",
+      planningScore,
+      codingScore,
+      planningSignals,
+      codingSignals,
+    };
+  }
+  if (codingScore >= 2 && planningScore === 0) {
+    return {
+      slot: "coding",
+      planningScore,
+      codingScore,
+      planningSignals,
+      codingSignals,
+    };
+  }
+  return {
+    slot: "default",
+    planningScore,
+    codingScore,
+    planningSignals,
+    codingSignals,
+  };
+}
+
+export function chooseRouteSlot(message: string): "default" | "planning" | "coding" {
+  return analyzeRouteIntent(message).slot;
 }
 
 function formatProviderError(route: RoutingTarget | undefined, slot: string, channel: GatewayChannelId, message: string): string {
@@ -284,6 +469,36 @@ function resolveChatTimeoutForMessage(
   return Math.min(MAX_CHAT_TIMEOUT_MS, Math.max(base, 30 * 60_000));
 }
 
+function parseExplicitBoolean(value: string): boolean | null {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  if (normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on") {
+    return true;
+  }
+  if (normalized === "0" || normalized === "false" || normalized === "no" || normalized === "off") {
+    return false;
+  }
+  return null;
+}
+
+function allowFallbackFromLocal(env: NodeJS.ProcessEnv = process.env): boolean {
+  const explicit = parseExplicitBoolean(String(env.T560_ALLOW_FALLBACK_FROM_LOCAL ?? ""));
+  if (explicit !== null) {
+    return explicit;
+  }
+  return false;
+}
+
+function allowCrossSlotFallback(env: NodeJS.ProcessEnv = process.env): boolean {
+  const explicit = parseExplicitBoolean(String(env.T560_ALLOW_CROSS_SLOT_FALLBACK ?? ""));
+  if (explicit !== null) {
+    return explicit;
+  }
+  return false;
+}
+
 async function runWithTimeout<T>(params: {
   operation: Promise<T>;
   timeoutMs: number;
@@ -360,7 +575,8 @@ export async function processChatMessage(
     };
   }
 
-  const slot = chooseRouteSlot(input.message);
+  const routeIntent = analyzeRouteIntent(input.message);
+  const slot = routeIntent.slot;
   const route =
     resolveRoutingTarget(status.config, slot) ?? resolveRoutingTarget(status.config, "default");
 
@@ -372,6 +588,7 @@ export async function processChatMessage(
     data: {
       phase: "route",
       slot,
+      routeIntent,
       provider: route?.provider,
       model: route?.model
     }
@@ -419,11 +636,20 @@ export async function processChatMessage(
     };
   } catch (error: unknown) {
     const errorMessage = error instanceof Error ? error.message : String(error);
+    const localRoute = isLikelyLocalRoute(status.config, route);
+    const localFallbackAllowed = allowFallbackFromLocal(process.env);
+    const crossSlotFallbackAllowed = allowCrossSlotFallback(process.env);
     const skipFallbackForLocalTimeout =
-      isLikelyLocalRoute(status.config, route) &&
+      localRoute &&
       isTimeoutLikeError(errorMessage) &&
       String(process.env.T560_ALLOW_FALLBACK_ON_LOCAL_TIMEOUT ?? "").trim() !== "1";
-    if (isConnectivityProviderError(errorMessage) && !skipFallbackForLocalTimeout) {
+    const skipFallbackForLocalRoute = localRoute && !localFallbackAllowed;
+    if (
+      isConnectivityProviderError(errorMessage) &&
+      !skipFallbackForLocalTimeout &&
+      !skipFallbackForLocalRoute &&
+      crossSlotFallbackAllowed
+    ) {
       const fallbackRoute = chooseFallbackRoute(status.config, route);
       if (fallbackRoute) {
         try {

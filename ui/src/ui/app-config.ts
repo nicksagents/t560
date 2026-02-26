@@ -31,6 +31,11 @@ type BootstrapResponse = {
   files?: unknown;
 };
 
+type MemoryResetResponse = {
+  clearedEntries?: unknown;
+  clearedSessionFiles?: unknown;
+};
+
 function asRecord(value: unknown): Record<string, unknown> {
   if (value && typeof value === "object" && !Array.isArray(value)) {
     return value as Record<string, unknown>;
@@ -100,6 +105,14 @@ function normalizeBootstrapFiles(raw: unknown): BootstrapContextFile[] {
 
 function setNotice(host: T560App, kind: SettingsNoticeKind, message: string): void {
   host.settingsNotice = { kind, message };
+}
+
+function revealNotice(host: T560App): void {
+  const content = host.querySelector(".content") as HTMLElement | null;
+  if (!content) {
+    return;
+  }
+  content.scrollTo({ top: 0, behavior: "smooth" });
 }
 
 function clearNotice(host: T560App): void {
@@ -306,6 +319,44 @@ export async function saveBootstrapDraft(host: T560App): Promise<void> {
     setNotice(host, "success", `${name} saved to workspace.`);
   } catch (error: unknown) {
     setNotice(host, "error", toErrorMessage(error, `Failed to save ${name}.`));
+  } finally {
+    host.settingsSaving = false;
+  }
+}
+
+export async function eraseAgentMemory(host: T560App): Promise<boolean> {
+  if (host.settingsSaving) {
+    return false;
+  }
+
+  host.settingsSaving = true;
+  clearNotice(host);
+  setNotice(host, "info", "Erasing agent memory...");
+  revealNotice(host);
+  try {
+    const payload = await requestJson<MemoryResetResponse>("/api/memory/store", {
+      method: "DELETE",
+    });
+    const record = asRecord(payload);
+    const clearedEntries = Number.isFinite(Number(record.clearedEntries))
+      ? Math.max(0, Math.floor(Number(record.clearedEntries)))
+      : 0;
+    const clearedSessionFiles = Number.isFinite(Number(record.clearedSessionFiles))
+      ? Math.max(0, Math.floor(Number(record.clearedSessionFiles)))
+      : 0;
+    if (clearedEntries > 0 || clearedSessionFiles > 0) {
+      setNotice(
+        host,
+        "success",
+        `Agent memory erased. Removed ${clearedEntries.toLocaleString()} memory entries and ${clearedSessionFiles.toLocaleString()} session files.`,
+      );
+    } else {
+      setNotice(host, "success", "Agent memory erased. No stored memory entries or session files were found.");
+    }
+    return true;
+  } catch (error: unknown) {
+    setNotice(host, "error", toErrorMessage(error, "Failed to erase agent memory."));
+    return false;
   } finally {
     host.settingsSaving = false;
   }

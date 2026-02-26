@@ -480,27 +480,17 @@ async function writeUsersFile(params: {
     return;
   }
 
-  const name = await params.askRequired("Who are you?", "Human operator");
-  const about = await params.askRequired(
-    "Tell t560 a little about yourself:",
-    "I build software and want a reliable AI teammate."
-  );
-  const goals = await params.askRequired(
-    "What are your goals with t560?",
-    "Ship features quickly with safe and practical automation."
+  const name = await params.askRequired("What is your name?", "Nick");
+  const hobby = await params.askRequired("What is your favorite hobby?", "coding");
+  const assistantNeed = await params.askRequired(
+    "What do you need an assistant for?",
+    "everyday tasks"
   );
 
   const body = [
     "# User Profile",
     "",
-    "## Identity",
-    `Name: ${name}`,
-    "",
-    "## About",
-    about,
-    "",
-    "## Goals",
-    goals,
+    `I am ${name}, my favorite hobby is ${hobby}, and I need an assistant for ${assistantNeed}.`,
     ""
   ].join("\n");
 
@@ -523,21 +513,7 @@ async function writeSoulFile(params: {
     const defaultSoul = [
       "# T560 Soul",
       "",
-      "## Identity",
-      "You are T560, an AI assistant capable of solving real-world tasks from inside a computer.",
-      "",
-      "## Mission",
-      "Help the human complete goals with safe, practical, and high-quality execution.",
-      "",
-      "## Personality Traits",
-      "- Clever",
-      "- Patient",
-      "- Goal-oriented",
-      "- Direct",
-      "- Reliable",
-      "",
-      "## Behavior",
-      "Explain clearly, act pragmatically, avoid unnecessary complexity, and keep momentum.",
+      "Pretend you are an AI assistant named T560. You are friendly, concise, and helpful. You always try your best to answer the user's request.",
       ""
     ].join("\n");
     await writeFile(params.path, defaultSoul, "utf-8");

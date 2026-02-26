@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { URL, fileURLToPath } from "node:url";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { readFile, writeFile } from "node:fs/promises";
+import { readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, extname, dirname } from "node:path";
 import { homedir } from "node:os";
 import { spawnSync } from "node:child_process";
@@ -15,6 +15,7 @@ import {
   readOnboardingStatus,
   resolveConfigPath,
   resolveBootstrapMaxChars,
+  resolveStateDir,
   resolveLegacyUserPath,
   resolveSoulPath,
   resolveRoutingTarget,
@@ -1591,6 +1592,46 @@ async function handlePutBootstrapFile(req: IncomingMessage, res: ServerResponse)
   sendJson(res, 200, { ok: true, name, path: filePath });
 }
 
+async function handleDeleteMemoryStore(res: ServerResponse): Promise<void> {
+  await ensureStateDir();
+  const stateDir = resolveStateDir();
+  const storePath = join(stateDir, "memory.jsonl");
+  const sessionsPath = join(stateDir, "sessions");
+  let clearedEntries = 0;
+  let clearedSessionFiles = 0;
+
+  try {
+    const raw = await readFile(storePath, "utf-8");
+    clearedEntries = raw
+      .split(/\r?\n/g)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .length;
+  } catch {
+    clearedEntries = 0;
+  }
+
+  try {
+    const sessionFiles = await readdir(sessionsPath, { withFileTypes: true }).catch(() => []);
+    clearedSessionFiles = sessionFiles.filter((entry) => entry.isFile() && entry.name.endsWith(".json")).length;
+
+    await writeFile(storePath, "", "utf-8");
+    await rm(sessionsPath, { recursive: true, force: true });
+    sendJson(res, 200, {
+      ok: true,
+      storePath,
+      clearedEntries,
+      sessionsPath,
+      clearedSessionFiles,
+    });
+  } catch (error: unknown) {
+    sendJson(res, 500, {
+      error: "memory_reset_failed",
+      message: error instanceof Error ? error.message : "Failed to erase memory store.",
+    });
+  }
+}
+
 async function handleChat(
   req: IncomingMessage,
   res: ServerResponse,
@@ -1912,6 +1953,10 @@ async function routeRequest(
   }
   if (method === "PUT" && pathname === "/api/context/bootstrap") {
     await handlePutBootstrapFile(req, res);
+    return;
+  }
+  if (method === "DELETE" && pathname === "/api/memory/store") {
+    await handleDeleteMemoryStore(res);
     return;
   }
   if (method === "POST" && pathname === "/api/setup/oauth/codex/start") {

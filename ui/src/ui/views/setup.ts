@@ -797,7 +797,7 @@ function renderBootstrapEditor(host: T560App, busy: boolean): string {
 
   return `<div class="card">
     <div class="card-title">Bootstrap Context Files</div>
-    <div class="card-sub">These files are injected into the runtime prompt during startup.</div>
+    <div class="card-sub">Workspace context reference files. Runtime identity injection uses only soul.md and users.md/user.md.</div>
     <div class="settings-chip-row" style="margin-top:12px">${chips || `<span class="muted">No bootstrap files found.</span>`}</div>
     <label class="field full" style="margin-top:12px">
       <span>${selected ? escapeHtml(selected) : "File content"}</span>

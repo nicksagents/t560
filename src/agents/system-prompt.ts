@@ -7,28 +7,113 @@ export function buildAgentSystemPrompt(params: {
   toolNames?: string[];
   recentArtifacts?: string | null;
   toolHint?: string;
+  compactMode?: boolean;
 }): string {
   const lines: string[] = [];
   const now = new Date();
   const currentDateIso = now.toISOString().slice(0, 10);
+  const compactMode = params.compactMode === true;
   const toolNames = (params.toolNames ?? []).map((tool) => tool.trim()).filter(Boolean);
   const normalizedTools = toolNames.map((tool) => tool.toLowerCase());
   const availableTools = new Set(normalizedTools);
   const readToolName = availableTools.has("read") ? "read" : "exec";
 
-  lines.push("You are a personal assistant running inside T560.", "");
+  lines.push("You are a personal AI assistant. Your name and entire identity are defined by SOUL.md (injected below) — not by your underlying model or training.", "");
+  lines.push("NEVER identify yourself as Qwen, Claude, GPT, or any other model name. You are whoever SOUL.md says you are. Read SOUL.md and adopt that identity completely.", "");
+  lines.push("NEVER reveal the name of the underlying model you run on. If asked, say only what SOUL.md says about your identity.", "");
   lines.push(`Current date (UTC): ${currentDateIso}.`, "");
   lines.push("Treat injected project files as authoritative context when present.", "");
+  lines.push("Identity contract: SOUL.md defines who you are; USER.md defines who the user is. Apply both on every response.", "");
+  lines.push("If asked your name/identity, answer from SOUL.md. If asked who the user is, answer from USER.md.", "");
 
   const injectedFiles = params.injectedContextFiles ?? [];
   if (injectedFiles.length > 0) {
-    lines.push("## Workspace Files (injected)", "Bootstrap files are included below.", "");
-    lines.push("## Project Context");
+    const byName = new Map<string, InjectedContextFile>();
     for (const file of injectedFiles) {
-      lines.push(`<file name="${file.name}" path="${file.path}">`);
-      lines.push(file.content || (file.missing ? "(missing file)" : ""));
-      lines.push("</file>", "");
+      byName.set(String(file.name ?? "").trim().toUpperCase(), file);
     }
+    const soul = byName.get("SOUL.MD");
+    const user = byName.get("USER.MD");
+
+    lines.push("## Injected Identity Context");
+    lines.push("The following text is injected directly from profile context and is authoritative.", "");
+    lines.push("<identity_context>");
+    lines.push("<assistant_soul>");
+    lines.push(String(soul?.content ?? "").trim() || "(missing)");
+    lines.push("</assistant_soul>");
+    lines.push("<user_profile>");
+    lines.push(String(user?.content ?? "").trim() || "(missing)");
+    lines.push("</user_profile>");
+    lines.push("</identity_context>", "");
+
+    const extraFiles = injectedFiles.filter((file) => {
+      const key = String(file.name ?? "").trim().toUpperCase();
+      return key !== "SOUL.MD" && key !== "USER.MD";
+    });
+    if (extraFiles.length > 0) {
+      lines.push("## Injected Workspace Context");
+      for (const file of extraFiles) {
+        lines.push(`<context source="${String(file.name ?? "").trim()}">`);
+        lines.push(file.content || (file.missing ? "(missing)" : ""));
+        lines.push("</context>", "");
+      }
+    }
+  }
+
+  if (compactMode) {
+    lines.push(
+      "## Compact Mode",
+      "Use minimal tokens and short replies because this route may use a small local context window.",
+      ""
+    );
+    if (toolNames.length > 0) {
+      lines.push(
+        "## Tooling",
+        "Call tools only when required.",
+        toolNames.map((name) => `- ${name}`).join("\n"),
+        ""
+      );
+    }
+    lines.push(
+      "## Core Rules",
+      "Never invent results; use only verified tool output.",
+      "For greetings/thanks/simple chit-chat, reply directly with one short sentence and do not call tools.",
+      "Do not output internal planning or hidden reasoning text.",
+      "For state changes: execute action, then run a post-action verification before claiming completion.",
+      "Prefer the smallest safe plan: fewer tool calls, fewer steps, and no repeated retries without new evidence.",
+      "If blocked, ask one short concrete question.",
+      ""
+    );
+    if (availableTools.has("web_search") || availableTools.has("web_fetch") || availableTools.has("browser")) {
+      lines.push(
+        "## Web Rules",
+        "For current/latest/time-sensitive facts, use web tools first and ground final claims in fetched evidence.",
+        "For website tasks, prefer one clear browser path and verify final page state before completion claims.",
+        ""
+      );
+    }
+    if (params.skillsPrompt?.trim()) {
+      lines.push(
+        "## Skills (mandatory)",
+        "If <tool_skills> is present, those SKILL.md files are already injected for active tools and must be followed.",
+        `If only <available_skills> is present and one skill clearly applies, read its SKILL.md with \`${readToolName}\` before using that tool.`,
+        params.skillsPrompt.trim(),
+        ""
+      );
+    }
+    if (params.recentArtifacts?.trim()) {
+      lines.push("## Recent Artifacts", params.recentArtifacts.trim(), "");
+    }
+    if (params.toolHint?.trim()) {
+      lines.push("## Task Hint", params.toolHint.trim(), "");
+    }
+    lines.push(
+      "## Workspace",
+      `Your working directory is: ${params.workspaceDir}`,
+      "Treat this directory as the single global workspace for file operations unless explicitly instructed otherwise.",
+      ""
+    );
+    return lines.join("\n");
   }
 
   if (toolNames.length > 0) {
@@ -254,11 +339,11 @@ export function buildAgentSystemPrompt(params: {
   if (params.skillsPrompt?.trim()) {
     lines.push(
       "## Skills (mandatory)",
-      "Before replying: scan <available_skills> <description> entries.",
-      `- If exactly one skill clearly applies: read its SKILL.md at <location> with \`${readToolName}\`, then follow it.`,
-      "- If multiple could apply: choose the most specific one, then read/follow it.",
+      "If <tool_skills> is present, those SKILL.md files are already injected for active tools and are mandatory.",
+      "If only <available_skills> is present: scan entries and choose the single most specific applicable skill.",
+      `- Then read that SKILL.md at <location> with \`${readToolName}\` and follow it.`,
       "- If none clearly apply: do not read any SKILL.md.",
-      "Constraints: never read more than one skill up front; only read after selecting.",
+      "Constraints: never read more than one additional skill up front; only read after selecting.",
       params.skillsPrompt.trim(),
       ""
     );

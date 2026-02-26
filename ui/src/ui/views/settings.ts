@@ -97,8 +97,19 @@ export function renderSettingsView(host: T560App): string {
       </div>
 
       <div class="card">
+        <div class="card-title">Agent Memory</div>
+        <div class="card-sub">Clear durable memory and stored chat session history.</div>
+        <div class="callout danger" style="margin-top:12px">
+          This wipes <span class="mono">memory.jsonl</span> and saved session history in <span class="mono">state/sessions</span>. It cannot be undone.
+        </div>
+        <div class="settings-actions" style="margin-top:12px">
+          <button class="btn danger" data-action="erase-agent-memory" ${busy ? "disabled" : ""}>Erase Agent Memory</button>
+        </div>
+      </div>
+
+      <div class="card">
         <div class="card-title">Workspace Bootstrap Files</div>
-        <div class="card-sub">These are injected into the system prompt each run.</div>
+        <div class="card-sub">Workspace context reference files. Runtime identity injection uses only soul.md and users.md/user.md.</div>
         <div class="settings-chip-row" style="margin-top:12px">
           ${bootstrapChips || `<span class="muted">No bootstrap files discovered.</span>`}
         </div>

@@ -63,14 +63,26 @@ function truncateForPrompt(content: string, maxChars: number): { content: string
 export async function loadT560BootstrapContext(params: {
   workspaceDir: string;
   maxChars?: number;
+  includeFiles?: string[];
   soulFallback?: FallbackProfileFile;
   userFallback?: FallbackProfileFile;
 }): Promise<InjectedContextFile[]> {
   const workspaceDir = path.resolve(params.workspaceDir);
   const maxChars = normalizeMaxChars(params.maxChars);
+  const requestedFiles = Array.isArray(params.includeFiles)
+    ? params.includeFiles
+        .map((name) => String(name ?? "").trim())
+        .filter((name): name is (typeof T560_BOOTSTRAP_FILENAMES)[number] =>
+          (T560_BOOTSTRAP_FILENAMES as readonly string[]).includes(name),
+        )
+    : [];
+  const selectedFiles =
+    requestedFiles.length > 0
+      ? Array.from(new Set(requestedFiles))
+      : [...T560_BOOTSTRAP_FILENAMES];
   const out: InjectedContextFile[] = [];
 
-  for (const name of T560_BOOTSTRAP_FILENAMES) {
+  for (const name of selectedFiles) {
     const workspacePath = path.join(workspaceDir, name);
     const workspaceContent = await readText(workspacePath);
     let sourcePath = workspacePath;

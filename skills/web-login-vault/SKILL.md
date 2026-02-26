@@ -1,6 +1,7 @@
 ---
 name: web-login-vault
 description: Run secure website/app sign-in using vault credentials with browser login+mfa flow. Use when the user asks to open a site, sign in, check account/dashboard/balance, or send/enter one-time codes. Prefer vault identifier+secret injection and never use social OAuth buttons.
+tools: [browser, email]
 ---
 
 # Web Login + Vault
